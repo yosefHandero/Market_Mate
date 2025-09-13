@@ -5,26 +5,14 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="8039e1aa-3cf1-4da6-86d9-6cc4a631c525" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/app/api/inngest/route.ts" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/actions/auth.actions.ts" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/better-auth/auth.ts" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/inngest/client.ts" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/inngest/functions.ts" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/inngest/prompts.ts" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/nodemailer/index.ts" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/lib/nodemailer/templates.ts" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/middleware/index.ts" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/database/models/watchlist.model.ts" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/lib/actions/user.actions.ts" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/(auth)/layout.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/app/(auth)/layout.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/(auth)/sign-in/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/app/(auth)/sign-in/page.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/(auth)/sign-up/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/app/(auth)/sign-up/page.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/(root)/layout.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/app/(root)/layout.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/app/layout.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/app/layout.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/components/Header.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/components/Header.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/components/UserDropdown.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/components/UserDropdown.tsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/database/mongoose.ts" beforeDir="false" afterPath="$PROJECT_DIR$/database/mongoose.ts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/package-lock.json" beforeDir="false" afterPath="$PROJECT_DIR$/package-lock.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/package.json" beforeDir="false" afterPath="$PROJECT_DIR$/package.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/(root)/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/app/(root)/page.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/api/inngest/route.ts" beforeDir="false" afterPath="$PROJECT_DIR$/app/api/inngest/route.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/inngest/functions.ts" beforeDir="false" afterPath="$PROJECT_DIR$/lib/inngest/functions.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/nodemailer/index.ts" beforeDir="false" afterPath="$PROJECT_DIR$/lib/nodemailer/index.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/utils.ts" beforeDir="false" afterPath="$PROJECT_DIR$/lib/utils.ts" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -107,7 +95,9 @@
       <updated>1756364772411</updated>
       <workItem from="1756364773427" duration="2148000" />
       <workItem from="1756366968623" duration="33000" />
-      <workItem from="1756729429235" duration="1206000" />
+      <workItem from="1756729429235" duration="3247000" />
+      <workItem from="1757758446589" duration="6500000" />
+      <workItem from="1757793249623" duration="449000" />
     </task>
     <servers />
   </component>
