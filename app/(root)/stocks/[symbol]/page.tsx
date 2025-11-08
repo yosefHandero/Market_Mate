@@ -1,5 +1,7 @@
 import TradingViewWidget from "@/components/TradingViewWidget";
 import WatchlistButton from "@/components/WatchlistButton";
+import { connectToDatabase } from "@/database/mongoose";
+import { Watchlist } from "@/database/models/watchlist.model";
 import {
   SYMBOL_INFO_WIDGET_CONFIG,
   CANDLE_CHART_WIDGET_CONFIG,
@@ -8,9 +10,19 @@ import {
   COMPANY_PROFILE_WIDGET_CONFIG,
   COMPANY_FINANCIALS_WIDGET_CONFIG,
 } from "@/lib/constants";
+import { getCurrentUser } from "@/lib/auth/session";
 
 export default async function StockDetails({ params }: StockDetailsPageProps) {
   const { symbol } = await params;
+  const uppercaseSymbol = symbol.toUpperCase();
+  const user = await getCurrentUser();
+  let isInWatchlist = false;
+
+  if (user) {
+    await connectToDatabase();
+    const existing = await Watchlist.exists({ userId: user.id, symbol: uppercaseSymbol });
+    isInWatchlist = !!existing;
+  }
   const scriptUrl = `https://s3.tradingview.com/external-embedding/embed-widget-`;
 
   return (
@@ -42,7 +54,7 @@ export default async function StockDetails({ params }: StockDetailsPageProps) {
         {/* Right column */}
         <div className="flex flex-col gap-6">
           <div className="flex items-center justify-between">
-            <WatchlistButton symbol={symbol.toUpperCase()} company={symbol.toUpperCase()} isInWatchlist={false} />
+            <WatchlistButton symbol={uppercaseSymbol} company={uppercaseSymbol} isInWatchlist={isInWatchlist} />
           </div>
 
           <TradingViewWidget
