@@ -1,9 +1,9 @@
 "use client";
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-// Minimal WatchlistButton implementation to satisfy page requirements.
-// This component focuses on UI contract only. It toggles local state and
-// calls onWatchlistChange if provided. Styling hooks match globals.css.
+// WatchlistButton toggles watchlist membership with optimistic UI updates
+// while syncing changes through the watchlist API. Styling hooks match
+// globals.css.
 
 const WatchlistButton = ({
   symbol,
@@ -14,16 +14,55 @@ const WatchlistButton = ({
   onWatchlistChange,
 }: WatchlistButtonProps) => {
   const [added, setAdded] = useState<boolean>(!!isInWatchlist);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    setAdded(!!isInWatchlist);
+  }, [isInWatchlist]);
 
   const label = useMemo(() => {
-    if (type === "icon") return added ? "" : "";
+    if (type === "icon") return "";
+    if (loading) return added ? "Removing..." : "Adding...";
     return added ? "Remove from Watchlist" : "Add to Watchlist";
-  }, [added, type]);
+  }, [added, loading, type]);
 
-  const handleClick = () => {
+  const updateWatchlist = async (next: boolean) => {
+    const method = next ? "POST" : "DELETE";
+
+    const response = await fetch("/api/watchlist", {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol, company }),
+    });
+
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.error || `Request failed with status ${response.status}`);
+    }
+
+    const payload = await response.json();
+
+    if (!payload?.success) {
+      throw new Error(payload?.error || "Unknown error");
+    }
+  };
+
+  const handleClick = async () => {
+    if (loading) return;
+
     const next = !added;
     setAdded(next);
-    onWatchlistChange?.(symbol, next);
+    setLoading(true);
+
+    try {
+      await updateWatchlist(next);
+      onWatchlistChange?.(symbol, next);
+    } catch (error) {
+      console.error("Failed to update watchlist", error);
+      setAdded(!next);
+    } finally {
+      setLoading(false);
+    }
   };
 
   if (type === "icon") {
@@ -33,6 +72,9 @@ const WatchlistButton = ({
         aria-label={added ? `Remove ${symbol} from watchlist` : `Add ${symbol} to watchlist`}
         className={`watchlist-icon-btn ${added ? "watchlist-icon-added" : ""}`}
         onClick={handleClick}
+        disabled={loading}
+        aria-busy={loading}
+        aria-disabled={loading}
       >
         <svg
           xmlns="http://www.w3.org/2000/svg"
@@ -53,7 +95,13 @@ const WatchlistButton = ({
   }
 
   return (
-    <button className={`watchlist-btn ${added ? "watchlist-remove" : ""}`} onClick={handleClick}>
+    <button
+      className={`watchlist-btn ${added ? "watchlist-remove" : ""}`}
+      onClick={handleClick}
+      disabled={loading}
+      aria-busy={loading}
+      aria-disabled={loading}
+    >
       {showTrashIcon && added ? (
         <svg
           xmlns="http://www.w3.org/2000/svg"

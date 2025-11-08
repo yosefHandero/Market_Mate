@@ -105,7 +105,7 @@ declare global {
     type WatchlistButtonProps = {
         symbol: string;
         company: string;
-        isInWatchlist: boolean;
+        isInWatchlist?: boolean;
         showTrashIcon?: boolean;
         type?: 'button' | 'icon';
         onWatchlistChange?: (symbol: string, isAdded: boolean) => void;
@@ -139,7 +139,7 @@ declare global {
         userId: string;
         symbol: string;
         company: string;
-        addedAt: Date;
+        createdAt: Date;
         currentPrice?: number;
         changePercent?: number;
         priceFormatted?: string;
