@@ -22,7 +22,7 @@ const WatchlistButton = ({
 
   const label = useMemo(() => {
     if (type === "icon") return "";
-    if (loading) return added ? "Removing..." : "Adding...";
+    if (loading) return added ? "Adding..." : "Removing...";
     return added ? "Remove from Watchlist" : "Add to Watchlist";
   }, [added, loading, type]);
 
