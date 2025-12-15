@@ -322,6 +322,20 @@
   .watchlist-news {
     @apply grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4;
   }
+  .watchlist-overlay-button {
+    @apply bg-gray-800 border border-gray-600 rounded-lg p-2 shadow-xl;
+    animation: fadeInScale 0.2s ease-out;
+  }
+  @keyframes fadeInScale {
+    from {
+      opacity: 0;
+      transform: scale(0.95);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
   .news-item {
     @apply bg-gray-800 rounded-lg border w-full border-gray-600  p-4 duration-200 hover:border-gray-600 cursor-pointer;
   }

@@ -1,4 +1,4 @@
-import { headers } from "next/headers";
+import { headers, cookies } from "next/headers";
 
 import { auth } from "@/lib/better-auth/auth";
 
@@ -6,6 +6,13 @@ export type CurrentUser = {
   id: string;
   email?: string | null;
   name?: string | null;
+};
+
+// Demo user data
+const DEMO_USER: CurrentUser = {
+  id: 'demo-user-yosef',
+  email: 'demo@marketmate.com',
+  name: 'Yosef',
 };
 
 async function getSessionFromHeaders(headersInit: HeadersInit) {
@@ -25,6 +32,15 @@ export async function getCurrentUser(): Promise<CurrentUser | null> {
 export async function getCurrentUserFromHeaders(
   headersInit: HeadersInit
 ): Promise<CurrentUser | null> {
+  // Check for demo mode first
+  const cookieStore = await cookies();
+  const demoMode = cookieStore.get('demo-mode');
+  
+  if (demoMode?.value === 'true') {
+    return DEMO_USER;
+  }
+
+  // Otherwise, check Better Auth session
   const session = await getSessionFromHeaders(headersInit);
 
   if (!session?.user?.id) {

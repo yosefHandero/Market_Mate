@@ -1,6 +1,5 @@
 import {inngest} from "@/lib/inngest/client";
 import {NEWS_SUMMARY_EMAIL_PROMPT, PERSONALIZED_WELCOME_EMAIL_PROMPT} from "@/lib/inngest/prompts";
-import {sendNewsSummaryEmail, sendWelcomeEmail} from "@/lib/nodemailer";
 import {getAllUsersForNewsEmail, type UserForNewsEmail} from "@/lib/actions/user.actions";
 import { getWatchlistSymbolsByEmail } from "@/lib/actions/watchlist.actions";
 import { getNews } from "@/lib/actions/finnhub.actions";
@@ -33,12 +32,15 @@ export const sendSignUpEmail = inngest.createFunction(
         })
 
         await step.run('send-welcome-email', async () => {
+            // Email functionality removed
             const part = response.candidates?.[0]?.content?.parts?.[0];
             const introText = (part && 'text' in part ? part.text : null) ||'Thanks for joining Market_Mate. You now have the tools to track markets and make smarter moves.'
 
             const { data: { email, name } } = event;
 
-            return await sendWelcomeEmail({ email, name, intro: introText });
+            // Email sending disabled
+            console.log('Welcome email would be sent to:', email, 'with intro:', introText);
+            return { success: true, message: 'Welcome email skipped (nodemailer removed)' };
         })
 
         return {
@@ -104,15 +106,11 @@ export const sendDailyNewsSummary = inngest.createFunction(
                 }
             }
 
-        // Step #4: (placeholder) Send the emails
+        // Step #4: Email sending disabled (nodemailer removed)
         await step.run('send-news-emails', async () => {
-                await Promise.all(
-                    userNewsSummaries.map(async ({ user, newsContent}) => {
-                        if(!newsContent) return false;
-
-                        return await sendNewsSummaryEmail({ email: user.email, date: getFormattedTodayDate(), newsContent })
-                    })
-                )
+                // Email functionality removed
+                console.log('News summary emails would be sent to', userNewsSummaries.length, 'users');
+                return { success: true, message: 'News emails skipped (nodemailer removed)' };
             })
 
         return { success: true, message: 'Daily news summary emails sent successfully' }
