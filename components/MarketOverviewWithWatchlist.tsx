@@ -2,6 +2,7 @@
 
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import TradingViewWidget from "@/components/TradingViewWidget";
+import StockActionDialog from "@/components/StockActionDialog";
 import WatchlistButton from "@/components/WatchlistButton";
 import { MARKET_OVERVIEW_WIDGET_CONFIG } from "@/lib/constants";
 
@@ -27,12 +28,14 @@ const MarketOverviewWithWatchlist: React.FC<
     x: number;
     y: number;
   } | null>(null);
-  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [isHovering, setIsHovering] = useState(false);
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [clickedSymbol, setClickedSymbol] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const widgetContainerRef = useRef<HTMLDivElement>(null);
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastClickSymbolRef = useRef<string | null>(null);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Extract symbol from TradingView format (e.g., "NYSE:JPM" -> "JPM")
   const extractSymbol = useCallback(
@@ -46,14 +49,12 @@ const MarketOverviewWithWatchlist: React.FC<
     []
   );
 
-  // Get all symbols from config for reference
-  const allSymbols = MARKET_OVERVIEW_WIDGET_CONFIG.tabs
-    .flatMap((tab) => tab.symbols.map((s) => extractSymbol(s.s) || ""))
-    .filter(Boolean);
-
-  // Enhanced config - remove symbolUrl to prevent navigation
+  // Enhanced config - remove symbolUrl to prevent navigation if it exists
   // We'll capture symbols via hover detection and postMessage instead
-  const { symbolUrl, ...enhancedConfig } = MARKET_OVERVIEW_WIDGET_CONFIG;
+  const enhancedConfig = { ...MARKET_OVERVIEW_WIDGET_CONFIG };
+  if ("symbolUrl" in enhancedConfig) {
+    delete (enhancedConfig as { symbolUrl?: string }).symbolUrl;
+  }
 
   // Listen for postMessage events from TradingView widget
   useEffect(() => {
@@ -67,6 +68,7 @@ const MarketOverviewWithWatchlist: React.FC<
             lastClickSymbolRef.current = symbol;
             setSelectedSymbol(symbol);
             setHoveredSymbol(symbol);
+            setIsHovering(true);
           }
         } else if (
           "name" in event.data &&
@@ -78,6 +80,7 @@ const MarketOverviewWithWatchlist: React.FC<
             lastClickSymbolRef.current = symbol;
             setSelectedSymbol(symbol);
             setHoveredSymbol(symbol);
+            setIsHovering(true);
           }
         }
       }
@@ -87,7 +90,7 @@ const MarketOverviewWithWatchlist: React.FC<
     return () => window.removeEventListener("message", handleMessage);
   }, [extractSymbol]);
 
-  // Handle mouse move to detect hover over stock items area
+  // Handle mouse move to track position
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       if (!containerRef.current) return;
@@ -96,103 +99,103 @@ const MarketOverviewWithWatchlist: React.FC<
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
 
-      // Market Overview has stock items in the lower section (below chart)
-      // If hovering in the lower 60% of widget, it's likely over a stock item
-      const isInStockArea = y > rect.height * 0.4;
+      setHoverPosition({ x, y });
 
-      if (isInStockArea) {
+      // If we have a hovered symbol, show the overlay
+      if (hoveredSymbol) {
         setIsHovering(true);
-        setHoverPosition({ x, y });
-
-        // Try to estimate which symbol based on position
-        // Market Overview typically has 6 stocks per tab, arranged in rows
-        const stockAreaHeight = rect.height * 0.6;
-        const stockIndex = Math.floor(
-          (y - rect.height * 0.4) / (stockAreaHeight / 6)
-        );
-
-        // If we have a last clicked symbol, prioritize it
-        if (lastClickSymbolRef.current) {
-          setHoveredSymbol(lastClickSymbolRef.current);
-        } else if (stockIndex >= 0 && stockIndex < allSymbols.length) {
-          // Use estimated symbol based on position
-          setHoveredSymbol(allSymbols[stockIndex]);
-        }
-
-        // Clear existing timeout
+        // Clear any existing timeout
         if (timeoutRef.current) {
           clearTimeout(timeoutRef.current);
         }
-      } else {
-        setIsHovering(false);
-        if (timeoutRef.current) {
-          clearTimeout(timeoutRef.current);
-        }
-        timeoutRef.current = setTimeout(() => {
-          setHoverPosition(null);
-          if (!selectedSymbol) {
-            setHoveredSymbol(null);
-          }
-        }, 300);
       }
     },
-    [selectedSymbol, allSymbols]
+    [hoveredSymbol]
   );
 
+  // Handle mouse leave to hide overlay
   const handleMouseLeave = useCallback(() => {
-    setIsHovering(false);
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
     }
     timeoutRef.current = setTimeout(() => {
+      setIsHovering(false);
+      setHoveredSymbol(null);
       setHoverPosition(null);
-      if (!selectedSymbol) {
-        setHoveredSymbol(null);
-      }
-    }, 300);
-  }, [selectedSymbol]);
+    }, 200);
+  }, []);
 
-  // Handle touch for mobile
+  // Handle touch events for mobile
   const handleTouchStart = useCallback(
     (e: React.TouchEvent<HTMLDivElement>) => {
       if (!containerRef.current) return;
 
-      const rect = containerRef.current.getBoundingClientRect();
       const touch = e.touches[0];
+      const rect = containerRef.current.getBoundingClientRect();
       const x = touch.clientX - rect.left;
       const y = touch.clientY - rect.top;
 
-      const isInStockArea = y > rect.height * 0.4;
+      setHoverPosition({ x, y });
 
-      if (isInStockArea) {
-        setHoverPosition({ x, y });
-        if (lastClickSymbolRef.current) {
-          setHoveredSymbol(lastClickSymbolRef.current);
-        }
+      // Use lastClickSymbolRef if available
+      const symbolToUse = lastClickSymbolRef.current || selectedSymbol;
+      if (symbolToUse) {
+        setHoveredSymbol(symbolToUse);
+        setIsHovering(true);
       }
     },
-    []
+    [selectedSymbol]
   );
 
   const handleTouchEnd = useCallback(() => {
-    // Keep button visible on mobile after touch
-    setTimeout(() => {
-      if (!isHovering && !selectedSymbol) {
-        setHoverPosition(null);
-        setHoveredSymbol(null);
-      }
-    }, 2000);
-  }, [isHovering, selectedSymbol]);
-
-  // Update hovered symbol when selected symbol changes
-  useEffect(() => {
-    if (selectedSymbol) {
-      setHoveredSymbol(selectedSymbol);
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
     }
-  }, [selectedSymbol]);
+    timeoutRef.current = setTimeout(() => {
+      setIsHovering(false);
+      setHoveredSymbol(null);
+      setHoverPosition(null);
+    }, 2000);
+  }, []);
 
-  const isInWatchlist = hoveredSymbol
+  // Handle click to open dialog
+  const handleClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!containerRef.current) return;
+
+      const rect = containerRef.current.getBoundingClientRect();
+      const y = e.clientY - rect.top;
+
+      // Market Overview has stock items in the lower section (below chart)
+      // If clicking in the lower 60% of widget, it's likely on a stock item
+      const isInStockArea = y > rect.height * 0.4;
+
+      // Use lastClickSymbolRef if available (from TradingView widget click)
+      const symbolToUse = lastClickSymbolRef.current || hoveredSymbol;
+
+      if (isInStockArea && symbolToUse) {
+        setClickedSymbol(symbolToUse);
+        setDialogOpen(true);
+      }
+    },
+    [hoveredSymbol]
+  );
+
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+    };
+  }, []);
+
+  const hoveredSymbolInWatchlist = hoveredSymbol
     ? watchlistSymbols.includes(hoveredSymbol.toUpperCase())
+    : false;
+
+  const clickedSymbolInWatchlist = clickedSymbol
+    ? watchlistSymbols.includes(clickedSymbol.toUpperCase())
     : false;
 
   return (
@@ -208,42 +211,69 @@ const MarketOverviewWithWatchlist: React.FC<
       </div>
       <div
         ref={containerRef}
-        className="absolute inset-0 pointer-events-none"
+        className="absolute inset-0 pointer-events-auto"
         onMouseMove={handleMouseMove}
         onMouseLeave={handleMouseLeave}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
+        onClick={handleClick}
         style={{ zIndex: 10 }}
-      >
-        {hoverPosition && hoveredSymbol && hoveredSymbol.length > 0 && (
-          <div
-            className="absolute pointer-events-auto z-20 animate-in fade-in-0 zoom-in-95 duration-200"
-            style={{
-              left: `${Math.min(
-                hoverPosition.x + 10,
-                (containerRef.current?.offsetWidth || window.innerWidth) - 220
-              )}px`,
-              top: `${Math.max(hoverPosition.y - 60, 10)}px`,
+      />
+      {/* Hover overlay with watchlist button */}
+      {isHovering && hoveredSymbol && hoverPosition && (
+        <div
+          className="watchlist-overlay-button"
+          style={{
+            position: "absolute",
+            left: `${hoverPosition.x}px`,
+            top: `${hoverPosition.y}px`,
+            transform: "translate(-50%, -100%)",
+            marginTop: "-8px",
+            zIndex: 20,
+            pointerEvents: "auto",
+          }}
+          onMouseEnter={() => {
+            if (timeoutRef.current) {
+              clearTimeout(timeoutRef.current);
+            }
+          }}
+          onMouseLeave={handleMouseLeave}
+        >
+          <WatchlistButton
+            symbol={hoveredSymbol}
+            company={hoveredSymbol}
+            isInWatchlist={hoveredSymbolInWatchlist}
+            type="icon"
+            onWatchlistChange={(_symbol, _isAdded) => {
+              if (onWatchlistUpdate) {
+                onWatchlistUpdate();
+              }
+              // Keep overlay visible after action
+              setIsHovering(true);
             }}
-            onClick={(e) => e.stopPropagation()}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <div className="watchlist-overlay-button">
-              <WatchlistButton
-                symbol={hoveredSymbol}
-                company={hoveredSymbol}
-                isInWatchlist={isInWatchlist}
-                type="button"
-                onWatchlistChange={(symbol, isAdded) => {
-                  if (onWatchlistUpdate) {
-                    onWatchlistUpdate();
-                  }
-                }}
-              />
-            </div>
-          </div>
-        )}
-      </div>
+          />
+        </div>
+      )}
+      {clickedSymbol && (
+        <StockActionDialog
+          open={dialogOpen}
+          onOpenChange={(open) => {
+            setDialogOpen(open);
+            if (!open) {
+              // Clear clicked symbol when dialog closes
+              setTimeout(() => setClickedSymbol(null), 200);
+            }
+          }}
+          symbol={clickedSymbol}
+          company={clickedSymbol}
+          isInWatchlist={clickedSymbolInWatchlist}
+          onWatchlistChange={(_symbol, _isAdded) => {
+            if (onWatchlistUpdate) {
+              onWatchlistUpdate();
+            }
+          }}
+        />
+      )}
     </div>
   );
 };

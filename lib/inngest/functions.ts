@@ -3,7 +3,6 @@ import {NEWS_SUMMARY_EMAIL_PROMPT, PERSONALIZED_WELCOME_EMAIL_PROMPT} from "@/li
 import {getAllUsersForNewsEmail, type UserForNewsEmail} from "@/lib/actions/user.actions";
 import { getWatchlistSymbolsByEmail } from "@/lib/actions/watchlist.actions";
 import { getNews } from "@/lib/actions/finnhub.actions";
-import { getFormattedTodayDate } from "@/lib/utils";
 
 export const sendSignUpEmail = inngest.createFunction(
     { id: 'sign-up-email' },
@@ -18,7 +17,7 @@ export const sendSignUpEmail = inngest.createFunction(
 
         const prompt = PERSONALIZED_WELCOME_EMAIL_PROMPT.replace('{{userProfile}}', userProfile)
 
-        const response = await step.ai.infer('generate-welcome-intro', {
+        await step.ai.infer('generate-welcome-intro', {
             model: step.ai.models.gemini({ model: 'gemini-2.5-flash-lite' }),
             body: {
                 contents: [
@@ -32,14 +31,7 @@ export const sendSignUpEmail = inngest.createFunction(
         })
 
         await step.run('send-welcome-email', async () => {
-            // Email functionality removed
-            const part = response.candidates?.[0]?.content?.parts?.[0];
-            const introText = (part && 'text' in part ? part.text : null) ||'Thanks for joining Market_Mate. You now have the tools to track markets and make smarter moves.'
-
-            const { data: { email, name } } = event;
-
-            // Email sending disabled
-            console.log('Welcome email would be sent to:', email, 'with intro:', introText);
+            // Email functionality removed (nodemailer removed)
             return { success: true, message: 'Welcome email skipped (nodemailer removed)' };
         })
 
@@ -100,7 +92,7 @@ export const sendDailyNewsSummary = inngest.createFunction(
                     const newsContent = (part && 'text' in part ? part.text : null) || 'No market news.'
 
                     userNewsSummaries.push({ user, newsContent });
-                } catch (e) {
+                } catch {
                     console.error('Failed to summarize news for : ', user.email);
                     userNewsSummaries.push({ user, newsContent: null });
                 }
@@ -109,7 +101,6 @@ export const sendDailyNewsSummary = inngest.createFunction(
         // Step #4: Email sending disabled (nodemailer removed)
         await step.run('send-news-emails', async () => {
                 // Email functionality removed
-                console.log('News summary emails would be sent to', userNewsSummaries.length, 'users');
                 return { success: true, message: 'News emails skipped (nodemailer removed)' };
             })
 

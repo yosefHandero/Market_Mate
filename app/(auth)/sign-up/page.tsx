@@ -11,12 +11,10 @@ import {
 } from "@/lib/constants";
 import { CountrySelectField } from "@/components/forms/CountrySelectField";
 import FooterLink from "@/components/forms/FooterLink";
-import { signUpWithEmail } from "@/lib/actions/auth.actions";
-import { useRouter } from "next/navigation";
+import { signUpWithEmail, signInAsDemo } from "@/lib/actions/auth.actions";
 import { toast } from "sonner";
 
 const SignUp = () => {
-  const router = useRouter();
   const {
     register,
     handleSubmit,
@@ -57,7 +55,6 @@ const SignUp = () => {
 
   const handleDemoSignIn = async () => {
     try {
-      const { signInAsDemo } = await import("@/lib/actions/auth.actions");
       const result = await signInAsDemo();
       if (result.success) {
         toast.success("Demo mode activated", {
@@ -100,9 +97,11 @@ const SignUp = () => {
           register={register}
           error={errors.email}
           validation={{
-            required: "Email name is required",
-            pattern: /^\w+@\w+\.\w+$/,
-            message: "Email address is required",
+            required: "Email is required",
+            pattern: {
+              value: /^\w+@\w+\.\w+$/,
+              message: "Please enter a valid email address",
+            },
           }}
         />
 
@@ -174,7 +173,7 @@ const SignUp = () => {
         <Button
           type="button"
           onClick={handleDemoSignIn}
-          className="w-full mt-5 border-2 border-yellow-500 bg-transparent hover:bg-yellow-500/10 text-yellow-500 font-semibold"
+          className="w-full mt-5 border-2 border-yellow-500 bg-transparent text-yellow-500 font-semibold"
         >
           Try Demo Mode (No Sign Up Required)
         </Button>

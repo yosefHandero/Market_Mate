@@ -2,9 +2,7 @@ import TradingViewWidget from "@/components/TradingViewWidget";
 import MarketOverviewWrapper from "@/components/MarketOverviewWrapper";
 import StockHeatmapWrapper from "@/components/StockHeatmapWrapper";
 import {
-  HEATMAP_WIDGET_CONFIG,
   MARKET_DATA_WIDGET_CONFIG,
-  MARKET_OVERVIEW_WIDGET_CONFIG,
   TOP_STORIES_WIDGET_CONFIG,
 } from "@/lib/constants";
 import { getCurrentUser } from "@/lib/auth/session";
@@ -23,7 +21,9 @@ const Home = async () => {
     const watchlistItems = await Watchlist.find({ userId: user.id })
       .select("symbol")
       .lean();
-    watchlistSymbols = watchlistItems.map((item) => item.symbol.toUpperCase());
+    watchlistSymbols = watchlistItems.map((item) =>
+      String(item.symbol).toUpperCase()
+    );
   }
 
   return (
@@ -37,7 +37,7 @@ const Home = async () => {
             initialWatchlistSymbols={watchlistSymbols}
           />
         </div>
-        <div className="md-col-span xl:col-span-2">
+        <div className="md:col-span-2 xl:col-span-2">
           <StockHeatmapWrapper
             scriptUrl={`${scriptUrl}stock-heatmap.js`}
             height={600}

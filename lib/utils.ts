@@ -21,10 +21,6 @@ export const formatTimeAgo = (timestamp: number) => {
   }
 };
 
-export function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 // Formatted string like "$3.10T", "$900.00B", "$25.00M" or "$999,999.99"
 export function formatMarketCapValue(marketCapUsd: number): string {
   if (!Number.isFinite(marketCapUsd) || marketCapUsd <= 0) return 'N/A';
@@ -45,39 +41,9 @@ export const getDateRange = (days: number) => {
   };
 };
 
-// Get today's date range (from today to today)
-export const getTodayDateRange = () => {
-  const today = new Date();
-  const todayString = today.toISOString().split('T')[0];
-  return {
-    to: todayString,
-    from: todayString,
-  };
-};
-
-// Calculate news per symbol based on watchlist size
-export const calculateNewsDistribution = (symbolsCount: number) => {
-  let itemsPerSymbol: number;
-  let targetNewsCount = 6;
-
-  if (symbolsCount < 3) {
-    itemsPerSymbol = 3; // Fewer symbols, more news each
-  } else if (symbolsCount === 3) {
-    itemsPerSymbol = 2; // Exactly 3 symbols, 2 news each = 6 total
-  } else {
-    itemsPerSymbol = 1; // Many symbols, 1 news each
-    targetNewsCount = 6; // Don't exceed 6 total
-  }
-
-  return { itemsPerSymbol, targetNewsCount };
-};
-
 // Check for required article fields
 export const validateArticle = (article: RawNewsArticle) =>
     article.headline && article.summary && article.url && article.datetime;
-
-// Get today's date string in YYYY-MM-DD format
-export const getTodayString = () => new Date().toISOString().split('T')[0];
 
 export const formatArticle = (
     article: RawNewsArticle,
@@ -114,20 +80,6 @@ export const formatPrice = (price: number) => {
     currency: 'USD',
     minimumFractionDigits: 2,
   }).format(price);
-};
-
-export const formatDateToday = new Date().toLocaleDateString('en-US', {
-  weekday: 'long',
-  year: 'numeric',
-  month: 'long',
-  day: 'numeric',
-  timeZone: 'UTC',
-});
-
-
-export const getAlertText = (alert: Alert) => {
-  const condition = alert.alertType === 'upper' ? '>' : '<';
-  return `Price ${condition} ${formatPrice(alert.threshold)}`;
 };
 
 export const getFormattedTodayDate = () => new Date().toLocaleDateString('en-US', {

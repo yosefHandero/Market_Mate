@@ -20,7 +20,10 @@ export const signUpWithEmail = async ({ email, password, fullName, country, inve
         // Check if response has an error
         if('error' in response && response.error) {
             console.error('Sign up failed:', response.error)
-            return { success: false, error: response.error.message || 'Sign up failed' }
+            const errorMessage = (response.error && typeof response.error === 'object' && 'message' in response.error) 
+                ? String(response.error.message) 
+                : 'Sign up failed';
+            return { success: false, error: errorMessage }
         }
 
         if(response) {
@@ -58,7 +61,6 @@ export const signInWithEmail = async ({ email, password }: SignInFormData) => {
 
         return { success: true, data: response }
     } catch (e) {
-        console.log('Sign in failed', e)
         const errorMessage = e instanceof Error ? e.message : 'Sign in failed'
         return { success: false, error: errorMessage }
     }
@@ -74,14 +76,12 @@ export const signOut = async () => {
         try {
             const auth = await getAuth();
             await auth.api.signOut({ headers: await headers() });
-        } catch (authError) {
+        } catch {
             // Ignore auth errors if user is in demo mode
-            console.log('Auth sign out skipped (may be demo user)');
         }
         
         return { success: true };
-    } catch (e) {
-        console.log('Sign out failed', e)
+    } catch {
         return { success: false, error: 'Sign out failed' }
     }
 }
@@ -93,8 +93,7 @@ export const exitDemo = async () => {
         cookieStore.delete('demo-mode');
         
         return { success: true };
-    } catch (e) {
-        console.log('Exit demo failed', e)
+    } catch {
         return { success: false, error: 'Exit demo failed' }
     }
 }
@@ -107,7 +106,7 @@ export const signInAsDemo = async () => {
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
             sameSite: 'lax',
-            maxAge: 60 * 60 * 24 * 7, // 7 days
+            maxAge: 45, // 45 seconds - matches DemoTimer duration
         });
 
         return { 

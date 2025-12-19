@@ -20,7 +20,7 @@ type WatchlistRecord = {
   symbol: string;
   company?: string | null;
   createdAt?: Date | string;
-  addedAt?: Date | string;
+  addedAt?: Date | string; // Support legacy records that may only have addedAt
 };
 
 export async function GET(request: NextRequest) {
@@ -32,16 +32,21 @@ export async function GET(request: NextRequest) {
 
   await connectToDatabase();
 
-  const items = await Watchlist.find<WatchlistRecord>({ userId: user.id })
+  const items = await Watchlist.find({ userId: user.id })
     .sort({ createdAt: -1 })
     .lean();
 
   const data = items.map((item) => {
-    const createdAtValue = item.createdAt ?? item.addedAt ?? new Date();
+    // Support legacy records: use createdAt if available, otherwise fall back to addedAt
+    // addedAt may exist in legacy DB records but not in the model type, so we access it safely
+    const itemAny = item as unknown as Record<string, unknown>;
+    const createdAtValue = (item.createdAt as Date | string | undefined) ?? 
+                          (itemAny.addedAt as Date | string | undefined) ?? 
+                          new Date();
     const createdAtDate = createdAtValue instanceof Date ? createdAtValue : new Date(createdAtValue);
 
     return {
-      id: item._id.toString(),
+      id: String(item._id),
       symbol: item.symbol,
       company: item.company ?? item.symbol,
       createdAt: createdAtDate.toISOString(),
@@ -73,12 +78,18 @@ export async function POST(request: NextRequest) {
 
   if (existing) {
     const existingObj = existing.toObject<WatchlistRecord & WatchlistItem>();
-    const createdAtValue = existingObj.createdAt ?? existingObj.addedAt ?? new Date();
+    // Support legacy records: use createdAt if available, otherwise fall back to addedAt
+    // addedAt may exist in legacy DB records but not in the model type, so we access it safely
+    const existingAny = existingObj as unknown as Record<string, unknown>;
+    const createdAtValue = (existingObj.createdAt as Date | string | undefined) ?? 
+                          (existingAny.addedAt as Date | string | undefined) ?? 
+                          new Date();
+    const existingId = existing._id as Types.ObjectId;
 
     return NextResponse.json({
       success: true,
       data: {
-        id: existing._id.toString(),
+        id: String(existingId),
         symbol: existing.symbol,
         company: existing.company ?? existing.symbol,
         createdAt: createdAtValue instanceof Date ? createdAtValue.toISOString() : new Date(createdAtValue).toISOString(),
@@ -94,12 +105,13 @@ export async function POST(request: NextRequest) {
 
   const createdObj = created.toObject<WatchlistRecord & WatchlistItem>();
   const createdAtValue = createdObj.createdAt ?? new Date();
+  const createdId = created._id as Types.ObjectId;
 
   return NextResponse.json(
     {
       success: true,
       data: {
-        id: created._id.toString(),
+        id: String(createdId),
         symbol: created.symbol,
         company: created.company ?? created.symbol,
         createdAt: createdAtValue instanceof Date ? createdAtValue.toISOString() : new Date(createdAtValue).toISOString(),

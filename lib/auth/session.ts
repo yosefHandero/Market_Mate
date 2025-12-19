@@ -1,6 +1,6 @@
 import { headers, cookies } from "next/headers";
 
-import { auth } from "@/lib/better-auth/auth";
+import { getAuth } from "@/lib/better-auth/auth";
 
 export type CurrentUser = {
   id: string;
@@ -17,6 +17,7 @@ const DEMO_USER: CurrentUser = {
 
 async function getSessionFromHeaders(headersInit: HeadersInit) {
   try {
+    const auth = await getAuth();
     return await auth.api.getSession({ headers: headersInit });
   } catch (error) {
     console.error("Failed to retrieve session", error);
@@ -27,6 +28,12 @@ async function getSessionFromHeaders(headersInit: HeadersInit) {
 export async function getCurrentUser(): Promise<CurrentUser | null> {
   const headersList = await headers();
   return getCurrentUserFromHeaders(headersList);
+}
+
+export async function isDemoMode(): Promise<boolean> {
+  const cookieStore = await cookies();
+  const demoMode = cookieStore.get('demo-mode');
+  return demoMode?.value === 'true';
 }
 
 export async function getCurrentUserFromHeaders(

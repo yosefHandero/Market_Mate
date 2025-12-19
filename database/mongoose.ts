@@ -31,7 +31,10 @@ export const connectToDatabase = async () => {
         throw err;
     }
 
-    console.log(`Connected to database ${process.env.NODE_ENV} - ${MONGODB_URI}`);
+    // Log connection success without exposing URI
+    if (process.env.NODE_ENV === 'development') {
+        console.log(`Connected to database (${process.env.NODE_ENV})`);
+    }
 
     return cached.conn;
 }

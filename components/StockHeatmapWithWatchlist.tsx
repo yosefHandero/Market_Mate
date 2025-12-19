@@ -2,6 +2,7 @@
 
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import TradingViewWidget from "@/components/TradingViewWidget";
+import StockActionDialog from "@/components/StockActionDialog";
 import WatchlistButton from "@/components/WatchlistButton";
 import { HEATMAP_WIDGET_CONFIG } from "@/lib/constants";
 
@@ -25,12 +26,14 @@ const StockHeatmapWithWatchlist: React.FC<StockHeatmapWithWatchlistProps> = ({
     x: number;
     y: number;
   } | null>(null);
-  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [isHovering, setIsHovering] = useState(false);
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [clickedSymbol, setClickedSymbol] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const widgetContainerRef = useRef<HTMLDivElement>(null);
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastClickSymbolRef = useRef<string | null>(null);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Extract symbol from TradingView format
   const extractSymbol = useCallback(
@@ -46,7 +49,8 @@ const StockHeatmapWithWatchlist: React.FC<StockHeatmapWithWatchlistProps> = ({
 
   // Enhanced config - remove symbolUrl to prevent navigation
   // We'll capture symbols via hover detection and postMessage instead
-  const { symbolUrl, ...enhancedConfig } = HEATMAP_WIDGET_CONFIG;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { symbolUrl: _symbolUrl, ...enhancedConfig } = HEATMAP_WIDGET_CONFIG;
 
   // Listen for postMessage events from TradingView widget
   useEffect(() => {
@@ -59,6 +63,7 @@ const StockHeatmapWithWatchlist: React.FC<StockHeatmapWithWatchlistProps> = ({
             lastClickSymbolRef.current = symbol;
             setSelectedSymbol(symbol);
             setHoveredSymbol(symbol);
+            setIsHovering(true);
           }
         } else if (
           "name" in event.data &&
@@ -69,6 +74,7 @@ const StockHeatmapWithWatchlist: React.FC<StockHeatmapWithWatchlistProps> = ({
             lastClickSymbolRef.current = symbol;
             setSelectedSymbol(symbol);
             setHoveredSymbol(symbol);
+            setIsHovering(true);
           }
         }
       }
@@ -78,99 +84,103 @@ const StockHeatmapWithWatchlist: React.FC<StockHeatmapWithWatchlistProps> = ({
     return () => window.removeEventListener("message", handleMessage);
   }, [extractSymbol]);
 
-  // Handle mouse move to detect hover over heatmap tiles
-  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    if (!containerRef.current) return;
+  // Handle mouse move to track position
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!containerRef.current) return;
 
-    const rect = containerRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+      const rect = containerRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
 
-    // For heatmap, the entire area contains stock tiles
-    setIsHovering(true);
-    setHoverPosition({ x, y });
+      setHoverPosition({ x, y });
 
-    // If we have a last clicked symbol, use it
-    if (lastClickSymbolRef.current) {
-      setHoveredSymbol(lastClickSymbolRef.current);
-    }
+      // If we have a hovered symbol, show the overlay
+      if (hoveredSymbol) {
+        setIsHovering(true);
+        // Clear any existing timeout
+        if (timeoutRef.current) {
+          clearTimeout(timeoutRef.current);
+        }
+      }
+    },
+    [hoveredSymbol]
+  );
 
-    // Clear existing timeout
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-    }
-  }, []);
-
+  // Handle mouse leave to hide overlay
   const handleMouseLeave = useCallback(() => {
-    setIsHovering(false);
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
     }
     timeoutRef.current = setTimeout(() => {
+      setIsHovering(false);
+      setHoveredSymbol(null);
       setHoverPosition(null);
-      if (!selectedSymbol) {
-        setHoveredSymbol(null);
-      }
-    }, 300);
-  }, [selectedSymbol]);
+    }, 200);
+  }, []);
 
-  // Handle touch for mobile
+  // Handle touch events for mobile
   const handleTouchStart = useCallback(
     (e: React.TouchEvent<HTMLDivElement>) => {
       if (!containerRef.current) return;
 
-      const rect = containerRef.current.getBoundingClientRect();
       const touch = e.touches[0];
+      const rect = containerRef.current.getBoundingClientRect();
       const x = touch.clientX - rect.left;
       const y = touch.clientY - rect.top;
 
       setHoverPosition({ x, y });
-      if (lastClickSymbolRef.current) {
-        setHoveredSymbol(lastClickSymbolRef.current);
+
+      // Use lastClickSymbolRef if available
+      const symbolToUse = lastClickSymbolRef.current || selectedSymbol;
+      if (symbolToUse) {
+        setHoveredSymbol(symbolToUse);
+        setIsHovering(true);
       }
     },
-    []
+    [selectedSymbol]
   );
 
   const handleTouchEnd = useCallback(() => {
-    // Keep button visible on mobile after touch
-    setTimeout(() => {
-      if (!isHovering && !selectedSymbol) {
-        setHoverPosition(null);
-        setHoveredSymbol(null);
-      }
-    }, 2000);
-  }, [isHovering, selectedSymbol]);
-
-  // Update hovered symbol when selected symbol changes
-  useEffect(() => {
-    if (selectedSymbol) {
-      setHoveredSymbol(selectedSymbol);
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
     }
-  }, [selectedSymbol]);
+    timeoutRef.current = setTimeout(() => {
+      setIsHovering(false);
+      setHoveredSymbol(null);
+      setHoverPosition(null);
+    }, 2000);
+  }, []);
 
-  // Listen for messages from TradingView widget (if it sends symbol info)
+  // Handle click to open dialog
+  const handleClick = useCallback(
+    (_e: React.MouseEvent<HTMLDivElement>) => {
+      // Use lastClickSymbolRef if available (from TradingView widget click)
+      const symbolToUse = lastClickSymbolRef.current || hoveredSymbol;
+
+      if (symbolToUse) {
+        setClickedSymbol(symbolToUse);
+        setDialogOpen(true);
+      }
+    },
+    [hoveredSymbol]
+  );
+
+  // Cleanup timeout on unmount
   useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      // TradingView widgets may send postMessage events
-      if (event.data && typeof event.data === "object") {
-        if ("symbol" in event.data) {
-          const symbol = extractSymbol(event.data.symbol as string);
-          if (symbol) {
-            lastClickSymbolRef.current = symbol;
-            setSelectedSymbol(symbol);
-            setHoveredSymbol(symbol);
-          }
-        }
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
       }
     };
+  }, []);
 
-    window.addEventListener("message", handleMessage);
-    return () => window.removeEventListener("message", handleMessage);
-  }, [extractSymbol]);
-
-  const isInWatchlist = hoveredSymbol
+  const hoveredSymbolInWatchlist = hoveredSymbol
     ? watchlistSymbols.includes(hoveredSymbol.toUpperCase())
+    : false;
+
+  const clickedSymbolInWatchlist = clickedSymbol
+    ? watchlistSymbols.includes(clickedSymbol.toUpperCase())
     : false;
 
   return (
@@ -186,42 +196,69 @@ const StockHeatmapWithWatchlist: React.FC<StockHeatmapWithWatchlistProps> = ({
       </div>
       <div
         ref={containerRef}
-        className="absolute inset-0 pointer-events-none"
+        className="absolute inset-0 pointer-events-auto"
         onMouseMove={handleMouseMove}
         onMouseLeave={handleMouseLeave}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
+        onClick={handleClick}
         style={{ zIndex: 10 }}
-      >
-        {hoverPosition && hoveredSymbol && hoveredSymbol.length > 0 && (
-          <div
-            className="absolute pointer-events-auto z-20 animate-in fade-in-0 zoom-in-95 duration-200"
-            style={{
-              left: `${Math.min(
-                hoverPosition.x + 10,
-                (containerRef.current?.offsetWidth || window.innerWidth) - 220
-              )}px`,
-              top: `${Math.max(hoverPosition.y - 60, 10)}px`,
+      />
+      {/* Hover overlay with watchlist button */}
+      {isHovering && hoveredSymbol && hoverPosition && (
+        <div
+          className="watchlist-overlay-button"
+          style={{
+            position: "absolute",
+            left: `${hoverPosition.x}px`,
+            top: `${hoverPosition.y}px`,
+            transform: "translate(-50%, -100%)",
+            marginTop: "-8px",
+            zIndex: 20,
+            pointerEvents: "auto",
+          }}
+          onMouseEnter={() => {
+            if (timeoutRef.current) {
+              clearTimeout(timeoutRef.current);
+            }
+          }}
+          onMouseLeave={handleMouseLeave}
+        >
+          <WatchlistButton
+            symbol={hoveredSymbol}
+            company={hoveredSymbol}
+            isInWatchlist={hoveredSymbolInWatchlist}
+            type="icon"
+            onWatchlistChange={(_symbol, _isAdded) => {
+              if (onWatchlistUpdate) {
+                onWatchlistUpdate();
+              }
+              // Keep overlay visible after action
+              setIsHovering(true);
             }}
-            onClick={(e) => e.stopPropagation()}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <div className="watchlist-overlay-button">
-              <WatchlistButton
-                symbol={hoveredSymbol}
-                company={hoveredSymbol}
-                isInWatchlist={isInWatchlist}
-                type="button"
-                onWatchlistChange={(symbol, isAdded) => {
-                  if (onWatchlistUpdate) {
-                    onWatchlistUpdate();
-                  }
-                }}
-              />
-            </div>
-          </div>
-        )}
-      </div>
+          />
+        </div>
+      )}
+      {clickedSymbol && (
+        <StockActionDialog
+          open={dialogOpen}
+          onOpenChange={(open) => {
+            setDialogOpen(open);
+            if (!open) {
+              // Clear clicked symbol when dialog closes
+              setTimeout(() => setClickedSymbol(null), 200);
+            }
+          }}
+          symbol={clickedSymbol}
+          company={clickedSymbol}
+          isInWatchlist={clickedSymbolInWatchlist}
+          onWatchlistChange={(_symbol, _isAdded) => {
+            if (onWatchlistUpdate) {
+              onWatchlistUpdate();
+            }
+          }}
+        />
+      )}
     </div>
   );
 };

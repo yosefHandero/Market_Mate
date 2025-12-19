@@ -4,13 +4,10 @@ import { useForm } from "react-hook-form";
 import { Button } from "@/components/ui/button";
 import InputField from "@/components/forms/InputField";
 import FooterLink from "@/components/forms/FooterLink";
-import { signInWithEmail } from "@/lib/actions/auth.actions";
+import { signInWithEmail, signInAsDemo } from "@/lib/actions/auth.actions";
 import { toast } from "sonner";
-import { signInEmail } from "better-auth/api";
-import { useRouter } from "next/navigation";
 
 const SignIn = () => {
-  const router = useRouter();
   const {
     register,
     handleSubmit,
@@ -44,7 +41,6 @@ const SignIn = () => {
 
   const handleDemoSignIn = async () => {
     try {
-      const { signInAsDemo } = await import("@/lib/actions/auth.actions");
       const result = await signInAsDemo();
       if (result.success) {
         toast.success("Demo mode activated", {
@@ -79,7 +75,10 @@ const SignIn = () => {
           error={errors.email}
           validation={{
             required: "Email is required",
-            pattern: /^\w+@\w+\.\w+$/,
+            pattern: {
+              value: /^\w+@\w+\.\w+$/,
+              message: "Please enter a valid email address",
+            },
           }}
         />
 
@@ -113,7 +112,7 @@ const SignIn = () => {
         <Button
           type="button"
           onClick={handleDemoSignIn}
-          className="w-full mt-5 border-2 border-yellow-500 bg-transparent hover:bg-yellow-500/10 text-yellow-500 font-semibold"
+          className="w-full mt-5 border-2 border-yellow-500 bg-transparent text-yellow-500 font-semibold"
         >
           Try Demo Mode
         </Button>
