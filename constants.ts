@@ -21,10 +21,10 @@ export const navItems = [
 ];
 
 const CHART_COLORS = {
-  background: '#0b1116',
-  text: '#8f9fb1',
-  grid: '#1a2332',
-  border: '#1a2332',
+  background: '#0f1a2e',
+  text: '#a3aed0',
+  grid: '#1a2338',
+  border: '#1e2842',
   crosshairVertical: '#ffffff40',
   crosshairHorizontal: '#ffffff20',
   candleUp: '#158A6E',
@@ -93,13 +93,13 @@ export const getChartConfig = (
 
 export const PERIOD_CONFIG: Record<
   Period,
-  { days: number | string; interval?: 'hourly' | 'daily' }
+  { days: number | string }
 > = {
-  daily: { days: 1, interval: 'hourly' },
-  weekly: { days: 7, interval: 'hourly' },
-  monthly: { days: 30, interval: 'hourly' },
-  '3months': { days: 90, interval: 'daily' },
-  '6months': { days: 180, interval: 'daily' },
+  daily: { days: 1 },
+  weekly: { days: 7 },
+  monthly: { days: 30 },
+  '3months': { days: 90 },
+  '6months': { days: 180 },
   yearly: { days: 365 },
   max: { days: 'max' },
 };

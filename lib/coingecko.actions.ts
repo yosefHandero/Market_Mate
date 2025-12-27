@@ -21,12 +21,13 @@ export async function fetcher<T>(
     { skipEmptyString: true, skipNull: true },
   );
 
+  // Remove cache option entirely for Node.js 22 compatibility
+  // The cache option causes transformAlgorithm error in Node.js 22's fetch implementation
   const response = await fetch(url, {
     headers: {
-      'x-cg-pro-api-key': API_KEY,
+      'x-cg-demo-api-key': API_KEY,
       'Content-Type': 'application/json',
     } as Record<string, string>,
-    next: { revalidate },
   });
 
   if (!response.ok) {
@@ -36,6 +37,16 @@ export async function fetcher<T>(
   }
 
   return response.json();
+}
+
+export async function searchCoins(query: string): Promise<SearchCoin[]> {
+  try {
+    const data = await fetcher<{ coins: SearchCoin[] }>('/search', { query });
+    return data.coins.slice(0, 10);
+  } catch (error) {
+    console.error('Search error:', error);
+    return [];
+  }
 }
 
 export async function getPools(

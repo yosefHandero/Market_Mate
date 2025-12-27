@@ -34,14 +34,16 @@ const CandlestickChart = ({
 
   const fetchOHLCData = async (selectedPeriod: Period) => {
     try {
-      const { days, interval } = PERIOD_CONFIG[selectedPeriod];
+      const { days } = PERIOD_CONFIG[selectedPeriod];
 
-      const newData = await fetcher<OHLCData[]>(`/coins/${coinId}/ohlc`, {
+      const params: Record<string, string | number> = {
         vs_currency: 'usd',
         days,
-        interval,
         precision: 'full',
-      });
+      };
+
+      // Demo API doesn't support interval parameter - it auto-determines based on days
+      const newData = await fetcher<OHLCData[]>(`/coins/${coinId}/ohlc`, params);
 
       startTransition(() => {
         setOhlcData(newData ?? []);
