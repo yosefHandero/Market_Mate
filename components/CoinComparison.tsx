@@ -15,10 +15,6 @@ interface CoinComparisonProps {
   className?: string;
 }
 
-/**
- * Coin Comparison Tool
- * Allows selecting 2-3 coins and comparing their metrics
- */
 export default function CoinComparison({
   availableCoins,
   maxSelection = 3,
@@ -31,7 +27,6 @@ export default function CoinComparison({
 
     if (coins.length < 2) return null;
 
-    // Find best and worst performers
     let bestPerformer = coins[0].id;
     let worstPerformer = coins[0].id;
     let bestChange = coins[0].price_change_percentage_24h || 0;
@@ -81,7 +76,6 @@ export default function CoinComparison({
         </p>
       </div>
 
-      {/* Coin Selection */}
       <div className="flex flex-wrap gap-2">
         {availableCoins.slice(0, 20).map((coin) => {
           const isSelected = selectedCoins.includes(coin.id);
@@ -116,7 +110,6 @@ export default function CoinComparison({
         })}
       </div>
 
-      {/* Comparison Table */}
       <AnimatePresence>
         {comparisonData && (
           <motion.div
@@ -170,10 +163,9 @@ export default function CoinComparison({
                               <div className="flex items-center gap-1">
                                 <span className="text-sm font-medium text-white">{coin.name}</span>
                                 {isBest && (
-                                  <TrendingUp
-                                    className="h-3 w-3 text-green-400"
-                                    title="Best Performer"
-                                  />
+                                  <span title="Best Performer">
+                                    <TrendingUp className="h-3 w-3 text-green-400" />
+                                  </span>
                                 )}
                               </div>
                               <span className="text-xs text-gray-400">

@@ -23,7 +23,6 @@ const SearchCommand = () => {
 
   const debouncedQuery = useDebounce(searchQuery, 300);
 
-  // Keyboard shortcut handler for ⌘K / Ctrl+K
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
@@ -36,7 +35,6 @@ const SearchCommand = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  // Reset selectedIndex when results change or dialog closes
   useEffect(() => {
     if (!open) {
       setSelectedIndex(0);
@@ -45,7 +43,6 @@ const SearchCommand = () => {
     }
   }, [open]);
 
-  // Reset selectedIndex when results change
   useEffect(() => {
     setSelectedIndex(0);
   }, [results.length]);
@@ -61,8 +58,7 @@ const SearchCommand = () => {
       try {
         const coins = await searchCoins(debouncedQuery);
         setResults(coins);
-      } catch (error) {
-        console.error('Search error:', error);
+      } catch {
         setResults([]);
       } finally {
         setLoading(false);

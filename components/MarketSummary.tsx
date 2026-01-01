@@ -11,10 +11,6 @@ interface MarketSummaryProps {
   className?: string;
 }
 
-/**
- * AI-Powered Market Summary Component
- * Displays a comprehensive human-readable market analysis
- */
 export default function MarketSummary({ coins, className }: MarketSummaryProps) {
   const summary = generateMarketSummary(coins);
 

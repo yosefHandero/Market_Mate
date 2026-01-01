@@ -16,13 +16,11 @@ const nextConfig: NextConfig = {
       },
     ],
   },
-  // Fix for Node.js 22 compatibility
   experimental: {
     serverActions: {
       bodySizeLimit: '2mb',
     },
   },
-  // Fix Turbopack root issue
   turbopack: {
     root: process.cwd(),
   },

@@ -5,7 +5,7 @@ import Image from 'next/image';
 import { cn, formatCurrency, formatPercentage } from '@/lib/utils';
 import { TrendingDown, TrendingUp } from 'lucide-react';
 import DataTable from '@/components/DataTable';
-import { TrendingCoin } from '@/type';
+import type { DataTableColumn, TrendingCoin } from '@/type';
 
 interface TrendingCoinsTableProps {
   coins: TrendingCoin[];

@@ -17,17 +17,12 @@ interface UseMarketDataReturn {
   loading: boolean;
   error: Error | null;
   refetch: () => Promise<void>;
-  // Derived metrics
   totalMarketCap: number;
   averagePriceChange: number;
   gainersCount: number;
   losersCount: number;
 }
 
-/**
- * Custom hook for fetching and managing market data
- * Includes caching, derived metrics, and error handling
- */
 export function useMarketData(options: UseMarketDataOptions = {}): UseMarketDataReturn {
   const {
     vsCurrency = 'usd',
@@ -68,7 +63,6 @@ export function useMarketData(options: UseMarketDataOptions = {}): UseMarketData
     fetchData();
   }, [fetchData]);
 
-  // Derived metrics (memoized)
   const totalMarketCap = useMemo(
     () => data.reduce((sum, coin) => sum + (coin.market_cap || 0), 0),
     [data],

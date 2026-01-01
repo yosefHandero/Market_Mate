@@ -4,13 +4,12 @@ import { useState } from 'react';
 import { Input } from '@/components/ui/input';
 import Image from 'next/image';
 import { formatCurrency } from '@/lib/utils';
+import type { ConverterProps } from '@/type';
 
 import {
   Select,
   SelectContent,
-  SelectGroup,
   SelectItem,
-  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';

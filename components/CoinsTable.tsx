@@ -4,7 +4,7 @@ import Image from 'next/image';
 import Link from 'next/link';
 import { cn, formatPercentage, formatCurrency } from '@/lib/utils';
 import DataTable from '@/components/DataTable';
-import { CoinMarketData } from '@/type';
+import type { CoinMarketData, DataTableColumn } from '@/type';
 
 interface CoinsTableProps {
   coins: CoinMarketData[];

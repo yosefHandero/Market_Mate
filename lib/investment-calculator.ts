@@ -1,17 +1,5 @@
-/**
- * Investment Calculator Utilities
- * Calculate returns on hypothetical investments
- */
-
 import { InvestmentResult } from '@/type';
 
-/**
- * Calculate investment returns
- * @param initialInvestment - Initial investment amount (e.g., $100)
- * @param historicalPrice - Price at time of investment
- * @param currentPrice - Current price
- * @returns Investment result with gain/loss calculations
- */
 export function calculateInvestment(
   initialInvestment: number,
   historicalPrice: number,
@@ -42,9 +30,6 @@ export function calculateInvestment(
   };
 }
 
-/**
- * Format investment result for display
- */
 export function formatInvestmentResult(result: InvestmentResult) {
   return {
     ...result,

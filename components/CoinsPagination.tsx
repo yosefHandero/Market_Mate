@@ -3,7 +3,6 @@
 import {
   Pagination,
   PaginationContent,
-  PaginationEllipsis,
   PaginationItem,
   PaginationLink,
   PaginationNext,
@@ -11,8 +10,9 @@ import {
 } from '@/components/ui/pagination';
 import { useRouter } from 'next/navigation';
 import { buildPageNumbers, cn, ELLIPSIS } from '@/lib/utils';
+import type { Pagination as PaginationProps } from '@/type';
 
-const CoinsPagination = ({ currentPage, totalPages, hasMorePages }: Pagination) => {
+const CoinsPagination = ({ currentPage, totalPages, hasMorePages }: PaginationProps) => {
   const router = useRouter();
 
   const handlePageChange = (page: number) => {

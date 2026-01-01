@@ -2,12 +2,12 @@ import { clsx, type ClassValue } from 'clsx';
 import { Time } from 'lightweight-charts';
 import { twMerge } from 'tailwind-merge';
 import { TrendingUp, TrendingDown, Minus } from 'lucide-react';
+import type { OHLCData } from '@/type';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-// Memoized formatCurrency with cache
 const currencyCache = new Map<string, string>();
 
 export function formatCurrency(
@@ -41,7 +41,6 @@ export function formatCurrency(
     });
   }
 
-  // Limit cache size to prevent memory leaks
   if (currencyCache.size > 1000) {
     const firstKey = currencyCache.keys().next().value;
     currencyCache.delete(firstKey);
@@ -58,7 +57,6 @@ export function formatPercentage(change: number | null | undefined): string {
   return `${formattedChange}%`;
 }
 
-// Enhanced trend utilities
 export type TrendDirection = 'up' | 'down' | 'neutral';
 
 export interface TrendInfo {
@@ -69,11 +67,6 @@ export interface TrendInfo {
   color: string;
 }
 
-/**
- * Get comprehensive trend information from a numeric value
- * @param value - The numeric value (positive = up, negative = down, zero = neutral)
- * @returns Trend information including classes, icon, and color
- */
 export function getTrendInfo(value: number | null | undefined): TrendInfo {
   if (value === null || value === undefined || isNaN(value)) {
     return {
@@ -117,21 +110,14 @@ export function getTrendInfo(value: number | null | undefined): TrendInfo {
   };
 }
 
-/**
- * Get trend color (hex) from value
- */
 export function getTrendColor(value: number | null | undefined): string {
   return getTrendInfo(value).color;
 }
 
-/**
- * Get trend icon component from value
- */
 export function getTrendIcon(value: number | null | undefined) {
   return getTrendInfo(value).icon;
 }
 
-// Legacy function for backward compatibility
 export function trendingClasses(value: number) {
   const trend = getTrendInfo(value);
   return {
@@ -144,7 +130,7 @@ export function trendingClasses(value: number) {
 export function timeAgo(date: string | number | Date): string {
   const now = new Date();
   const past = new Date(date);
-  const diff = now.getTime() - past.getTime(); // difference in ms
+  const diff = now.getTime() - past.getTime();
 
   const seconds = Math.floor(diff / 1000);
   const minutes = Math.floor(seconds / 60);
@@ -158,14 +144,13 @@ export function timeAgo(date: string | number | Date): string {
   if (days < 7) return `${days} day${days > 1 ? 's' : ''}`;
   if (weeks < 4) return `${weeks} week${weeks > 1 ? 's' : ''}`;
 
-  // Format date as YYYY-MM-DD
   return past.toISOString().split('T')[0];
 }
 
 export function convertOHLCData(data: OHLCData[]) {
   return data
     .map((d) => ({
-      time: d[0] as Time, // ensure seconds, not ms
+      time: d[0] as Time,
       open: d[1],
       high: d[2],
       low: d[3],

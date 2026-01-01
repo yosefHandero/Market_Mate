@@ -51,4 +51,3 @@ export default function VolumeSpikesPage() {
     </main>
   );
 }
-

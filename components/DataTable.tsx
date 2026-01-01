@@ -12,10 +12,9 @@ import { cn } from '@/lib/utils';
 import { motion } from 'framer-motion';
 import type { DataTableProps, DataTableColumn } from '@/type';
 
-// Helper function to extract value from object using dot notation path
 const getValueByPath = (obj: unknown, path: string): unknown => {
   if (path === '__index__') {
-    return undefined; // Special case handled separately
+    return undefined;
   }
   return path.split('.').reduce<unknown>((current, prop) => {
     if (current && typeof current === 'object' && prop in current) {

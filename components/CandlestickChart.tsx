@@ -11,6 +11,7 @@ import {
 import { CandlestickSeries, createChart, IChartApi, ISeriesApi } from 'lightweight-charts';
 import { fetcher } from '@/lib/coingecko.actions';
 import { convertOHLCData } from '@/lib/utils';
+import type { CandlestickChartProps, OHLCData, Period } from '@/type';
 
 const CandlestickChart = ({
   children,
@@ -42,14 +43,12 @@ const CandlestickChart = ({
         precision: 'full',
       };
 
-      // Demo API doesn't support interval parameter - it auto-determines based on days
       const newData = await fetcher<OHLCData[]>(`/coins/${coinId}/ohlc`, params);
 
       startTransition(() => {
         setOhlcData(newData ?? []);
       });
-    } catch (e) {
-      console.error('Failed to fetch OHLCData', e);
+    } catch {
     }
   };
 

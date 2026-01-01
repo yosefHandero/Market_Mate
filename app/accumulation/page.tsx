@@ -42,7 +42,9 @@ export default function AccumulationPage() {
         </div>
 
         <div className="rounded-lg border border-purple-100/10 bg-gradient-to-br from-dark-400/80 to-dark-500/60 p-6 backdrop-blur-sm">
-          <p className="text-center text-gray-400">No accumulation signals detected at this time.</p>
+          <p className="text-center text-gray-400">
+            No accumulation signals detected at this time.
+          </p>
         </div>
       </main>
     );
@@ -66,4 +68,3 @@ export default function AccumulationPage() {
     </main>
   );
 }
-

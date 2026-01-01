@@ -96,7 +96,6 @@ export interface SearchCoin {
   };
 }
 
-// Chart Section Props (used in ChartSection.tsx)
 export interface ChartSectionProps {
   coinData: {
     image: { large: string };
@@ -317,7 +316,6 @@ export interface PoolData {
   network: string;
 }
 
-// Enhanced market data types for insights
 export interface MarketInsight {
   id: string;
   type: 'top_mover' | 'volume_spike' | 'near_high' | 'whale_accumulation';
@@ -341,15 +339,14 @@ export interface VolumeSpikeInsight extends MarketInsight {
 export interface NearHighInsight extends MarketInsight {
   type: 'near_high';
   days: number;
-  proximity: number; // percentage from high
+  proximity: number;
 }
 
 export interface WhaleAccumulationInsight extends MarketInsight {
   type: 'whale_accumulation';
-  signalStrength: number; // 0-100
+  signalStrength: number;
 }
 
-// Investment calculator types
 export interface InvestmentResult {
   initialInvestment: number;
   currentValue: number;
@@ -358,7 +355,6 @@ export interface InvestmentResult {
   isProfit: boolean;
 }
 
-// Coin comparison types
 export interface ComparisonCoin {
   id: string;
   name: string;
@@ -374,6 +370,6 @@ export interface ComparisonCoin {
 
 export interface CoinComparison {
   coins: ComparisonCoin[];
-  bestPerformer: string; // coin id
-  worstPerformer: string; // coin id
+  bestPerformer: string;
+  worstPerformer: string;
 }

@@ -4,10 +4,6 @@ import { useEffect, useState } from 'react';
 import { fetcher } from '@/lib/coingecko.actions';
 import { CoinMarketData } from '@/type';
 
-/**
- * Shared hook for fetching market data
- * Used across multiple pages for consistent data fetching
- */
 export function useMarketData() {
   const [coins, setCoins] = useState<CoinMarketData[]>([]);
   const [loading, setLoading] = useState(true);
@@ -38,4 +34,3 @@ export function useMarketData() {
 
   return { coins, loading, error };
 }
-

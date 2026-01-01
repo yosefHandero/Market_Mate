@@ -13,10 +13,6 @@ interface AnimatedPriceProps {
   showChange?: boolean;
 }
 
-/**
- * Animated price component with smooth transitions and flash effects
- * Animates price changes with spring physics
- */
 export default function AnimatedPrice({
   price,
   previousPrice,
@@ -31,31 +27,26 @@ export default function AnimatedPrice({
   });
 
   const scale = useMotionValue(1);
-  const color = useMotionValue('rgb(163, 163, 163)'); // default gray
+  const color = useMotionValue('rgb(163, 163, 163)');
   const prevPriceRef = useRef(price);
 
   useEffect(() => {
     if (previousPrice !== undefined && previousPrice !== price) {
       const isIncrease = price > previousPrice;
 
-      // Update color
       color.set(isIncrease ? 'rgb(74, 222, 128)' : 'rgb(248, 113, 113)');
 
-      // Animate scale
       scale.set(1.1);
       setTimeout(() => {
         scale.set(1);
       }, 300);
 
-      // Update spring value
       priceSpring.set(price);
 
-      // Reset color after animation
       setTimeout(() => {
         color.set('rgb(163, 163, 163)');
       }, 1000);
     } else if (prevPriceRef.current !== price) {
-      // Initial load or price update without previous price
       priceSpring.set(price);
       prevPriceRef.current = price;
     }

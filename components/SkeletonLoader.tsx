@@ -11,9 +11,6 @@ interface SkeletonLoaderProps {
   animate?: boolean;
 }
 
-/**
- * Skeleton loader component to prevent layout shift
- */
 export default function SkeletonLoader({
   className,
   variant = 'rectangular',
@@ -60,9 +57,6 @@ export default function SkeletonLoader({
   );
 }
 
-/**
- * Skeleton for table rows
- */
 export function TableSkeleton({ rows = 5 }: { rows?: number }) {
   return (
     <div className="space-y-2">
@@ -73,9 +67,6 @@ export function TableSkeleton({ rows = 5 }: { rows?: number }) {
   );
 }
 
-/**
- * Skeleton for cards
- */
 export function CardSkeleton({ count = 3 }: { count?: number }) {
   return (
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">

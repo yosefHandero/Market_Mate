@@ -21,8 +21,7 @@ const CoinOverview = async () => {
         precision: 'full',
       }),
     ]);
-  } catch (error) {
-    console.error('Error fetching coin overview:', error);
+  } catch {
     return <CoinOverviewFallback />;
   }
 

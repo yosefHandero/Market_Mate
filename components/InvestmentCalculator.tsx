@@ -5,7 +5,6 @@ import { motion } from 'framer-motion';
 import { calculateInvestment, formatInvestmentResult } from '@/lib/investment-calculator';
 import { formatCurrency } from '@/lib/utils';
 import { Input } from '@/components/ui/input';
-import { Button } from '@/components/ui/button';
 import { TrendingUp, TrendingDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -16,10 +15,6 @@ interface InvestmentCalculatorProps {
   className?: string;
 }
 
-/**
- * "If You Invested $100" Calculator Component
- * Calculates returns on hypothetical investments
- */
 export default function InvestmentCalculator({
   currentPrice,
   historicalPrice,

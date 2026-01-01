@@ -7,9 +7,8 @@ const TrendingCoins = async () => {
   let trendingCoins: { coins: TrendingCoin[] } | undefined;
 
   try {
-    trendingCoins = await fetcher<{ coins: TrendingCoin[] }>('/search/trending', undefined, 300);
-  } catch (error) {
-    console.error('Error fetching trending coins:', error);
+    trendingCoins = await fetcher<{ coins: TrendingCoin[] }>('/search/trending', undefined);
+  } catch {
     return <TrendingCoinsFallback />;
   }
 

@@ -11,10 +11,6 @@ import Image from 'next/image';
 import { formatCurrency, formatPercentage, getTrendInfo } from '@/lib/utils';
 import { cn } from '@/lib/utils';
 
-/**
- * Client component for market insights and summary previews
- * Shows previews with links to full pages
- */
 export default function MarketInsights() {
   const { coins, loading, error } = useMarketData();
 
@@ -32,7 +28,10 @@ export default function MarketInsights() {
 
   const insights = generateInsights(coins);
 
-  const renderCoinPreview = (coin: (typeof coins)[0], type?: 'volume_spike' | 'whale_accumulation') => {
+  const renderCoinPreview = (
+    coin: (typeof coins)[0],
+    type?: 'volume_spike' | 'whale_accumulation',
+  ) => {
     const trend = getTrendInfo(coin.price_change_percentage_24h);
     const TrendIcon = trend.icon;
 
@@ -77,7 +76,10 @@ export default function MarketInsights() {
   return (
     <div className="space-y-6">
       <Link href="/market-summary" className="block">
-        <MarketSummary coins={coins} className="cursor-pointer transition-opacity hover:opacity-90" />
+        <MarketSummary
+          coins={coins}
+          className="cursor-pointer transition-opacity hover:opacity-90"
+        />
       </Link>
 
       <div className="grid gap-6 md:grid-cols-2">
@@ -88,7 +90,7 @@ export default function MarketInsights() {
           href="/top-movers"
         >
           <div className="space-y-2">
-            {insights.topMovers.gainers.slice(0, 3).map(renderCoinPreview)}
+            {insights.topMovers.gainers.slice(0, 3).map((coin) => renderCoinPreview(coin))}
           </div>
         </InsightPreview>
 
@@ -99,7 +101,7 @@ export default function MarketInsights() {
           href="/top-movers"
         >
           <div className="space-y-2">
-            {insights.topMovers.losers.slice(0, 3).map(renderCoinPreview)}
+            {insights.topMovers.losers.slice(0, 3).map((coin) => renderCoinPreview(coin))}
           </div>
         </InsightPreview>
 
@@ -110,7 +112,9 @@ export default function MarketInsights() {
           href="/volume-spikes"
         >
           <div className="space-y-2">
-            {insights.volumeSpikes.slice(0, 3).map((coin) => renderCoinPreview(coin, 'volume_spike'))}
+            {insights.volumeSpikes
+              .slice(0, 3)
+              .map((coin) => renderCoinPreview(coin, 'volume_spike'))}
           </div>
         </InsightPreview>
 
@@ -121,7 +125,7 @@ export default function MarketInsights() {
           href="/near-high"
         >
           <div className="space-y-2">
-            {insights.nearHigh.slice(0, 3).map(renderCoinPreview)}
+            {insights.nearHigh.slice(0, 3).map((coin) => renderCoinPreview(coin))}
           </div>
         </InsightPreview>
 

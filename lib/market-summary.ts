@@ -1,8 +1,3 @@
-/**
- * AI-Powered Market Summary Generator
- * Generates comprehensive human-readable market summaries from all market insights
- */
-
 import type { CoinMarketData } from '@/type';
 import {
   getTopMovers,
@@ -17,10 +12,6 @@ interface MarketSummary {
   keyTrends: string[];
 }
 
-/**
- * Generate a comprehensive, human-readable market summary
- * Includes insights from Top Movers, Volume Spikes, Near High, and Accumulation
- */
 export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
   if (!coins || coins.length === 0) {
     return {
@@ -30,29 +21,24 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     };
   }
 
-  // Generate all insights
   const topMovers = getTopMovers(coins, '24h', 5);
   const volumeSpikes = getVolumeSpikes(coins, 1.5);
   const nearHigh = getCoinsNearHigh(coins, 7, 5);
   const whaleSignals = getWhaleAccumulationSignals(coins);
 
-  // Analyze market trends
   const avgPriceChange =
     coins.reduce((sum, coin) => sum + (coin.price_change_percentage_24h || 0), 0) / coins.length;
   const gainers = coins.filter((c) => (c.price_change_percentage_24h || 0) > 0).length;
   const gainerRatio = gainers / coins.length;
 
-  // Get Bitcoin and Ethereum data
   const bitcoin = coins.find((c) => c.id === 'bitcoin' || c.symbol === 'btc');
   const ethereum = coins.find((c) => c.id === 'ethereum' || c.symbol === 'eth');
   const bitcoinChange = bitcoin?.price_change_percentage_24h || 0;
   const ethereumChange = ethereum?.price_change_percentage_24h || 0;
 
-  // Build comprehensive summary
   const trends: string[] = [];
   const summaryParts: string[] = [];
 
-  // Opening: Bitcoin and overall market sentiment
   if (bitcoin) {
     if (bitcoinChange > 2) {
       trends.push('Bitcoin showing strong momentum');
@@ -77,7 +63,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     }
   }
 
-  // Ethereum mention if significant
   if (ethereum && Math.abs(ethereumChange) > 1) {
     if (ethereumChange > 0) {
       summaryParts.push(`while Ethereum (ETH) follows with a ${ethereumChange.toFixed(1)}% gain`);
@@ -86,7 +71,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     }
   }
 
-  // Market breadth analysis
   if (gainerRatio > 0.6) {
     trends.push('Broad market strength');
     summaryParts.push('The broader altcoin market shows increased momentum');
@@ -98,7 +82,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     summaryParts.push('with mixed signals across the altcoin market');
   }
 
-  // Top Gainers section
   if (topMovers.gainers.length > 0) {
     const topGainers = topMovers.gainers.slice(0, 3);
     const gainerNames = topGainers.map((c) => c.name).join(', ');
@@ -119,7 +102,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     }
   }
 
-  // Top Losers section
   if (topMovers.losers.length > 0) {
     const topLosers = topMovers.losers.slice(0, 3);
     const loserNames = topLosers.map((c) => c.name).join(', ');
@@ -140,7 +122,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     }
   }
 
-  // Volume Spikes section
   if (volumeSpikes.length > 0) {
     const significantVolumeSpikes = volumeSpikes.slice(0, 3);
     const volumeNames = significantVolumeSpikes.map((c) => c.name).join(', ');
@@ -158,7 +139,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     }
   }
 
-  // Near High section
   if (nearHigh.length > 0) {
     const nearHighCoins = nearHigh.slice(0, 3);
     const nearHighNames = nearHighCoins.map((c) => c.name).join(', ');
@@ -172,7 +152,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     );
   }
 
-  // Whale Accumulation section
   if (whaleSignals.length > 0) {
     const topWhaleSignals = whaleSignals.slice(0, 3);
     const whaleNames = topWhaleSignals.map((s) => s.coin.name).join(', ');
@@ -195,7 +174,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     );
   }
 
-  // Overall volume context
   const totalVolume = coins.reduce((sum, coin) => sum + (coin.total_volume || 0), 0);
   const avgVolume = totalVolume / coins.length;
   const highVolumeCount = coins.filter((c) => (c.total_volume || 0) > avgVolume * 1.5).length;
@@ -207,7 +185,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     );
   }
 
-  // Market cap context
   const marketCapChange =
     coins.reduce((sum, coin) => sum + (coin.market_cap_change_percentage_24h || 0), 0) /
     coins.length;
@@ -224,13 +201,10 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
     }
   }
 
-  // Combine all summary parts
   let summary = summaryParts.join('. ') + '.';
 
-  // Add period context
   summary += ' All metrics reflect the last 24 hours of trading activity.';
 
-  // Determine sentiment
   let sentiment: 'bullish' | 'bearish' | 'neutral' = 'neutral';
   const positiveFactors =
     (avgPriceChange > 0 ? 1 : 0) +
@@ -254,6 +228,6 @@ export function generateMarketSummary(coins: CoinMarketData[]): MarketSummary {
   return {
     summary,
     sentiment,
-    keyTrends: trends.slice(0, 8), // Increased from 4 to 8 for more trends
+    keyTrends: trends.slice(0, 8),
   };
 }

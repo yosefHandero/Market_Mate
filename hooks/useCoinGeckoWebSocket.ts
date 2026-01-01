@@ -1,6 +1,14 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import type {
+  ExtendedPriceData,
+  OHLCData,
+  Trade,
+  UseCoinGeckoWebSocketProps,
+  UseCoinGeckoWebSocketReturn,
+  WebSocketMessage,
+} from '@/type';
 
 const WS_BASE = `${process.env.NEXT_PUBLIC_COINGECKO_WEBSOCKET_URL}?x_cg_demo_api_key=${process.env.NEXT_PUBLIC_COINGECKO_API_KEY}`;
 
@@ -79,7 +87,7 @@ export const useCoinGeckoWebSocket = ({
 
     ws.onclose = () => setIsWsReady(false);
 
-    ws.onerror = (error) => {
+    ws.onerror = () => {
       setIsWsReady(false);
     };
 

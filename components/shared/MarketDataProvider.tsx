@@ -25,4 +25,3 @@ export function useMarketDataContext() {
   }
   return context;
 }
-

@@ -8,8 +8,7 @@ const Categories = async () => {
 
   try {
     categories = await fetcher<Category[]>('/coins/categories');
-  } catch (error) {
-    console.error('Error fetching categories:', error);
+  } catch {
     return <CategoriesFallback />;
   }
 
