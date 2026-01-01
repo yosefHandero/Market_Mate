@@ -5,6 +5,8 @@ import { ArrowUpRight } from 'lucide-react';
 import { formatCurrency } from '@/lib/utils';
 import LiveDataWrapper from '@/components/LiveDataWrapper';
 import Converter from '@/components/Converter';
+import InvestmentCalculator from '@/components/InvestmentCalculator';
+import type { NextPageProps, CoinDetailsData, OHLCData } from '@/type';
 
 const Page = async ({ params }: NextPageProps) => {
   const { id } = await params;
@@ -13,7 +15,7 @@ const Page = async ({ params }: NextPageProps) => {
     fetcher<CoinDetailsData>(`/coins/${id}`, {
       dex_pair_format: 'contract_address',
     }),
-    fetcher<OHLCData>(`/coins/${id}/ohlc`, {
+    fetcher<OHLCData[]>(`/coins/${id}/ohlc`, {
       vs_currency: 'usd',
       days: 1,
       precision: 'full',
@@ -23,7 +25,7 @@ const Page = async ({ params }: NextPageProps) => {
   const platform = coinData.asset_platform_id
     ? coinData.detail_platforms?.[coinData.asset_platform_id]
     : null;
-  const network = platform?.geckoterminal_url.split('/')[3] || null;
+  const network = platform?.geckoterminal_url?.split('/')[3] || null;
   const contractAddress = platform?.contract_address || null;
 
   const pool = await getPools(id, network, contractAddress);
@@ -44,13 +46,13 @@ const Page = async ({ params }: NextPageProps) => {
     {
       label: 'Website',
       value: '-',
-      link: coinData.links.homepage[0],
+      link: coinData.links.homepage?.[0],
       linkText: 'Homepage',
     },
     {
       label: 'Explorer',
       value: '-',
-      link: coinData.links.blockchain_site[0],
+      link: coinData.links.blockchain_site?.[0],
       linkText: 'Explorer',
     },
     {
@@ -64,7 +66,12 @@ const Page = async ({ params }: NextPageProps) => {
   return (
     <main id="coin-details-page">
       <section className="primary">
-        <LiveDataWrapper coinId={id} poolId={pool.id} coin={coinData} coinOHLCData={coinOHLCData}>
+        <LiveDataWrapper
+          coinId={id}
+          poolId={pool.id || ''}
+          coin={coinData}
+          coinOHLCData={coinOHLCData}
+        >
           <h4>Exchange Listings</h4>
         </LiveDataWrapper>
       </section>
@@ -74,6 +81,12 @@ const Page = async ({ params }: NextPageProps) => {
           symbol={coinData.symbol}
           icon={coinData.image.small}
           priceList={coinData.market_data.current_price}
+        />
+
+        <InvestmentCalculator
+          currentPrice={coinData.market_data.current_price.usd}
+          defaultInvestment={100}
+          className="mt-6"
         />
 
         <div className="details">

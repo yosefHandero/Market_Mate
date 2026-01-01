@@ -12,8 +12,15 @@ const Header = () => {
   return (
     <header>
       <div className="main-container inner">
-        <Link href="/">
-          <Image src="/logo.svg" alt="CoinMetric logo" width={132} height={40} />
+        <Link href="/" className="flex items-center gap-3">
+          <Image
+            src="/coin.jpg"
+            alt="MarketMate logo"
+            width={40}
+            height={40}
+            className="rounded-full object-cover"
+          />
+          <span className="text-xl font-bold text-purple-200">MarketMate</span>
         </Link>
 
         <nav>
@@ -27,8 +34,6 @@ const Header = () => {
             Home
           </Link>
 
-          <SearchCommand />
-
           <Link
             href="/coins"
             className={cn('nav-link', {
@@ -37,6 +42,53 @@ const Header = () => {
           >
             All Coins
           </Link>
+
+          <Link
+            href="/top-movers"
+            className={cn('nav-link', {
+              'is-active': pathname === '/top-movers',
+            })}
+          >
+            Top Movers
+          </Link>
+
+          <Link
+            href="/volume-spikes"
+            className={cn('nav-link', {
+              'is-active': pathname === '/volume-spikes',
+            })}
+          >
+            Volume Spikes
+          </Link>
+
+          <Link
+            href="/near-high"
+            className={cn('nav-link', {
+              'is-active': pathname === '/near-high',
+            })}
+          >
+            Near High
+          </Link>
+
+          <Link
+            href="/accumulation"
+            className={cn('nav-link', {
+              'is-active': pathname === '/accumulation',
+            })}
+          >
+            Accumulation
+          </Link>
+
+          <Link
+            href="/market-summary"
+            className={cn('nav-link', {
+              'is-active': pathname === '/market-summary',
+            })}
+          >
+            Market Summary
+          </Link>
+
+          <SearchCommand />
         </nav>
       </div>
     </header>

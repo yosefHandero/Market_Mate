@@ -14,8 +14,12 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'CoinMetric',
+  title: 'MarketMate',
   description: 'Crypto Screener App with a built-in High-Frequency Terminal & Dashboard',
+  icons: {
+    icon: '/coin.jpg',
+    apple: '/coin.jpg',
+  },
 };
 
 export default function RootLayout({

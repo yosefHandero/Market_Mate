@@ -8,6 +8,10 @@ const API_KEY = process.env.COINGECKO_API_KEY;
 if (!BASE_URL) throw new Error('Could not get base url');
 if (!API_KEY) throw new Error('Could not get api key');
 
+// Determine which API key header to use based on the base URL
+const isProAPI = BASE_URL.includes('pro-api.coingecko.com');
+const API_KEY_HEADER = isProAPI ? 'x-cg-pro-api-key' : 'x-cg-demo-api-key';
+
 export async function fetcher<T>(
   endpoint: string,
   params?: QueryParams,
@@ -25,15 +29,25 @@ export async function fetcher<T>(
   // The cache option causes transformAlgorithm error in Node.js 22's fetch implementation
   const response = await fetch(url, {
     headers: {
-      'x-cg-demo-api-key': API_KEY,
+      [API_KEY_HEADER]: API_KEY,
       'Content-Type': 'application/json',
     } as Record<string, string>,
   });
 
   if (!response.ok) {
-    const errorBody: CoinGeckoErrorBody = await response.json().catch(() => ({}));
+    let errorMessage = response.statusText;
+    try {
+      const errorBody: CoinGeckoErrorBody = await response.json();
+      errorMessage = errorBody.error || errorMessage;
+      // If error is an object, stringify it
+      if (typeof errorMessage === 'object') {
+        errorMessage = JSON.stringify(errorMessage);
+      }
+    } catch {
+      // If JSON parsing fails, use status text
+    }
 
-    throw new Error(`API Error: ${response.status}: ${errorBody.error || response.statusText} `);
+    throw new Error(`API Error: ${response.status}: ${errorMessage}`);
   }
 
   return response.json();

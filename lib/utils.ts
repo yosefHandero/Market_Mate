@@ -1,10 +1,14 @@
 import { clsx, type ClassValue } from 'clsx';
 import { Time } from 'lightweight-charts';
 import { twMerge } from 'tailwind-merge';
+import { TrendingUp, TrendingDown, Minus } from 'lucide-react';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
+
+// Memoized formatCurrency with cache
+const currencyCache = new Map<string, string>();
 
 export function formatCurrency(
   value: number | null | undefined,
@@ -16,18 +20,34 @@ export function formatCurrency(
     return showSymbol !== false ? '$0.00' : '0.00';
   }
 
+  const cacheKey = `${value}-${digits ?? 'default'}-${currency ?? 'USD'}-${showSymbol ?? 'default'}`;
+  const cached = currencyCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  let formatted: string;
   if (showSymbol === undefined || showSymbol === true) {
-    return value.toLocaleString(undefined, {
+    formatted = value.toLocaleString(undefined, {
       style: 'currency',
       currency: currency?.toUpperCase() || 'USD',
       minimumFractionDigits: digits ?? 2,
       maximumFractionDigits: digits ?? 2,
     });
+  } else {
+    formatted = value.toLocaleString(undefined, {
+      minimumFractionDigits: digits ?? 2,
+      maximumFractionDigits: digits ?? 2,
+    });
   }
-  return value.toLocaleString(undefined, {
-    minimumFractionDigits: digits ?? 2,
-    maximumFractionDigits: digits ?? 2,
-  });
+
+  // Limit cache size to prevent memory leaks
+  if (currencyCache.size > 1000) {
+    const firstKey = currencyCache.keys().next().value;
+    currencyCache.delete(firstKey);
+  }
+  currencyCache.set(cacheKey, formatted);
+  return formatted;
 }
 
 export function formatPercentage(change: number | null | undefined): string {
@@ -38,13 +58,86 @@ export function formatPercentage(change: number | null | undefined): string {
   return `${formattedChange}%`;
 }
 
-export function trendingClasses(value: number) {
+// Enhanced trend utilities
+export type TrendDirection = 'up' | 'down' | 'neutral';
+
+export interface TrendInfo {
+  direction: TrendDirection;
+  textClass: string;
+  bgClass: string;
+  icon: typeof TrendingUp | typeof TrendingDown | typeof Minus;
+  color: string;
+}
+
+/**
+ * Get comprehensive trend information from a numeric value
+ * @param value - The numeric value (positive = up, negative = down, zero = neutral)
+ * @returns Trend information including classes, icon, and color
+ */
+export function getTrendInfo(value: number | null | undefined): TrendInfo {
+  if (value === null || value === undefined || isNaN(value)) {
+    return {
+      direction: 'neutral',
+      textClass: 'text-gray-400',
+      bgClass: 'bg-gray-500/10',
+      icon: Minus,
+      color: '#9ca3af',
+    };
+  }
+
   const isTrendingUp = value > 0;
+  const isNeutral = value === 0;
+
+  if (isNeutral) {
+    return {
+      direction: 'neutral',
+      textClass: 'text-gray-400',
+      bgClass: 'bg-gray-500/10',
+      icon: Minus,
+      color: '#9ca3af',
+    };
+  }
+
+  if (isTrendingUp) {
+    return {
+      direction: 'up',
+      textClass: 'text-green-400',
+      bgClass: 'bg-green-500/10',
+      icon: TrendingUp,
+      color: '#4ade80',
+    };
+  }
 
   return {
-    textClass: isTrendingUp ? 'text-green-400' : 'text-red-400',
-    bgClass: isTrendingUp ? 'bg-green-500/10' : 'bg-red-500/10',
-    iconClass: isTrendingUp ? 'icon-up' : 'icon-down',
+    direction: 'down',
+    textClass: 'text-red-400',
+    bgClass: 'bg-red-500/10',
+    icon: TrendingDown,
+    color: '#f87171',
+  };
+}
+
+/**
+ * Get trend color (hex) from value
+ */
+export function getTrendColor(value: number | null | undefined): string {
+  return getTrendInfo(value).color;
+}
+
+/**
+ * Get trend icon component from value
+ */
+export function getTrendIcon(value: number | null | undefined) {
+  return getTrendInfo(value).icon;
+}
+
+// Legacy function for backward compatibility
+export function trendingClasses(value: number) {
+  const trend = getTrendInfo(value);
+  return {
+    textClass: trend.textClass,
+    bgClass: trend.bgClass,
+    iconClass: trend.direction === 'up' ? 'icon-up' : 'icon-down',
   };
 }
 

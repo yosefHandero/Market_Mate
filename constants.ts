@@ -91,10 +91,7 @@ export const getChartConfig = (
   },
 });
 
-export const PERIOD_CONFIG: Record<
-  Period,
-  { days: number | string }
-> = {
+export const PERIOD_CONFIG: Record<Period, { days: number | string }> = {
   daily: { days: 1 },
   weekly: { days: 7 },
   monthly: { days: 30 },

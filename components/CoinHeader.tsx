@@ -1,7 +1,11 @@
+'use client';
+
+import { useState, useEffect } from 'react';
 import { cn, formatCurrency, formatPercentage } from '@/lib/utils';
 import Image from 'next/image';
 import { Badge } from '@/components/ui/badge';
 import { TrendingDown, TrendingUp } from 'lucide-react';
+import AnimatedPrice from '@/components/AnimatedPrice';
 
 const CoinHeader = ({
   livePriceChangePercentage24h,
@@ -11,6 +15,17 @@ const CoinHeader = ({
   livePrice,
   priceChange24h,
 }: LiveCoinHeaderProps) => {
+  const [previousPrice, setPreviousPrice] = useState<number | undefined>(undefined);
+
+  useEffect(() => {
+    setPreviousPrice((prev) => {
+      if (prev !== undefined && prev !== livePrice) {
+        return prev;
+      }
+      return livePrice;
+    });
+  }, [livePrice]);
+
   const isTrendingUp = livePriceChangePercentage24h > 0;
   const isThirtyDayUp = priceChangePercentage30d > 0;
   const isPriceChangeUp = priceChange24h > 0;
@@ -47,7 +62,9 @@ const CoinHeader = ({
         <Image src={image} alt={name} width={77} height={77} />
 
         <div className="price-row">
-          <h1>{formatCurrency(livePrice)}</h1>
+          <h1>
+            <AnimatedPrice price={livePrice} previousPrice={previousPrice} className="text-white" />
+          </h1>
           <Badge className={cn('badge', isTrendingUp ? 'badge-up' : 'badge-down')}>
             {formatPercentage(livePriceChangePercentage24h)}
             {isTrendingUp ? <TrendingUp /> : <TrendingDown />}

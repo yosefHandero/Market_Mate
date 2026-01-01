@@ -1,6 +1,8 @@
+'use client';
+
 import React from 'react';
 import DataTable from '@/components/DataTable';
-import { cn } from '@/lib/utils';
+import type { DataTableColumn } from '@/type';
 
 export const CoinOverviewFallback = () => {
   return (
@@ -20,7 +22,9 @@ export const CoinOverviewFallback = () => {
 };
 
 export const TrendingCoinsFallback = () => {
-  const columns = [
+  type DummyData = { id: number };
+
+  const columns: DataTableColumn<DummyData>[] = [
     {
       header: 'Name',
       cell: () => (
@@ -45,15 +49,15 @@ export const TrendingCoinsFallback = () => {
     },
   ];
 
-  const dummyData = Array.from({ length: 6 }, (_, i) => ({ id: i }));
+  const dummyData: DummyData[] = Array.from({ length: 6 }, (_, i) => ({ id: i }));
 
   return (
     <div id="trending-coins-fallback">
       <h4>Trending Coins</h4>
       <DataTable
         data={dummyData}
-        columns={columns as any}
-        rowKey={(item: any) => item.id}
+        columns={columns}
+        rowKey="id"
         tableClassName="trending-coins-table"
       />
     </div>
@@ -61,7 +65,9 @@ export const TrendingCoinsFallback = () => {
 };
 
 export const CategoriesFallback = () => {
-  const columns = [
+  type DummyData = { id: number };
+
+  const columns: DataTableColumn<DummyData>[] = [
     {
       header: 'Category',
       cellClassName: 'category-cell',
@@ -100,17 +106,12 @@ export const CategoriesFallback = () => {
     },
   ];
 
-  const dummyData = Array.from({ length: 10 }, (_, i) => ({ id: i }));
+  const dummyData: DummyData[] = Array.from({ length: 10 }, (_, i) => ({ id: i }));
 
   return (
     <div id="categories-fallback">
       <h4>Top Categories</h4>
-      <DataTable
-        data={dummyData}
-        columns={columns as any}
-        rowKey={(item: any) => item.id}
-        tableClassName="mt-3"
-      />
+      <DataTable data={dummyData} columns={columns} rowKey="id" tableClassName="mt-3" />
     </div>
   );
 };

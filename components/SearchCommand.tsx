@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { Search, Loader2 } from 'lucide-react';
 import Image from 'next/image';
@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input';
 import { useDebounce } from '@/hooks/useDebounce';
 import { searchCoins } from '@/lib/coingecko.actions';
 import { cn } from '@/lib/utils';
+import type { SearchCoin } from '@/type';
 
 const SearchCommand = () => {
   const [open, setOpen] = useState(false);
@@ -18,8 +19,36 @@ const SearchCommand = () => {
   const [loading, setLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const router = useRouter();
+  const buttonRef = useRef<HTMLButtonElement>(null);
 
   const debouncedQuery = useDebounce(searchQuery, 300);
+
+  // Keyboard shortcut handler for ⌘K / Ctrl+K
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setOpen((prev) => !prev);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // Reset selectedIndex when results change or dialog closes
+  useEffect(() => {
+    if (!open) {
+      setSelectedIndex(0);
+      setSearchQuery('');
+      setResults([]);
+    }
+  }, [open]);
+
+  // Reset selectedIndex when results change
+  useEffect(() => {
+    setSelectedIndex(0);
+  }, [results.length]);
 
   useEffect(() => {
     if (!debouncedQuery || debouncedQuery.length < 2) {
@@ -67,6 +96,7 @@ const SearchCommand = () => {
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <button
+          ref={buttonRef}
           id="search-modal"
           className="trigger px-6 hover:bg-transparent! font-medium transition-all h-full cursor-pointer text-base text-purple-100 flex items-center gap-2"
         >
@@ -78,7 +108,9 @@ const SearchCommand = () => {
         </button>
       </DialogTrigger>
       <DialogContent className="dialog bg-dark-400! max-w-sm sm:max-w-md md:max-w-2xl mx-auto">
-        <DialogTitle className="absolute w-px h-px p-0 -m-px overflow-hidden whitespace-nowrap border-0">Search for cryptocurrencies</DialogTitle>
+        <DialogTitle className="absolute w-px h-px p-0 -m-px overflow-hidden whitespace-nowrap border-0">
+          Search for cryptocurrencies
+        </DialogTitle>
         <div className="cmd-input bg-dark-500!">
           <div className="flex items-center gap-2 px-3">
             <Search className="h-4 w-4 text-purple-100" />
@@ -105,14 +137,20 @@ const SearchCommand = () => {
                 href={`/coins/${coin.id}`}
                 onClick={() => handleSelect(coin.id)}
                 className={cn(
-                  'search-item grid grid-cols-4 gap-4 items-center justify-between transition-all !cursor-pointer hover:bg-dark-400 py-3 px-4',
+                  'search-item grid grid-cols-4 gap-4 items-center justify-between transition-all cursor-pointer! hover:bg-dark-400 py-3 px-4',
                   {
                     'bg-dark-400': index === selectedIndex,
                   },
                 )}
               >
                 <div className="coin-info flex gap-4 items-center col-span-2">
-                  <Image src={coin.thumb} alt={coin.name} width={36} height={36} className="size-9 rounded-full" />
+                  <Image
+                    src={coin.thumb}
+                    alt={coin.name}
+                    width={36}
+                    height={36}
+                    className="size-9 rounded-full"
+                  />
                   <div>
                     <p className="font-medium">{coin.name}</p>
                     <p className="text-sm text-gray-400 uppercase">{coin.symbol}</p>
@@ -135,4 +173,3 @@ const SearchCommand = () => {
 };
 
 export default SearchCommand;
-
