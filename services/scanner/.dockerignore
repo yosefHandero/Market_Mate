@@ -1,0 +1,7 @@
+.venv
+__pycache__
+*.pyc
+market_mate.db
+news_cache.json
+var
+tests
