@@ -20,5 +20,7 @@ class JournalEntryORM(Base):
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     news_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     notes: Mapped[str] = mapped_column(Text, default="")
+    override_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action_state: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 

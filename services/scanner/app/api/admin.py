@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from app.auth import require_admin_access
 from app.dependencies import (
     get_execution_service,
     get_journal_repository,
+    get_promotion_service,
+    get_replay_service,
     get_risk_service,
+    get_scan_repository,
     get_scheduler_service,
     get_scanner_service,
 )
@@ -18,11 +23,19 @@ from app.schemas import (
     OrderPlaceResponse,
     OrderPreviewRequest,
     OrderPreviewResponse,
+    PromotionReadinessResponse,
+    ReconciliationReportResponse,
+    ReplayRequest,
+    ReplayResponse,
     ScanRun,
+    SignalOutcomePerformanceReportResponse,
     TradeEligibilityResponse,
 )
 from app.services.execution import ExecutionService
 from app.services.journal_repository import JournalRepository
+from app.services.promotion import PromotionService
+from app.services.replay import ReplayService
+from app.services.repository import ScanRepository
 from app.services.risk import RiskService
 from app.services.scheduler import SchedulerService
 from app.services.scanner import ScannerService
@@ -37,6 +50,14 @@ async def run_scan(
     return await scanner_service.run_scan()
 
 
+@router.post("/strategy/replay", response_model=ReplayResponse)
+async def replay_strategy(
+    request: ReplayRequest,
+    replay_service: ReplayService = Depends(get_replay_service),
+) -> ReplayResponse:
+    return await replay_service.replay(request)
+
+
 @router.post("/scan/scheduler/start")
 async def start_scheduler(
     scheduler_service: SchedulerService = Depends(get_scheduler_service),
@@ -49,6 +70,46 @@ async def stop_scheduler(
     scheduler_service: SchedulerService = Depends(get_scheduler_service),
 ) -> dict[str, bool]:
     return {"stopped": scheduler_service.stop()}
+
+
+@router.get(
+    "/signals/outcomes/performance-report",
+    response_model=SignalOutcomePerformanceReportResponse,
+)
+async def get_signal_outcome_performance_report(
+    start: datetime = Query(),
+    end: datetime = Query(),
+    asset_type: str | None = Query(default=None, pattern="^(stock|crypto)$"),
+    regime: str | None = Query(default=None, pattern="^(bullish|neutral|bearish)$"),
+    friction_scenario: str = Query(default="base", pattern="^(base|stressed|worst)$"),
+    strict_walkforward: bool = Query(default=False),
+    scan_repository: ScanRepository = Depends(get_scan_repository),
+) -> SignalOutcomePerformanceReportResponse:
+    if end <= start:
+        raise HTTPException(status_code=422, detail="end must be greater than start")
+    return scan_repository.get_signal_outcome_performance_report(
+        start=start,
+        end=end,
+        asset_type=asset_type,
+        regime=regime,
+        friction_scenario=friction_scenario,
+        strict_walkforward=strict_walkforward,
+    )
+
+
+@router.get("/paper/promotion-check", response_model=PromotionReadinessResponse)
+async def get_promotion_check(
+    current_phase: str = Query(default="disabled", pattern="^(disabled|shadow|limited|broad)$"),
+    promotion_service: PromotionService = Depends(get_promotion_service),
+) -> PromotionReadinessResponse:
+    return promotion_service.evaluate_promotion_readiness(current_phase=current_phase)
+
+
+@router.get("/paper/reconcile", response_model=ReconciliationReportResponse)
+async def get_paper_reconciliation(
+    scan_repository: ScanRepository = Depends(get_scan_repository),
+) -> ReconciliationReportResponse:
+    return scan_repository.reconcile_paper_loop()
 
 
 @router.get("/risk/trade-eligibility", response_model=TradeEligibilityResponse)

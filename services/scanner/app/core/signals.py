@@ -2,11 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.core.scoring import (
-    SCORING_VERSION,
-    build_explanation,
-    compute_directional_scores,
-)
+from app.core.scoring import build_explanation, compute_directional_scores
+from app.core.strategy_contract import STRATEGY_VERSION
 from app.schemas import DecisionSignal, MarketStatus, OptionsFlowSnapshot
 
 
@@ -18,7 +15,9 @@ class SignalComputation:
     decision_signal: DecisionSignal
     signal_label: str
     explanation: str
-    scoring_version: str = SCORING_VERSION
+    directional_reasons: tuple[str, ...] = ()
+    directional_contributions: dict[str, float] | None = None
+    scoring_version: str = STRATEGY_VERSION
 
 
 def compute_signal_and_explanation(
@@ -43,6 +42,8 @@ def compute_signal_and_explanation(
     data_quality: str = "ok",
     context_bias: float = 0.0,
     gate_reason: str | None = None,
+    trend_above_sma: bool = True,
+    trend_strength_pct: float = 0.0,
 ) -> SignalComputation:
     directional = compute_directional_scores(
         relative_volume=relative_volume,
@@ -61,11 +62,13 @@ def compute_signal_and_explanation(
         volatility_regime=volatility_regime,
         data_quality=data_quality,
         context_bias=context_bias,
+        trend_above_sma=trend_above_sma,
+        trend_strength_pct=trend_strength_pct,
     )
 
-    if directional.selected_score >= 80 and directional.decision_signal != "HOLD":
+    if directional.selected_score >= 70 and directional.decision_signal != "HOLD":
         signal_label = "strong"
-    elif directional.selected_score >= 65 and directional.decision_signal != "HOLD":
+    elif directional.selected_score >= 58 and directional.decision_signal != "HOLD":
         signal_label = "watch"
     else:
         signal_label = "weak"
@@ -89,6 +92,10 @@ def compute_signal_and_explanation(
         benchmark_label=benchmark_label,
         volatility_regime=volatility_regime,
         gate_reason=gate_reason,
+        options_bullish_score=options_snapshot.bullish_score,
+        options_bearish_score=options_snapshot.bearish_score,
+        trend_above_sma=trend_above_sma,
+        trend_strength_pct=trend_strength_pct,
     )
 
     return SignalComputation(
@@ -98,6 +105,10 @@ def compute_signal_and_explanation(
         decision_signal=directional.decision_signal,
         signal_label=signal_label,
         explanation=explanation,
+        directional_reasons=(
+            directional.buy_reasons if directional.decision_signal == "BUY" else directional.sell_reasons
+        ),
+        directional_contributions=directional.selected_contributions,
     )
 
 
@@ -118,7 +129,11 @@ def map_score_to_decision_signal(
         if sell_score >= 60 and (sell_score - buy_score) >= 8:
             return "SELL"
         return "HOLD"
-    if scoring_version and scoring_version.startswith("v2"):
+    if scoring_version and (
+        scoring_version.startswith("v2")
+        or scoring_version.startswith("v3")
+        or scoring_version.startswith("v4")
+    ):
         return "HOLD"
     if score >= 75:
         return "BUY"

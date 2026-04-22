@@ -1,0 +1,9 @@
+metric	target	observed	pass_fail
+readyz.ready	true entire window		
+readyz.scan_fresh	true except documented gaps		
+duplicate terminal actions per deterministic intent key	0		
+HTTP POST /orders/preview from automation context	0		
+max attempt_count vs paper_loop_retry_max_attempts	never exceeds cap before failed_terminal		
+budget caps	hourly/daily/per-symbol/cycle within limits		
+breaker half-open single probe	at most one concurrent probe owner; open→half_open→closed consistent		
+frontend parity	API fields visible or gap documented		

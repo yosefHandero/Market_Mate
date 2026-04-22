@@ -10,6 +10,8 @@ import yfinance as yf
 from yahooquery import Ticker
 
 from app.config import get_settings
+from app.http_client import parse_json_response
+from app.provider_resilience import AsyncProviderGuard
 from app.schemas import OptionsFlowSnapshot
 
 
@@ -26,9 +28,16 @@ class _ContractSignal:
 class OptionsFlowClient:
     def __init__(self) -> None:
         self.settings = get_settings()
+        self._guard = AsyncProviderGuard("options_flow", pace_seconds=0.5)
 
     async def get_flow_snapshot(self, ticker: str) -> OptionsFlowSnapshot:
-        return await asyncio.to_thread(self._get_flow_snapshot_sync, ticker)
+        normalized = ticker.upper()
+        return await self._guard.cached_call(
+            key=("options_flow", normalized),
+            ttl_seconds=self.settings.options_flow_cache_seconds,
+            stale_ttl_seconds=max(self.settings.options_flow_cache_seconds * 3, 900),
+            fetcher=lambda: asyncio.to_thread(self._get_flow_snapshot_sync, normalized),
+        )
 
     def _get_flow_snapshot_sync(self, ticker: str) -> OptionsFlowSnapshot:
         errors: list[str] = []
@@ -56,10 +65,9 @@ class OptionsFlowClient:
             "Authorization": f"Bearer {self.settings.marketdata_api_token}",
         }
         url = f"https://api.marketdata.app/v1/options/chain/{ticker.upper()}/"
-        with httpx.Client(timeout=20, headers=headers) as client:
+        with httpx.Client(timeout=self.settings.provider_timeout_seconds, headers=headers) as client:
             response = client.get(url)
-            response.raise_for_status()
-            payload = response.json()
+            payload = parse_json_response(response, provider="marketdata.app", url=url)
 
         if payload.get("s") != "ok":
             raise RuntimeError(payload.get("errmsg") or payload.get("error") or "unexpected MarketData.app response")

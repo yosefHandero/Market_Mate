@@ -9,3 +9,4 @@ psycopg[binary]==3.3.3
 python-dotenv==1.1.1
 yfinance==0.2.66
 yahooquery==2.4.1
+websockets==15.0.1

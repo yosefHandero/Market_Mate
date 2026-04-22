@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -11,9 +12,13 @@ from app.api.admin import router as admin_router
 from app.api.public import protected_router as protected_public_router
 from app.api.public import router as public_router
 from app.config import get_settings
+from app.db import apply_required_schema_patches
 from app.dependencies import (
+    automation_service,
+    coinbase_market_data_service,
     execution_service,
     journal_repository,
+    promotion_service,
     risk_service,
     scan_repository,
     scanner_service,
@@ -30,13 +35,36 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.cache_dir_path.mkdir(parents=True, exist_ok=True)
+    market_data_task = None
+    if coinbase_market_data_service.enabled:
+        market_data_task = asyncio.create_task(
+            coinbase_market_data_service.run_forever(),
+            name="coinbase-advanced-trade-ws",
+        )
+    schema_patches = apply_required_schema_patches()
+    repaired_rows = scan_repository.sync_signal_outcome_returns()
+    relinked_audits = scan_repository.backfill_execution_audit_signal_links()
+    recovered_automation_intents = await automation_service.recover_due_intents()
     logger.info(
         "startup completed",
         extra={
             "event": "startup",
+            "schema_patches_applied": schema_patches,
+            "repaired_signal_outcome_returns": repaired_rows,
+            "relinked_execution_audits": relinked_audits,
+            "recovered_automation_intents": recovered_automation_intents,
         },
     )
-    yield
+    try:
+        yield
+    finally:
+        if market_data_task is not None:
+            coinbase_market_data_service.stop()
+            market_data_task.cancel()
+            try:
+                await market_data_task
+            except asyncio.CancelledError:
+                pass
 
 
 def _error_response(request: Request, *, status_code: int, code: str, message: str, details: dict | None = None) -> JSONResponse:

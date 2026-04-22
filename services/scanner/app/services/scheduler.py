@@ -31,6 +31,9 @@ class SchedulerService:
     def running(self) -> bool:
         return self.repository.get_state().running
 
+    def state(self):
+        return self.repository.get_state()
+
     async def run_forever(self) -> None:
         instance_id = self.settings.app_instance_id
         while True:
@@ -45,6 +48,8 @@ class SchedulerService:
                         self.repository.mark_run_started(instance_id)
                         await self.scanner_service.run_scan()
                         self.repository.mark_run_finished(instance_id)
+                    else:
+                        self.repository.clear_error(instance_id)
                 except Exception as exc:
                     logger.exception(
                         "scheduler loop failed",

@@ -1,6 +1,6 @@
-import { MarketStatus } from "@/lib/types";
+import { MarketStatus } from '@/lib/types';
 
 export function MarketStatusBadge({ status }: { status: MarketStatus }) {
-  const cls = status === "bullish" ? "green" : status === "bearish" ? "red" : "amber";
+  const cls = status === 'bullish' ? 'green' : status === 'bearish' ? 'red' : 'amber';
   return <span className={`badge ${cls}`}>Market: {status}</span>;
 }

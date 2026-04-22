@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 
 from sqlalchemy import desc, select
@@ -11,14 +12,36 @@ from app.db import SessionLocal
 from app.errors import AppError
 from app.models.scan import ExecutionAuditORM
 from app.schemas import OrderPlaceRequest, OrderPlaceResponse, OrderPreviewRequest, OrderPreviewResponse
+from app.services.readiness import evaluate_operational_readiness
+from app.services.repository import ScanRepository
 from app.services.risk import RiskService
 
 
 class ExecutionService:
-    def __init__(self) -> None:
+    def __init__(self, scan_repository: ScanRepository | None = None) -> None:
         self.settings = get_settings()
         self.alpaca = AlpacaClient()
-        self.risk = RiskService()
+        self._scan_repository = scan_repository or ScanRepository()
+        self.risk = RiskService(scan_repository=self._scan_repository)
+
+    @staticmethod
+    def _idempotency_payload_hash(payload: dict) -> str:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _enforce_operational_readiness(self) -> None:
+        if not self.settings.require_readyz_for_execution:
+            return
+        ok, reason = evaluate_operational_readiness(
+            scan_repository=self._scan_repository,
+            settings=self.settings,
+        )
+        if not ok:
+            raise AppError(
+                message=reason or "Scanner is not operationally ready.",
+                status_code=503,
+                code="not_ready",
+            )
 
     def _asset_type_for_symbol(self, symbol: str) -> str:
         return "crypto" if "/" in symbol else "stock"
@@ -63,13 +86,21 @@ class ExecutionService:
                     qty=preview.qty,
                     dry_run=getattr(request, "dry_run", False),
                     idempotency_key=getattr(request, "idempotency_key", None),
+                    idempotency_payload_hash=self._idempotency_payload_hash(
+                        request.model_dump(mode="json")
+                    ),
                     lifecycle_status="previewed",
                     latest_price=preview.latest_price,
                     notional_estimate=preview.notional_estimate,
+                    signal_outcome_id=trade_gate.signal_outcome_id if trade_gate else None,
                     signal_run_id=trade_gate.signal_run_id if trade_gate else None,
                     signal_generated_at=trade_gate.signal_generated_at if trade_gate else None,
                     latest_signal=trade_gate.latest_signal if trade_gate else None,
                     confidence=trade_gate.confidence if trade_gate else None,
+                    trade_gate_horizon=trade_gate.horizon if trade_gate else None,
+                    evidence_basis=getattr(trade_gate, "evidence_basis", None) if trade_gate else None,
+                    trust_window_start=getattr(trade_gate, "trust_window_start", None) if trade_gate else None,
+                    trust_window_end=getattr(trade_gate, "trust_window_end", None) if trade_gate else None,
                     trade_gate_allowed=trade_gate.allowed if trade_gate else None,
                     trade_gate_reason=trade_gate.reason if trade_gate else None,
                     submitted=False,
@@ -88,10 +119,15 @@ class ExecutionService:
                 row.lifecycle_status = "previewed"
                 row.latest_price = preview.latest_price
                 row.notional_estimate = preview.notional_estimate
+                row.signal_outcome_id = trade_gate.signal_outcome_id if trade_gate else None
                 row.signal_run_id = trade_gate.signal_run_id if trade_gate else None
                 row.signal_generated_at = trade_gate.signal_generated_at if trade_gate else None
                 row.latest_signal = trade_gate.latest_signal if trade_gate else None
                 row.confidence = trade_gate.confidence if trade_gate else None
+                row.trade_gate_horizon = trade_gate.horizon if trade_gate else None
+                row.evidence_basis = getattr(trade_gate, "evidence_basis", None) if trade_gate else None
+                row.trust_window_start = getattr(trade_gate, "trust_window_start", None) if trade_gate else None
+                row.trust_window_end = getattr(trade_gate, "trust_window_end", None) if trade_gate else None
                 row.trade_gate_allowed = trade_gate.allowed if trade_gate else None
                 row.trade_gate_reason = trade_gate.reason if trade_gate else None
                 row.preview_payload = json.dumps(preview.model_dump(mode="json"))
@@ -139,6 +175,38 @@ class ExecutionService:
                 code="live_trading_disabled",
             )
 
+    def _enforce_live_rollout_caps(self, *, request: OrderPlaceRequest, preview: OrderPreviewResponse) -> None:
+        is_live_route = "paper-api" not in self.settings.alpaca_base_url
+        if not is_live_route:
+            return
+        if request.qty > self.settings.live_trading_max_qty:
+            raise AppError(
+                message=(
+                    f"Live rollout qty {request.qty} exceeds conservative max qty "
+                    f"{self.settings.live_trading_max_qty}."
+                ),
+                status_code=409,
+                code="live_rollout_qty_exceeded",
+            )
+        if preview.notional_estimate > self.settings.live_trading_max_notional:
+            raise AppError(
+                message=(
+                    f"Live rollout notional ${preview.notional_estimate:.2f} exceeds conservative max "
+                    f"${self.settings.live_trading_max_notional:.2f}."
+                ),
+                status_code=409,
+                code="live_rollout_notional_exceeded",
+            )
+        if preview.trade_gate and preview.trade_gate.execution_eligibility != "eligible":
+            raise AppError(
+                message=(
+                    "Live rollout only allows trades with explicit execution eligibility "
+                    f"'eligible'; got {preview.trade_gate.execution_eligibility}."
+                ),
+                status_code=409,
+                code="live_rollout_requires_explicit_eligibility",
+            )
+
     def _response_from_existing_audit(self, row: ExecutionAuditORM) -> OrderPlaceResponse:
         raw_payload = {}
         if row.broker_payload:
@@ -165,6 +233,7 @@ class ExecutionService:
         )
 
     async def preview(self, request: OrderPreviewRequest) -> OrderPreviewResponse:
+        self._enforce_operational_readiness()
         ticker = request.ticker.upper()
         if self._asset_type_for_symbol(ticker) == "crypto":
             latest_price = await self.alpaca.get_latest_crypto_price(ticker)
@@ -182,6 +251,8 @@ class ExecutionService:
         )
         if not trade_gate.allowed:
             warnings.append(trade_gate.reason)
+        elif trade_gate.execution_eligibility == "review":
+            warnings.append("Execution requires manual review because evidence or provider quality is not fully clean.")
         preview = OrderPreviewResponse(
             ticker=ticker,
             side=request.side,
@@ -204,6 +275,19 @@ class ExecutionService:
         self._enforce_execution_safeguards()
         existing = self._find_existing_idempotent_result(request.idempotency_key)
         if existing and existing.lifecycle_status in {"submitted", "dry_run", "blocked"}:
+            want_hash = self._idempotency_payload_hash(request.model_dump(mode="json"))
+            prior_hash = existing.idempotency_payload_hash
+            if prior_hash is None and existing.request_payload:
+                try:
+                    prior_hash = self._idempotency_payload_hash(json.loads(existing.request_payload))
+                except (json.JSONDecodeError, TypeError):
+                    prior_hash = None
+            if prior_hash is not None and want_hash != prior_hash:
+                raise AppError(
+                    message="Idempotency key already used with a different request body.",
+                    status_code=409,
+                    code="idempotency_payload_mismatch",
+                )
             return self._response_from_existing_audit(existing)
 
         preview = await self.preview(request)
@@ -244,6 +328,8 @@ class ExecutionService:
                 trade_gate=preview.trade_gate,
                 execution_audit_id=preview.execution_audit_id,
             )
+
+        self._enforce_live_rollout_caps(request=request, preview=preview)
 
         try:
             raw = await self.alpaca.submit_order(

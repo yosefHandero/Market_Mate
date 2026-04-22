@@ -1,6 +1,6 @@
-"use client";
+'use client';
 
-import { JournalEntry } from "@/lib/types";
+import { JournalEntry } from '@/lib/types';
 
 type JournalEntryActionsProps = {
   entry: JournalEntry;
@@ -19,13 +19,13 @@ export function JournalEntryActions({
 
   return (
     <>
-      {entry.decision === "watching" ? (
+      {entry.decision === 'watching' ? (
         <div
           style={{
             marginTop: 10,
-            display: "flex",
+            display: 'flex',
             gap: 8,
-            flexWrap: "wrap",
+            flexWrap: 'wrap',
           }}
         >
           <button
@@ -34,7 +34,7 @@ export function JournalEntryActions({
             disabled={anyActionBusy}
             onClick={() => onMarkAsTook(entry)}
           >
-            {isUpdating ? "Updating..." : "Mark as took"}
+            {isUpdating ? 'Updating...' : 'Mark as took'}
           </button>
 
           <button
@@ -43,7 +43,7 @@ export function JournalEntryActions({
             disabled={anyActionBusy}
             onClick={() => onMarkAsSkipped(entry)}
           >
-            {isUpdating ? "Updating..." : "Mark as skipped"}
+            {isUpdating ? 'Updating...' : 'Mark as skipped'}
           </button>
         </div>
       ) : null}

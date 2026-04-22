@@ -29,6 +29,8 @@ class JournalRepository:
                 score=payload.score,
                 news_source=payload.news_source,
                 notes=payload.notes,
+                override_reason=payload.override_reason,
+                action_state=payload.action_state or payload.decision,
                 created_at=datetime.now(timezone.utc),
             )
             session.add(row)
@@ -58,6 +60,8 @@ class JournalRepository:
             score=row.score,
             news_source=row.news_source,
             notes=row.notes,
+            override_reason=getattr(row, "override_reason", None),
+            action_state=getattr(row, "action_state", None),
             created_at=row.created_at
         )
     def update_entry(self, entry_id: int, payload: JournalEntryUpdateRequest) -> JournalEntryResponse | None:
@@ -80,6 +84,10 @@ class JournalRepository:
 
             if "notes" in provided_fields:
                 row.notes = payload.notes
+            if "override_reason" in provided_fields:
+                row.override_reason = payload.override_reason
+            if "action_state" in provided_fields:
+                row.action_state = payload.action_state
 
             session.commit()
             session.refresh(row)

@@ -1,50 +1,40 @@
-"use client";
+'use client';
 
-import { useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
-import { JournalEntry, JournalDecision } from "@/lib/types";
-import { updateJournalEntry } from "@/lib/api";
-import { JournalSummary } from "@/components/journal-summary";
-import { JournalEntryCard } from "@/components/journal-entry-card";
-import { JournalFilterBar } from "@/components/journal-filter-bar";
+import { useMemo, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { JournalEntry, JournalDecision } from '@/lib/types';
+import { updateJournalEntry } from '@/lib/api';
+import { JournalSummary } from '@/components/journal-summary';
+import { JournalEntryCard } from '@/components/journal-entry-card';
+import { JournalFilterBar } from '@/components/journal-filter-bar';
 
 export function JournalList({ entries }: { entries: JournalEntry[] }) {
-  const [filter, setFilter] = useState<"all" | JournalDecision>("all");
+  const [filter, setFilter] = useState<'all' | JournalDecision>('all');
   const [updatingId, setUpdatingId] = useState<number | null>(null);
-  const [errorMessage, setErrorMessage] = useState("");
+  const [errorMessage, setErrorMessage] = useState('');
   const router = useRouter();
 
   const filteredEntries = useMemo(() => {
-    const base =
-      filter === "all"
-        ? entries
-        : entries.filter((entry) => entry.decision === filter);
+    const base = filter === 'all' ? entries : entries.filter((entry) => entry.decision === filter);
 
     return [...base].sort((a, b) => {
-      const aOpen = a.decision === "took" && a.exit_price == null ? 1 : 0;
-      const bOpen = b.decision === "took" && b.exit_price == null ? 1 : 0;
+      const aOpen = a.decision === 'took' && a.exit_price == null ? 1 : 0;
+      const bOpen = b.decision === 'took' && b.exit_price == null ? 1 : 0;
 
       if (aOpen !== bOpen) return bOpen - aOpen;
 
-      return (
-        new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-      );
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
     });
   }, [entries, filter]);
 
-  async function handleDecisionUpdate(
-    entry: JournalEntry,
-    decision: "took" | "skipped",
-  ) {
+  async function handleDecisionUpdate(entry: JournalEntry, decision: 'took' | 'skipped') {
     const confirmText =
-      decision === "took"
-        ? `Mark ${entry.ticker} as took?`
-        : `Mark ${entry.ticker} as skipped?`;
+      decision === 'took' ? `Mark ${entry.ticker} as took?` : `Mark ${entry.ticker} as skipped?`;
 
     if (!window.confirm(confirmText)) return;
 
     try {
-      setErrorMessage("");
+      setErrorMessage('');
       setUpdatingId(entry.id);
 
       await updateJournalEntry(entry.id, {
@@ -52,16 +42,14 @@ export function JournalList({ entries }: { entries: JournalEntry[] }) {
         entry_price: entry.entry_price,
         exit_price: entry.exit_price,
         pnl_pct: entry.pnl_pct,
-        notes: entry.notes ?? "",
+        notes: entry.notes ?? '',
+        override_reason: entry.override_reason ?? null,
+        action_state: decision,
       });
 
       router.refresh();
     } catch (error) {
-      setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : `Failed to update ${entry.ticker}.`,
-      );
+      setErrorMessage(error instanceof Error ? error.message : `Failed to update ${entry.ticker}.`);
     } finally {
       setUpdatingId(null);
     }
@@ -85,8 +73,8 @@ export function JournalList({ entries }: { entries: JournalEntry[] }) {
             key={entry.id}
             entry={entry}
             isUpdating={updatingId === entry.id}
-            onMarkAsTook={(item) => handleDecisionUpdate(item, "took")}
-            onMarkAsSkipped={(item) => handleDecisionUpdate(item, "skipped")}
+            onMarkAsTook={(item) => handleDecisionUpdate(item, 'took')}
+            onMarkAsSkipped={(item) => handleDecisionUpdate(item, 'skipped')}
           />
         ))
       ) : (

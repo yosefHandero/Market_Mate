@@ -25,6 +25,7 @@ class SchemaMigrationTests(unittest.TestCase):
             self.assertTrue(inspector.has_table("scan_results"))
             self.assertTrue(inspector.has_table("execution_audits"))
             self.assertTrue(inspector.has_table("scheduler_state"))
+            self.assertTrue(inspector.has_table("paper_loop_breaker"))
 
             scan_result_columns = {column["name"] for column in inspector.get_columns("scan_results")}
             execution_audit_columns = {column["name"] for column in inspector.get_columns("execution_audits")}

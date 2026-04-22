@@ -1,0 +1,88 @@
+{
+  "baseline_version": "2026-03-29",
+  "scanner_entrypoint": "services/scanner/app/services/scanner.py",
+  "pipeline": {
+    "ingestion": [
+      "alpaca.stock_bars",
+      "alpaca.crypto_bars",
+      "fear_greed.index",
+      "coingecko.market_context",
+      "coinbase.crypto_price_override"
+    ],
+    "feature_builder": "ScannerService._analyze_ticker_impl",
+    "raw_signal": "app/core/signals.py::compute_signal_and_explanation",
+    "directional_model": "app/core/scoring.py::compute_directional_scores",
+    "calibration_and_gate": "app/services/repository.py::{calibrate_signal,evaluate_signal_gate}",
+    "strategy_policy": "app/core/strategy_contract.py::build_strategy_evaluation_metadata",
+    "persistence": "app/services/repository.py::save_run",
+    "execution": [
+      "app/services/risk.py::evaluate_trade",
+      "app/services/execution.py::{preview,place}"
+    ]
+  },
+  "provider_roles": {
+    "alpaca": {
+      "role": "primary",
+      "primary_layer": "directional_score",
+      "notes": "Primary bars, execution prices, broker integration, and signal outcome resolution."
+    },
+    "coinbase_advanced_trade_ws": {
+      "role": "supportive",
+      "primary_layer": "provider_health",
+      "notes": "Crypto price freshness overlay only."
+    },
+    "coingecko": {
+      "role": "supportive",
+      "primary_layer": "directional_score",
+      "notes": "Currently feeds crypto context bias directly."
+    },
+    "fear_greed": {
+      "role": "supportive",
+      "primary_layer": "directional_score",
+      "notes": "Currently feeds crypto market status and context bias."
+    },
+    "marketaux": {
+      "role": "supportive",
+      "primary_layer": "directional_score",
+      "notes": "Directional news sentiment helper."
+    },
+    "finnhub": {
+      "role": "supportive",
+      "primary_layer": "directional_score",
+      "notes": "Directional news sentiment helper."
+    },
+    "sec": {
+      "role": "supportive",
+      "primary_layer": "directional_score",
+      "notes": "Currently contributes a neutral catalyst score."
+    },
+    "options_flow": {
+      "role": "supportive",
+      "primary_layer": "directional_score",
+      "notes": "Currently contributes supportive bullish/bearish score and warnings."
+    }
+  },
+  "current_mix_points": [
+    "Directional score blends trend, regime, sentiment, catalyst, and options context.",
+    "Evidence quality includes gate and calibration maturity rather than only trustworthiness of evidence.",
+    "Provider degradation semantics are inconsistent across clients.",
+    "Trade-time policy reuses scan-time trust metadata but shadow variants do not exist yet."
+  ],
+  "current_tests": [
+    "services/scanner/tests/test_coinbase_market_data.py",
+    "services/scanner/tests/test_db.py",
+    "services/scanner/tests/test_execution.py",
+    "services/scanner/tests/test_export_evidence_pack.py",
+    "services/scanner/tests/test_journal_repository.py",
+    "services/scanner/tests/test_main.py",
+    "services/scanner/tests/test_provider_resilience.py",
+    "services/scanner/tests/test_replay.py",
+    "services/scanner/tests/test_repository.py",
+    "services/scanner/tests/test_risk.py",
+    "services/scanner/tests/test_scanner.py",
+    "services/scanner/tests/test_scheduler.py",
+    "services/scanner/tests/test_scheduler_repository.py",
+    "services/scanner/tests/test_signals.py",
+    "services/scanner/tests/test_strategy_contract.py"
+  ]
+}

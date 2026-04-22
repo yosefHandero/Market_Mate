@@ -4,7 +4,11 @@ from dataclasses import dataclass
 
 from app.schemas import DecisionSignal, MarketStatus
 
-SCORING_VERSION = "v2.1-regime-gated"
+SCORING_VERSION = "v4.1-integrated"
+
+TREND_SMA_WINDOW = 20
+TREND_SCALING_FACTOR = 2.5
+TREND_MAX_CONTRIBUTION = 12
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
@@ -29,6 +33,11 @@ class DirectionalScoreResult:
     score_margin: float
     buy_confirmations: int
     sell_confirmations: int
+    buy_contributions: dict[str, float]
+    sell_contributions: dict[str, float]
+    selected_contributions: dict[str, float]
+    buy_reasons: tuple[str, ...] = ()
+    sell_reasons: tuple[str, ...] = ()
 
 
 def compute_directional_scores(
@@ -49,21 +58,18 @@ def compute_directional_scores(
     volatility_regime: str = "normal",
     data_quality: str = "ok",
     context_bias: float = 0.0,
+    trend_above_sma: bool = True,
+    trend_strength_pct: float = 0.0,
 ) -> DirectionalScoreResult:
-    volume_component = clamp((relative_volume - 0.8) * 10, 0, 16)
-    bullish_momentum = clamp(price_change_pct * 4, 0, 18)
-    bearish_momentum = clamp((-price_change_pct) * 4, 0, 18)
-    bullish_relative_strength = clamp((relative_strength_pct + 0.3) * 3.5, 0, 12)
-    bearish_relative_weakness = clamp(((-relative_strength_pct) + 0.3) * 3.5, 0, 12)
-    bullish_sentiment = clamp(max(sentiment_score, 0) * 11, 0, 11)
-    bearish_sentiment = clamp(max(-sentiment_score, 0) * 11, 0, 11)
-    bullish_market = 10 if market_status == "bullish" else 4 if market_status == "neutral" else 0
-    bearish_market = 10 if market_status == "bearish" else 4 if market_status == "neutral" else 0
-    bullish_options = clamp(options_bullish_score, 0, 10)
-    bearish_options = clamp(options_bearish_score, 0, 10)
-    neutral_catalyst = clamp(catalyst_score * 6, 0, 4)
-    bullish_context = clamp(max(context_bias, 0) * 8, 0, 8)
-    bearish_context = clamp(max(-context_bias, 0) * 8, 0, 8)
+    bullish_momentum = clamp(price_change_pct * 4.2, 0, 18)
+    bearish_momentum = clamp((-price_change_pct) * 4.2, 0, 18)
+    bullish_relative_strength = clamp(relative_strength_pct * 3.8, 0, 16)
+    bearish_relative_weakness = clamp((-relative_strength_pct) * 3.8, 0, 16)
+    bullish_structure = (14 if breakout_flag else 0) + (10 if above_vwap else 0) + clamp(close_to_high_pct * 8, 0, 8)
+    bearish_structure = (14 if breakdown_flag else 0) + (10 if not above_vwap else 0) + clamp(close_to_low_pct * 8, 0, 8)
+    volume_confirmation = clamp((relative_volume - 1.0) * 4.5, 0, 5)
+    bullish_alignment = clamp(max((1 if breakout_flag else 0) + (1 if above_vwap else 0) + (1 if price_change_pct >= 0.5 else 0) + (1 if relative_strength_pct >= 0.5 else 0) - 1, 0) * 3, 0, 9)
+    bearish_alignment = clamp(max((1 if breakdown_flag else 0) + (1 if not above_vwap else 0) + (1 if price_change_pct <= -0.5 else 0) + (1 if relative_strength_pct <= -0.5 else 0) - 1, 0) * 3, 0, 9)
 
     if volatility_regime == "hot":
         bullish_momentum *= 1.05
@@ -71,14 +77,28 @@ def compute_directional_scores(
     elif volatility_regime == "extreme":
         bullish_momentum *= 0.85
         bearish_momentum *= 0.85
-        volume_component *= 0.9
+        bullish_structure *= 0.95
+        bearish_structure *= 0.95
 
     if data_quality == "low":
-        volume_component *= 0.6
-        bullish_options *= 0.75
-        bearish_options *= 0.75
+        volume_confirmation *= 0.5
+        bullish_structure *= 0.85
+        bearish_structure *= 0.85
     elif data_quality == "degraded":
-        volume_component *= 0.8
+        volume_confirmation *= 0.8
+
+    # Provider signal terms: bounded additive contributions (~15 pts max per side)
+    sentiment_buy = clamp(sentiment_score * 5, 0, 5)       # max +5
+    sentiment_sell = clamp(-sentiment_score * 5, 0, 5)      # max +5
+    catalyst_buy = clamp(catalyst_score * 3, 0, 3)          # max +3, buy-only
+    regime_buy = 3.0 if market_status == "bullish" else 0.0  # max +3
+    regime_sell = 3.0 if market_status == "bearish" else 0.0 # max +3
+    net_options = options_bullish_score - options_bearish_score
+    options_buy = clamp(net_options * 0.5, 0, 4)            # max +4
+    options_sell = clamp(-net_options * 0.5, 0, 4)          # max +4
+
+    bullish_trend = clamp(trend_strength_pct * TREND_SCALING_FACTOR, 0, TREND_MAX_CONTRIBUTION)
+    bearish_trend = clamp((-trend_strength_pct) * TREND_SCALING_FACTOR, 0, TREND_MAX_CONTRIBUTION)
 
     buy_confirmations = sum(
         [
@@ -86,9 +106,8 @@ def compute_directional_scores(
             1 if above_vwap else 0,
             1 if close_to_high_pct >= 0.65 else 0,
             1 if relative_strength_pct >= 0.75 else 0,
-            1 if sentiment_score >= 0.2 else 0,
-            1 if options_bullish_score >= 6 else 0,
             1 if relative_volume >= 1.35 else 0,
+            1 if trend_above_sma else 0,
         ]
     )
     sell_confirmations = sum(
@@ -97,54 +116,116 @@ def compute_directional_scores(
             1 if not above_vwap else 0,
             1 if close_to_low_pct >= 0.65 else 0,
             1 if relative_strength_pct <= -0.75 else 0,
-            1 if sentiment_score <= -0.2 else 0,
-            1 if options_bearish_score >= 6 else 0,
             1 if relative_volume >= 1.35 else 0,
+            1 if not trend_above_sma else 0,
         ]
     )
 
     buy_raw = (
-        volume_component
-        + bullish_momentum
+        bullish_momentum
         + bullish_relative_strength
-        + (12 if breakout_flag else 0)
-        + (8 if above_vwap else 0)
-        + clamp(close_to_high_pct * 8, 0, 8)
-        + bullish_sentiment
-        + bullish_market
-        + bullish_options
-        + neutral_catalyst
-        + bullish_context
-        + clamp(max(buy_confirmations - 1, 0) * 2.5, 0, 10)
+        + bullish_structure
+        + bullish_alignment
+        + volume_confirmation
+        + sentiment_buy
+        + catalyst_buy
+        + regime_buy
+        + options_buy
+        + bullish_trend
     )
     sell_raw = (
-        volume_component
-        + bearish_momentum
+        bearish_momentum
         + bearish_relative_weakness
-        + (12 if breakdown_flag else 0)
-        + (8 if not above_vwap else 0)
-        + clamp(close_to_low_pct * 8, 0, 8)
-        + bearish_sentiment
-        + bearish_market
-        + bearish_options
-        + neutral_catalyst
-        + bearish_context
-        + clamp(max(sell_confirmations - 1, 0) * 2.5, 0, 10)
+        + bearish_structure
+        + bearish_alignment
+        + volume_confirmation
+        + sentiment_sell
+        + regime_sell
+        + options_sell
+        + bearish_trend
     )
 
     buy_score = round(clamp(buy_raw, 0, 100), 2)
     sell_score = round(clamp(sell_raw, 0, 100), 2)
     margin = round(abs(buy_score - sell_score), 2)
 
-    if buy_score >= 60 and (buy_score - sell_score) >= 8:
+    if buy_score >= 52 and (buy_score - sell_score) >= 6:
         decision_signal: DecisionSignal = "BUY"
         selected_score = buy_score
-    elif sell_score >= 60 and (sell_score - buy_score) >= 8:
+    elif sell_score >= 52 and (sell_score - buy_score) >= 6:
         decision_signal = "SELL"
         selected_score = sell_score
     else:
         decision_signal = "HOLD"
         selected_score = round(max(buy_score, sell_score), 2)
+
+    buy_reasons: list[str] = []
+    sell_reasons: list[str] = []
+    if breakout_flag:
+        buy_reasons.append("breakout_structure")
+    if above_vwap:
+        buy_reasons.append("above_vwap")
+    if close_to_high_pct >= 0.65:
+        buy_reasons.append("close_to_high")
+    if price_change_pct >= 0.75:
+        buy_reasons.append("positive_momentum")
+    if relative_strength_pct >= 0.75:
+        buy_reasons.append("relative_outperformance")
+    if relative_volume >= 1.35:
+        buy_reasons.append("volume_confirmation")
+    if breakdown_flag:
+        sell_reasons.append("breakdown_structure")
+    if not above_vwap:
+        sell_reasons.append("below_vwap")
+    if close_to_low_pct >= 0.65:
+        sell_reasons.append("close_to_low")
+    if price_change_pct <= -0.75:
+        sell_reasons.append("negative_momentum")
+    if relative_strength_pct <= -0.75:
+        sell_reasons.append("relative_weakness")
+    if relative_volume >= 1.35:
+        sell_reasons.append("volume_confirmation")
+    if sentiment_score >= 0.2:
+        buy_reasons.append("positive_news_sentiment")
+    if sentiment_score <= -0.2:
+        sell_reasons.append("negative_news_sentiment")
+    if catalyst_score >= 0.3:
+        buy_reasons.append("sec_catalyst")
+    if market_status == "bullish":
+        buy_reasons.append("bullish_regime")
+    if market_status == "bearish":
+        sell_reasons.append("bearish_regime")
+    if net_options >= 3:
+        buy_reasons.append("bullish_options_flow")
+    if net_options <= -3:
+        sell_reasons.append("bearish_options_flow")
+    if trend_above_sma and trend_strength_pct > 0.5:
+        buy_reasons.append("price_above_20sma")
+    if not trend_above_sma and trend_strength_pct < -0.5:
+        sell_reasons.append("price_below_20sma")
+
+    buy_contributions = {
+        "momentum": round(bullish_momentum + bullish_relative_strength, 2),
+        "structure": round(bullish_structure, 2),
+        "volume": round(volume_confirmation, 2),
+        "alignment": round(bullish_alignment, 2),
+        "signals": round(sentiment_buy + catalyst_buy + regime_buy + options_buy, 2),
+        "trend": round(bullish_trend, 2),
+    }
+    sell_contributions = {
+        "momentum": round(bearish_momentum + bearish_relative_weakness, 2),
+        "structure": round(bearish_structure, 2),
+        "volume": round(volume_confirmation, 2),
+        "alignment": round(bearish_alignment, 2),
+        "signals": round(sentiment_sell + regime_sell + options_sell, 2),
+        "trend": round(bearish_trend, 2),
+    }
+    if decision_signal == "BUY":
+        selected_contributions = buy_contributions
+    elif decision_signal == "SELL":
+        selected_contributions = sell_contributions
+    else:
+        selected_contributions = buy_contributions if buy_score >= sell_score else sell_contributions
 
     return DirectionalScoreResult(
         buy_score=buy_score,
@@ -154,6 +235,11 @@ def compute_directional_scores(
         score_margin=margin,
         buy_confirmations=buy_confirmations,
         sell_confirmations=sell_confirmations,
+        buy_contributions=buy_contributions,
+        sell_contributions=sell_contributions,
+        selected_contributions=selected_contributions,
+        buy_reasons=tuple(buy_reasons),
+        sell_reasons=tuple(sell_reasons),
     )
 
 
@@ -177,6 +263,10 @@ def build_explanation(
     benchmark_label: str = "SPY/QQQ",
     volatility_regime: str = "normal",
     gate_reason: str | None = None,
+    options_bullish_score: float = 0.0,
+    options_bearish_score: float = 0.0,
+    trend_above_sma: bool = True,
+    trend_strength_pct: float = 0.0,
 ) -> str:
     parts: list[str] = [
         f"{ticker} has {relative_volume:.2f}x time-aware relative volume",
@@ -200,17 +290,32 @@ def build_explanation(
         parts.append(f"bull thesis {buy_score:.1f} and bear thesis {sell_score:.1f} are too close")
 
     if sentiment_score > 0.15:
-        parts.append("news tone is supportive")
+        s_contrib = round(clamp(sentiment_score * 5, 0, 5), 1)
+        parts.append(f"news tone is supportive (+{s_contrib:.0f} to buy thesis)" if s_contrib >= 2 else "news tone is supportive")
     elif sentiment_score < -0.15:
-        parts.append("news tone is risk-off")
+        s_contrib = round(clamp(-sentiment_score * 5, 0, 5), 1)
+        parts.append(f"news tone is risk-off (+{s_contrib:.0f} to sell thesis)" if s_contrib >= 2 else "news tone is risk-off")
 
-    if catalyst_score > 0:
-        parts.append("a recent filing adds catalyst risk but not clear direction")
+    if catalyst_score >= 0.25:
+        c_contrib = round(clamp(catalyst_score * 3, 0, 3), 1)
+        parts.append(f"recent filing adds catalyst support (+{c_contrib:.0f})" if c_contrib >= 2 else "a recent filing adds catalyst interest")
 
     if options_flow_summary:
         parts.append(options_flow_summary.rstrip("."))
+    net_opt = options_bullish_score - options_bearish_score
+    opt_contrib = round(clamp(abs(net_opt) * 0.5, 0, 4), 1)
+    if opt_contrib >= 2:
+        opt_side = "buy" if net_opt > 0 else "sell"
+        parts.append(f"options flow reinforced {opt_side} thesis (+{opt_contrib:.0f})")
 
-    parts.append(f"market regime is {market_status}")
+    regime_contrib = 3.0 if market_status in ("bullish", "bearish") else 0.0
+    if regime_contrib >= 2:
+        parts.append(f"market regime is {market_status} (+{regime_contrib:.0f} to {'buy' if market_status == 'bullish' else 'sell'} thesis)")
+    else:
+        parts.append(f"market regime is {market_status}")
+    if abs(trend_strength_pct) > 0.1:
+        direction = "above" if trend_above_sma else "below"
+        parts.append(f"price is {abs(trend_strength_pct):.1f}% {direction} the 20-bar moving average")
     if volatility_regime != "normal":
         parts.append(f"volatility regime is {volatility_regime}")
     if gate_reason:

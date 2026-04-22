@@ -1,0 +1,11 @@
+.next
+apps/web/.next
+node_modules
+dist
+build
+public
+*.config.js
+*.config.mjs
+*.config.ts
+**/.venv/**
+**/venv/**

@@ -5,6 +5,8 @@ from typing import Any
 import httpx
 
 from app.config import get_settings
+from app.http_client import request_json
+from app.provider_resilience import AsyncProviderGuard
 
 
 class AlpacaClient:
@@ -16,6 +18,22 @@ class AlpacaClient:
             "APCA-API-SECRET-KEY": self.settings.alpaca_api_secret,
         }
         self._async_client = httpx.AsyncClient(timeout=self.timeout)
+        self._guard = AsyncProviderGuard("alpaca", pace_seconds=0.1)
+
+    async def _request_json(self, method: str, url: str, **kwargs: Any) -> Any:
+        await self._guard.throttle()
+        return await request_json(
+            self._async_client,
+            method=method,
+            url=url,
+            provider="alpaca",
+            on_backoff=self._guard.register_backoff,
+            headers={**self.headers, **kwargs.pop("headers", {})},
+            **kwargs,
+        )
+
+    def _latest_cache_key(self, namespace: str, symbols: list[str], timeframe: str) -> tuple[str, tuple[str, ...], str]:
+        return namespace, tuple(sorted(symbol.upper() for symbol in symbols if symbol)), timeframe
 
     def _require_credentials(self) -> None:
         if not self.settings.alpaca_api_key or not self.settings.alpaca_api_secret:
@@ -110,28 +128,62 @@ class AlpacaClient:
             }
         return bars_by_symbol
 
+    async def _fetch_stock_bars(
+        self,
+        *,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        timeframe: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        return await self._request_json(
+            "GET",
+            f"{self.settings.alpaca_market_data_url}/v2/stocks/bars",
+            params={
+                "symbols": ",".join(symbols),
+                "timeframe": timeframe,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "limit": limit,
+                "adjustment": "raw",
+                "feed": "iex",
+                "sort": "asc",
+            },
+        )
+
+    async def _fetch_crypto_bars(
+        self,
+        *,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        timeframe: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        return await self._request_json(
+            "GET",
+            f"{self.settings.alpaca_market_data_url}/v1beta3/crypto/us/bars",
+            params={
+                "symbols": ",".join(symbols),
+                "timeframe": timeframe,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "limit": limit,
+                "sort": "asc",
+            },
+        )
+
     async def get_latest_bars(self, symbols: list[str], timeframe: str = "5Min") -> dict[str, dict[str, Any]]:
         self._require_credentials()
-
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=3)
-        params = {
-            "symbols": ",".join(symbols),
-            "timeframe": timeframe,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "limit": 1000,
-            "adjustment": "raw",
-            "feed": "iex",
-            "sort": "asc",
-        }
-
-        url = f"{self.settings.alpaca_market_data_url}/v2/stocks/bars"
-        response = await self._async_client.get(url, params=params, headers=self.headers)
-        response.raise_for_status()
-        payload = response.json()
-
-        return self._build_bars_by_symbol(payload)
+        if not symbols:
+            return {}
+        return await self._guard.cached_call(
+            key=self._latest_cache_key("stocks", symbols, timeframe),
+            ttl_seconds=self.settings.alpaca_latest_data_cache_seconds,
+            stale_ttl_seconds=max(self.settings.alpaca_latest_data_cache_seconds * 6, 15),
+            fetcher=lambda: self._get_latest_bars_uncached(symbols=symbols, timeframe=timeframe),
+        )
 
     async def get_latest_crypto_bars(
         self,
@@ -141,21 +193,45 @@ class AlpacaClient:
         self._require_credentials()
         if not symbols:
             return {}
+        return await self._guard.cached_call(
+            key=self._latest_cache_key("crypto", symbols, timeframe),
+            ttl_seconds=self.settings.alpaca_latest_data_cache_seconds,
+            stale_ttl_seconds=max(self.settings.alpaca_latest_data_cache_seconds * 6, 15),
+            fetcher=lambda: self._get_latest_crypto_bars_uncached(symbols=symbols, timeframe=timeframe),
+        )
 
+    async def _get_latest_bars_uncached(
+        self,
+        *,
+        symbols: list[str],
+        timeframe: str,
+    ) -> dict[str, dict[str, Any]]:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=3)
-        params = {
-            "symbols": ",".join(symbols),
-            "timeframe": timeframe,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "limit": 1000,
-            "sort": "asc",
-        }
-        url = f"{self.settings.alpaca_market_data_url}/v1beta3/crypto/us/bars"
-        response = await self._async_client.get(url, params=params, headers=self.headers)
-        response.raise_for_status()
-        payload = response.json()
+        payload = await self._fetch_stock_bars(
+            symbols=symbols,
+            start=start,
+            end=end,
+            timeframe=timeframe,
+            limit=1000,
+        )
+        return self._build_bars_by_symbol(payload)
+
+    async def _get_latest_crypto_bars_uncached(
+        self,
+        *,
+        symbols: list[str],
+        timeframe: str,
+    ) -> dict[str, dict[str, Any]]:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=3)
+        payload = await self._fetch_crypto_bars(
+            symbols=symbols,
+            start=start,
+            end=end,
+            timeframe=timeframe,
+            limit=1000,
+        )
         return self._build_bars_by_symbol(payload)
 
     async def get_latest_price(self, symbol: str) -> float:
@@ -189,21 +265,13 @@ class AlpacaClient:
         )
         start = target - timedelta(minutes=tolerance_minutes)
         end = target + timedelta(minutes=tolerance_minutes)
-        params = {
-            "symbols": symbol.upper(),
-            "timeframe": timeframe,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "limit": 500,
-            "adjustment": "raw",
-            "feed": "iex",
-            "sort": "asc",
-        }
-
-        url = f"{self.settings.alpaca_market_data_url}/v2/stocks/bars"
-        response = await self._async_client.get(url, params=params, headers=self.headers)
-        response.raise_for_status()
-        payload = response.json()
+        payload = await self._fetch_stock_bars(
+            symbols=[symbol.upper()],
+            start=start,
+            end=end,
+            timeframe=timeframe,
+            limit=500,
+        )
 
         rows = payload.get("bars", {}).get(symbol.upper(), [])
         if not rows:
@@ -233,21 +301,13 @@ class AlpacaClient:
             else target_time.replace(tzinfo=timezone.utc)
         )
         end = target + timedelta(minutes=max_search_minutes)
-        params = {
-            "symbols": symbol.upper(),
-            "timeframe": timeframe,
-            "start": target.isoformat(),
-            "end": end.isoformat(),
-            "limit": 5000,
-            "adjustment": "raw",
-            "feed": "iex",
-            "sort": "asc",
-        }
-
-        url = f"{self.settings.alpaca_market_data_url}/v2/stocks/bars"
-        response = await self._async_client.get(url, params=params, headers=self.headers)
-        response.raise_for_status()
-        payload = response.json()
+        payload = await self._fetch_stock_bars(
+            symbols=[symbol.upper()],
+            start=target,
+            end=end,
+            timeframe=timeframe,
+            limit=5000,
+        )
 
         rows = payload.get("bars", {}).get(symbol.upper(), [])
         if not rows:
@@ -274,19 +334,13 @@ class AlpacaClient:
             else target_time.replace(tzinfo=timezone.utc)
         )
         end = target + timedelta(minutes=max_search_minutes)
-        params = {
-            "symbols": symbol.upper(),
-            "timeframe": timeframe,
-            "start": target.isoformat(),
-            "end": end.isoformat(),
-            "limit": 5000,
-            "sort": "asc",
-        }
-
-        url = f"{self.settings.alpaca_market_data_url}/v1beta3/crypto/us/bars"
-        response = await self._async_client.get(url, params=params, headers=self.headers)
-        response.raise_for_status()
-        payload = response.json()
+        payload = await self._fetch_crypto_bars(
+            symbols=[symbol.upper()],
+            start=target,
+            end=end,
+            timeframe=timeframe,
+            limit=5000,
+        )
 
         rows = payload.get("bars", {}).get(symbol.upper(), [])
         if not rows:
@@ -324,10 +378,63 @@ class AlpacaClient:
         if idempotency_key:
             payload["client_order_id"] = idempotency_key[:48]
 
-        response = await self._async_client.post(
+        return await self._request_json(
+            "POST",
             f"{self.settings.alpaca_base_url}/v2/orders",
             json=payload,
-            headers=self.headers,
         )
-        response.raise_for_status()
-        return response.json()
+
+    async def get_account(self) -> dict[str, Any]:
+        self._require_credentials()
+        return await self._request_json(
+            "GET",
+            f"{self.settings.alpaca_base_url}/v2/account",
+        )
+
+    async def get_positions(self) -> list[dict[str, Any]]:
+        self._require_credentials()
+        payload = await self._request_json(
+            "GET",
+            f"{self.settings.alpaca_base_url}/v2/positions",
+        )
+        if isinstance(payload, list):
+            return payload
+        return []
+
+    async def get_historical_stock_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        timeframe: str = "5Min",
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        self._require_credentials()
+        payload = await self._fetch_stock_bars(
+            symbols=[symbol.upper()],
+            start=start,
+            end=end,
+            timeframe=timeframe,
+            limit=limit,
+        )
+        return payload.get("bars", {}).get(symbol.upper(), [])
+
+    async def get_historical_crypto_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        timeframe: str = "5Min",
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        self._require_credentials()
+        payload = await self._fetch_crypto_bars(
+            symbols=[symbol.upper()],
+            start=start,
+            end=end,
+            timeframe=timeframe,
+            limit=limit,
+        )
+        return payload.get("bars", {}).get(symbol.upper(), [])

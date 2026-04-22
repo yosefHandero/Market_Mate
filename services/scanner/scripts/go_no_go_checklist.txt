@@ -1,0 +1,26 @@
+95+ automation readiness (fake-money dry-run) — final declaration checklist
+
+Complete only after a single burn-in window (6–12h) with hourly evidence captures.
+
+[ ] 6–12h continuous dry-run window completed with hourly triple snapshots:
+    GET /automation/status, GET /readyz, GET /orders/audits?limit=200
+    (use scripts/collect_hourly_evidence.py; artifacts under var/hourly-evidence/)
+
+[ ] Severity-1 conditions not observed (see docs/95-plus-fake-money-evidence.md):
+    no duplicate dry-run places per deterministic intent key;
+    no budget bypass;
+    no silent retry beyond cap;
+    breaker not logically stuck (scripts/verify_automation_gates.py)
+
+[ ] Acceptance gates verified with pass/fail recorded (evidence table in operator notes)
+
+[ ] Config freeze documented for the window (scripts/snapshot_operator_baseline.py)
+
+[ ] Read-model/UI parity: dashboard shows candidates filter metrics and breaker probe fields,
+    or gap documented with raw JSON captured
+
+[ ] Scope statement recorded: 95+ = automation reliability/safety for fake-money dry-run;
+    not profitability or live trading.
+
+GO: all boxes checked.
+NO-GO: any box unchecked — remediate and re-run burn-in.

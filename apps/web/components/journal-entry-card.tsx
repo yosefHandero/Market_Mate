@@ -1,15 +1,15 @@
-"use client";
+'use client';
 
-import { useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
-import { JournalEntry } from "@/lib/types";
-import { updateJournalEntry } from "@/lib/api";
-import { JournalEntryActions } from "@/components/journal-entry-actions";
+import { useMemo, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { JournalEntry } from '@/lib/types';
+import { updateJournalEntry } from '@/lib/api';
+import { JournalEntryActions } from '@/components/journal-entry-actions';
 
 function decisionBadgeClass(decision: string) {
-  if (decision === "took") return "green";
-  if (decision === "skipped") return "amber";
-  return "blue";
+  if (decision === 'took') return 'green';
+  if (decision === 'skipped') return 'amber';
+  return 'blue';
 }
 
 type JournalEntryCardProps = {
@@ -29,13 +29,14 @@ export function JournalEntryCard({
   const [isEditing, setIsEditing] = useState(false);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
   const [editEntryPrice, setEditEntryPrice] = useState(
-    entry.entry_price != null ? String(entry.entry_price) : "",
+    entry.entry_price != null ? String(entry.entry_price) : '',
   );
   const [editExitPrice, setEditExitPrice] = useState(
-    entry.exit_price != null ? String(entry.exit_price) : "",
+    entry.exit_price != null ? String(entry.exit_price) : '',
   );
-  const [editNotes, setEditNotes] = useState(entry.notes ?? "");
-  const [editError, setEditError] = useState("");
+  const [editNotes, setEditNotes] = useState(entry.notes ?? '');
+  const [editOverrideReason, setEditOverrideReason] = useState(entry.override_reason ?? '');
+  const [editError, setEditError] = useState('');
 
   const editPnlPct = useMemo(() => {
     if (!editEntryPrice || !editExitPrice) return null;
@@ -43,11 +44,7 @@ export function JournalEntryCard({
     const entryNum = Number(editEntryPrice);
     const exitNum = Number(editExitPrice);
 
-    if (
-      !Number.isFinite(entryNum) ||
-      !Number.isFinite(exitNum) ||
-      entryNum <= 0
-    ) {
+    if (!Number.isFinite(entryNum) || !Number.isFinite(exitNum) || entryNum <= 0) {
       return null;
     }
 
@@ -58,24 +55,23 @@ export function JournalEntryCard({
     const parsedEntry = editEntryPrice ? Number(editEntryPrice) : null;
     const parsedExit = editExitPrice ? Number(editExitPrice) : null;
 
-    if (
-      parsedEntry != null &&
-      (!Number.isFinite(parsedEntry) || parsedEntry <= 0)
-    ) {
-      setEditError("Entry price must be a valid positive number.");
+    if (parsedEntry != null && (!Number.isFinite(parsedEntry) || parsedEntry <= 0)) {
+      setEditError('Entry price must be a valid positive number.');
       return;
     }
 
-    if (
-      parsedExit != null &&
-      (!Number.isFinite(parsedExit) || parsedExit <= 0)
-    ) {
-      setEditError("Exit price must be a valid positive number.");
+    if (parsedExit != null && (!Number.isFinite(parsedExit) || parsedExit <= 0)) {
+      setEditError('Exit price must be a valid positive number.');
+      return;
+    }
+
+    if (parsedExit != null && parsedEntry == null) {
+      setEditError('Exit price requires an entry price.');
       return;
     }
 
     try {
-      setEditError("");
+      setEditError('');
       setIsSavingEdit(true);
 
       await updateJournalEntry(entry.id, {
@@ -83,15 +79,15 @@ export function JournalEntryCard({
         exit_price: parsedExit,
         pnl_pct: editPnlPct,
         notes: editNotes,
+        override_reason: editOverrideReason || null,
+        action_state: entry.decision,
       });
 
       setIsEditing(false);
       router.refresh();
     } catch (error) {
       setEditError(
-        error instanceof Error
-          ? error.message
-          : `Failed to save changes for ${entry.ticker}.`,
+        error instanceof Error ? error.message : `Failed to save changes for ${entry.ticker}.`,
       );
     } finally {
       setIsSavingEdit(false);
@@ -99,12 +95,11 @@ export function JournalEntryCard({
   }
 
   function handleCancelEdit() {
-    setEditEntryPrice(
-      entry.entry_price != null ? String(entry.entry_price) : "",
-    );
-    setEditExitPrice(entry.exit_price != null ? String(entry.exit_price) : "");
-    setEditNotes(entry.notes ?? "");
-    setEditError("");
+    setEditEntryPrice(entry.entry_price != null ? String(entry.entry_price) : '');
+    setEditExitPrice(entry.exit_price != null ? String(entry.exit_price) : '');
+    setEditNotes(entry.notes ?? '');
+    setEditOverrideReason(entry.override_reason ?? '');
+    setEditError('');
     setIsEditing(false);
   }
 
@@ -113,57 +108,50 @@ export function JournalEntryCard({
       <div className="header-row">
         <div>
           <strong>{entry.ticker}</strong>
-          <div className="muted small">
-            {new Date(entry.created_at).toLocaleString()}
-          </div>
+          <div className="muted small">{new Date(entry.created_at).toLocaleString()}</div>
           <div className="muted small">ID: {entry.id}</div>
         </div>
-        <span className={`badge ${decisionBadgeClass(entry.decision)}`}>
-          {entry.decision}
-        </span>
+        <span className={`badge ${decisionBadgeClass(entry.decision)}`}>{entry.decision}</span>
       </div>
 
       {!isEditing ? (
         <>
           <div className="small" style={{ marginTop: 8 }}>
-            Entry:{" "}
-            {entry.entry_price != null
-              ? `$${entry.entry_price.toFixed(2)}`
-              : "—"}
-            {" • "}
-            Exit:{" "}
-            {entry.exit_price != null ? `$${entry.exit_price.toFixed(2)}` : "—"}
-            {" • "}
+            Entry: {entry.entry_price != null ? `$${entry.entry_price.toFixed(2)}` : '—'}
+            {' • '}
+            Exit: {entry.exit_price != null ? `$${entry.exit_price.toFixed(2)}` : '—'}
+            {' • '}
             <span
               className={
-                entry.pnl_pct != null
-                  ? entry.pnl_pct >= 0
-                    ? "positive"
-                    : "negative"
-                  : ""
+                entry.pnl_pct != null ? (entry.pnl_pct >= 0 ? 'positive' : 'negative') : ''
               }
             >
-              P/L:{" "}
+              P/L:{' '}
               {entry.pnl_pct != null
-                ? `${entry.pnl_pct >= 0 ? "+" : ""}${entry.pnl_pct.toFixed(2)}%`
-                : "—"}
+                ? `${entry.pnl_pct >= 0 ? '+' : ''}${entry.pnl_pct.toFixed(2)}%`
+                : '—'}
             </span>
             <div className="small muted" style={{ marginTop: 8 }}>
-              Signal: {entry.signal_label ?? "—"}
-              {" • "}
-              Score: {entry.score != null ? entry.score.toFixed(1) : "—"}
-              {" • "}
-              News: {entry.news_source ?? "—"}
+              Signal: {entry.signal_label ?? '—'}
+              {' • '}
+              Score: {entry.score != null ? entry.score.toFixed(1) : '—'}
+              {' • '}
+              News: {entry.news_source ?? '—'}
             </div>
             <div className="small muted" style={{ marginTop: 6 }}>
-              {entry.decision === "watching"
-                ? "Status: waiting for decision"
-                : entry.decision === "took" && entry.exit_price == null
-                  ? "Status: trade open"
-                  : entry.decision === "took" && entry.exit_price != null
-                    ? "Status: trade closed"
-                    : "Status: skipped"}
+              {entry.decision === 'watching'
+                ? 'Status: waiting for decision'
+                : entry.decision === 'took' && entry.exit_price == null
+                  ? 'Status: trade open'
+                  : entry.decision === 'took' && entry.exit_price != null
+                    ? 'Status: trade closed'
+                    : 'Status: skipped'}
             </div>
+            {entry.override_reason ? (
+              <div className="small muted" style={{ marginTop: 6 }}>
+                Override reason: {entry.override_reason}
+              </div>
+            ) : null}
           </div>
 
           {entry.notes ? (
@@ -172,9 +160,7 @@ export function JournalEntryCard({
             </div>
           ) : null}
 
-          <div
-            style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}
-          >
+          <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button
               type="button"
               className="button"
@@ -184,7 +170,7 @@ export function JournalEntryCard({
               Edit
             </button>
 
-            {entry.decision === "took" && entry.exit_price == null ? (
+            {entry.decision === 'took' && entry.exit_price == null ? (
               <button
                 type="button"
                 className="button"
@@ -205,16 +191,17 @@ export function JournalEntryCard({
         </>
       ) : (
         <div className="journal-form" style={{ marginTop: 10 }}>
-          {entry.decision === "took" && entry.exit_price == null ? (
-            <div className="small muted">
-              Add an exit price to close this trade.
-            </div>
+          {entry.decision === 'took' && entry.exit_price == null ? (
+            <div className="small muted">Add an exit price to close this trade.</div>
           ) : null}
 
           <div className="form-grid">
             <div>
-              <label className="form-label">Entry price</label>
+              <label className="form-label" htmlFor={`journal-entry-price-${entry.id}`}>
+                Entry price
+              </label>
               <input
+                id={`journal-entry-price-${entry.id}`}
                 className="input"
                 type="number"
                 step="0.01"
@@ -226,8 +213,11 @@ export function JournalEntryCard({
             </div>
 
             <div>
-              <label className="form-label">Exit price</label>
+              <label className="form-label" htmlFor={`journal-exit-price-${entry.id}`}>
+                Exit price
+              </label>
               <input
+                id={`journal-exit-price-${entry.id}`}
                 className="input"
                 type="number"
                 step="0.01"
@@ -240,10 +230,8 @@ export function JournalEntryCard({
           </div>
 
           {editPnlPct != null ? (
-            <div
-              className={`small ${editPnlPct >= 0 ? "positive" : "negative"}`}
-            >
-              Estimated P/L: {editPnlPct >= 0 ? "+" : ""}
+            <div className={`small ${editPnlPct >= 0 ? 'positive' : 'negative'}`}>
+              Estimated P/L: {editPnlPct >= 0 ? '+' : ''}
               {editPnlPct.toFixed(2)}%
             </div>
           ) : (
@@ -251,8 +239,25 @@ export function JournalEntryCard({
           )}
 
           <div>
-            <label className="form-label">Notes</label>
+            <label className="form-label" htmlFor={`journal-override-reason-${entry.id}`}>
+              Override reason
+            </label>
+            <input
+              id={`journal-override-reason-${entry.id}`}
+              className="input"
+              value={editOverrideReason}
+              onChange={(e) => setEditOverrideReason(e.target.value)}
+              placeholder="Why you overrode the default path..."
+              maxLength={200}
+            />
+          </div>
+
+          <div>
+            <label className="form-label" htmlFor={`journal-notes-${entry.id}`}>
+              Notes
+            </label>
             <textarea
+              id={`journal-notes-${entry.id}`}
               className="textarea"
               rows={4}
               value={editNotes}
@@ -270,7 +275,7 @@ export function JournalEntryCard({
               disabled={isSavingEdit}
               onClick={handleSaveEdit}
             >
-              {isSavingEdit ? "Saving..." : "Save changes"}
+              {isSavingEdit ? 'Saving...' : 'Save changes'}
             </button>
 
             <button

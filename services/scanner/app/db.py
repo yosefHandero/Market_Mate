@@ -24,20 +24,27 @@ SessionLocal = sessionmaker(
 )
 Base = declarative_base()
 
+# Register ORM tables on Base.metadata (create_all / schema patches).
+from app.models.journal import JournalEntryORM  # noqa: E402, F401
+from app.models.scan import AutomationIntentORM, ExecutionAuditORM, PaperLoopBreakerORM, PaperPositionORM  # noqa: E402, F401
+
 REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
     "scan_runs": {
+        "strategy_variant": "VARCHAR(32) DEFAULT 'layered-v4'",
+        "shadow_enabled": "BOOLEAN DEFAULT 0",
         "alerts_sent": "INTEGER DEFAULT 0",
         "fear_greed_value": "INTEGER",
         "fear_greed_label": "VARCHAR(32)",
     },
     "scan_results": {
         "asset_type": "VARCHAR(16) DEFAULT 'stock'",
+        "strategy_variant": "VARCHAR(32) DEFAULT 'layered-v4'",
         "calibrated_confidence": "FLOAT DEFAULT 0",
         "calibration_source": "VARCHAR(16) DEFAULT 'raw'",
         "buy_score": "FLOAT DEFAULT 0",
         "sell_score": "FLOAT DEFAULT 0",
         "decision_signal": "VARCHAR(16) DEFAULT 'HOLD'",
-        "scoring_version": "VARCHAR(32) DEFAULT 'v2-directional'",
+        "scoring_version": "VARCHAR(32) DEFAULT 'v4.0-layered'",
         "sector_strength_score": "FLOAT DEFAULT 0",
         "relative_strength_pct": "FLOAT DEFAULT 0",
         "options_flow_score": "FLOAT DEFAULT 0",
@@ -62,21 +69,28 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "fear_greed_label": "VARCHAR(32)",
         "provider_status": "VARCHAR(16) DEFAULT 'ok'",
         "provider_warnings_json": "TEXT",
+        "data_grade": "VARCHAR(16) DEFAULT 'research'",
+        "bar_age_minutes": "FLOAT",
+        "freshness_flags_json": "TEXT",
+        "layer_details_json": "TEXT",
+        "comparison_json": "TEXT",
     },
     "signal_outcomes": {
         "asset_type": "VARCHAR(16) DEFAULT 'stock'",
+        "strategy_variant": "VARCHAR(32) DEFAULT 'layered-v4'",
         "confidence": "FLOAT DEFAULT 0",
         "calibrated_confidence": "FLOAT DEFAULT 0",
         "calibration_source": "VARCHAR(16) DEFAULT 'raw'",
         "raw_score": "FLOAT DEFAULT 0",
         "score_band": "VARCHAR(16) DEFAULT '0-59'",
-        "scoring_version": "VARCHAR(32) DEFAULT 'v2-directional'",
+        "scoring_version": "VARCHAR(32) DEFAULT 'v4.0-layered'",
         "market_status": "VARCHAR(16)",
         "buy_score": "FLOAT DEFAULT 0",
         "sell_score": "FLOAT DEFAULT 0",
         "signal_label": "VARCHAR(16)",
         "gate_passed": "BOOLEAN DEFAULT 0",
         "gate_reason": "TEXT",
+        "data_grade": "VARCHAR(16) DEFAULT 'research'",
         "news_source": "VARCHAR(32)",
         "relative_volume": "FLOAT",
         "price_change_pct": "FLOAT",
@@ -104,6 +118,8 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "score": "FLOAT",
         "news_source": "VARCHAR(32)",
         "notes": "TEXT DEFAULT ''",
+        "override_reason": "TEXT",
+        "action_state": "VARCHAR(16)",
     },
     "execution_audits": {
         "created_at": "DATETIME",
@@ -115,13 +131,19 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "qty": "FLOAT",
         "dry_run": "BOOLEAN DEFAULT 0",
         "idempotency_key": "VARCHAR(128)",
+        "idempotency_payload_hash": "VARCHAR(64)",
         "lifecycle_status": "VARCHAR(32) DEFAULT 'previewed'",
         "latest_price": "FLOAT",
         "notional_estimate": "FLOAT",
+        "signal_outcome_id": "INTEGER",
         "signal_run_id": "VARCHAR(64)",
         "signal_generated_at": "DATETIME",
         "latest_signal": "VARCHAR(16)",
         "confidence": "FLOAT",
+        "trade_gate_horizon": "VARCHAR(16)",
+        "evidence_basis": "VARCHAR(64)",
+        "trust_window_start": "DATETIME",
+        "trust_window_end": "DATETIME",
         "trade_gate_allowed": "BOOLEAN",
         "trade_gate_reason": "TEXT",
         "submitted": "BOOLEAN DEFAULT 0",
@@ -144,6 +166,58 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "last_error": "TEXT",
         "created_at": "DATETIME",
         "updated_at": "DATETIME",
+    },
+    "automation_intents": {
+        "created_at": "DATETIME",
+        "updated_at": "DATETIME",
+        "run_id": "VARCHAR(64)",
+        "symbol": "VARCHAR(16)",
+        "asset_type": "VARCHAR(16) DEFAULT 'stock'",
+        "side": "VARCHAR(16)",
+        "qty": "FLOAT",
+        "strategy_version": "VARCHAR(32)",
+        "confidence": "FLOAT",
+        "horizon": "VARCHAR(16)",
+        "window_start": "DATETIME",
+        "window_end": "DATETIME",
+        "intent_key": "VARCHAR(255)",
+        "intent_hash": "VARCHAR(64)",
+        "status": "VARCHAR(32) DEFAULT 'pending'",
+        "status_reason": "TEXT",
+        "idempotency_key": "VARCHAR(128)",
+        "execution_audit_id": "INTEGER",
+        "decision_payload_json": "TEXT",
+        "request_payload_json": "TEXT",
+        "attempt_count": "INTEGER DEFAULT 0",
+        "request_count_used": "INTEGER DEFAULT 0",
+        "request_count_avoided": "INTEGER DEFAULT 0",
+        "last_attempt_at": "DATETIME",
+        "next_retry_at": "DATETIME",
+        "claimed_by": "VARCHAR(64)",
+        "claim_expires_at": "DATETIME",
+        "cooldown_until": "DATETIME",
+        "incident_class": "VARCHAR(64)",
+    },
+    "paper_loop_breaker": {},
+    "paper_positions": {
+        "created_at": "DATETIME",
+        "updated_at": "DATETIME",
+        "intent_key": "VARCHAR(255)",
+        "execution_audit_id": "INTEGER",
+        "ticker": "VARCHAR(16)",
+        "asset_type": "VARCHAR(16) DEFAULT 'stock'",
+        "side": "VARCHAR(16)",
+        "quantity": "FLOAT",
+        "simulated_fill_price": "FLOAT",
+        "notional_usd": "FLOAT DEFAULT 0",
+        "cost_basis_usd": "FLOAT DEFAULT 0",
+        "close_price": "FLOAT",
+        "realized_pnl": "FLOAT",
+        "status": "VARCHAR(16) DEFAULT 'open'",
+        "opened_at": "DATETIME",
+        "closed_at": "DATETIME",
+        "strategy_version": "VARCHAR(32)",
+        "confidence": "FLOAT",
     },
 }
 
@@ -189,5 +263,28 @@ def check_database_connection() -> bool:
         return True
     except Exception:
         return False
+
+
+def apply_required_schema_patches() -> list[str]:
+    """Add missing columns declared in REQUIRED_TABLE_COLUMNS (SQLite-friendly ALTER ADD)."""
+    applied: list[str] = []
+    with engine.begin() as connection:
+        for table_name, column_defs in REQUIRED_TABLE_COLUMNS.items():
+            inspector = inspect(connection)
+            if not inspector.has_table(table_name):
+                table = Base.metadata.tables.get(table_name)
+                if table is not None:
+                    Base.metadata.create_all(bind=connection, tables=[table], checkfirst=True)
+                    applied.append(f"{table_name}.__created_table__")
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name, column_sql in column_defs.items():
+                if column_name in existing:
+                    continue
+                connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"))
+                applied.append(f"{table_name}.{column_name}")
+                inspector = inspect(connection)
+                existing = {column["name"] for column in inspector.get_columns(table_name)}
+    return applied
 
 
