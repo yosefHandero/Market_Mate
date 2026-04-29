@@ -1696,13 +1696,17 @@ class ScanRepository:
         self,
         *,
         limit: int = 100,
+        offset: int = 0,
         status: str | None = None,
+        symbol: str | None = None,
     ) -> list[PaperPositionSummary]:
         with SessionLocal() as session:
             query = select(PaperPositionORM).order_by(desc(PaperPositionORM.opened_at), desc(PaperPositionORM.id))
             if status is not None:
                 query = query.where(PaperPositionORM.status == status)
-            rows = session.execute(query.limit(limit)).scalars().all()
+            if symbol is not None:
+                query = query.where(PaperPositionORM.ticker == symbol.upper())
+            rows = session.execute(query.offset(offset).limit(limit)).scalars().all()
             return [
                 PaperPositionSummary(
                     id=row.id,
@@ -1726,11 +1730,34 @@ class ScanRepository:
                 for row in rows
             ]
 
+    def record_paper_position_from_audit(
+        self,
+        *,
+        audit_id: int,
+        simulated_fill_price: float,
+        filled_at: datetime | None = None,
+    ) -> int | None:
+        from app.services.automation_repository import AutomationRepository
+
+        return AutomationRepository().record_paper_position_from_audit(
+            audit_id=audit_id,
+            simulated_fill_price=simulated_fill_price,
+            filled_at=filled_at,
+        )
+
     def get_paper_ledger_summary(self) -> PaperLedgerSummaryResponse:
         with SessionLocal() as session:
             rows = session.execute(select(PaperPositionORM)).scalars().all()
         open_rows = [row for row in rows if (row.status or "open") == "open"]
         closed_rows = [row for row in rows if (row.status or "open") == "closed"]
+        winning_closed = [row for row in closed_rows if float(row.realized_pnl or 0.0) > 0]
+        cumulative = 0.0
+        peak = 0.0
+        max_drawdown = 0.0
+        for row in sorted(closed_rows, key=lambda item: (item.closed_at or item.opened_at, item.id)):
+            cumulative += float(row.realized_pnl or 0.0)
+            peak = max(peak, cumulative)
+            max_drawdown = max(max_drawdown, peak - cumulative)
         return PaperLedgerSummaryResponse(
             open_positions=len(open_rows),
             closed_positions=len(closed_rows),
@@ -1741,6 +1768,10 @@ class ScanRepository:
             short_positions=sum(1 for row in open_rows if row.side == "sell"),
             last_opened_at=max((row.opened_at for row in open_rows), default=None),
             last_closed_at=max((row.closed_at for row in closed_rows if row.closed_at is not None), default=None),
+            total_count=len(rows),
+            win_rate_pct=round((len(winning_closed) / len(closed_rows)) * 100, 2) if closed_rows else None,
+            gross_pnl_usd=round(sum(float(row.realized_pnl or 0.0) for row in closed_rows), 2),
+            max_drawdown_usd=round(max_drawdown, 2),
         )
 
     def reconcile_paper_loop(self) -> ReconciliationReportResponse:
@@ -1758,7 +1789,9 @@ class ScanRepository:
             positions = session.execute(select(PaperPositionORM)).scalars().all()
         for position in positions:
             intent = intents.get(position.intent_key)
-            if intent is None:
+            audit = audits.get(position.execution_audit_id) if position.execution_audit_id is not None else None
+            is_manual_audit_position = audit is not None and bool(getattr(audit, "dry_run", False))
+            if intent is None and not is_manual_audit_position:
                 issues.append(
                     ReconciliationIssue(
                         kind="paper_position_missing_intent",

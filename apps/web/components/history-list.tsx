@@ -1,4 +1,4 @@
-import { ScanRun } from '@/lib/types';
+import type { ScanRun } from '@/lib/types';
 import { MarketStatusBadge } from '@/components/market-status-badge';
 
 export function HistoryList({ runs }: { runs: ScanRun[] }) {

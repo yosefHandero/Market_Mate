@@ -1,84 +1,121 @@
-import { ActionList } from '@/components/action-list';
+import Link from 'next/link';
 import { OperatorActions } from '@/components/operator-actions';
-import { RankBuySimulationPanel } from '@/components/rank-buy-simulation-panel';
-import { RankTable } from '@/components/rank-table';
-import { GemmaTestButton } from '@/components/gemma-test-button';
+import { TradingWorkspace } from '@/components/trading-workspace';
 
 import {
   getAutomationStatus,
-  getJournalEntries,
   getLatestDecisions,
   getLatestScan,
+  getPaperLedger,
+  getPaperLedgerSummary,
   getReadyz,
 } from '@/lib/api';
-import { computePendingActions } from '@/lib/actions';
+
+function formatTimestamp(value: string | null | undefined) {
+  if (!value) {
+    return 'No scan has been recorded yet.';
+  }
+
+  return new Date(value).toLocaleString();
+}
 
 export default async function HomePage() {
-  const [decisionsResult, automationResult, journalResult, healthResult, latestScanResult] =
-    await Promise.all([
-      getLatestDecisions(),
-      getAutomationStatus(),
-      getJournalEntries(200),
-      getReadyz(),
-      getLatestScan(),
-    ]);
-
-  const items = computePendingActions({
-    decisions: decisionsResult.data,
-    automation: automationResult.data,
-    journalEntries: journalResult.data,
-    health: healthResult.data,
-    latestScan: latestScanResult.data,
-  });
+  const [
+    decisionsResult,
+    automationResult,
+    healthResult,
+    latestScanResult,
+    paperLedgerResult,
+    paperLedgerSummaryResult,
+  ] = await Promise.all([
+    getLatestDecisions(),
+    getAutomationStatus(),
+    getReadyz(),
+    getLatestScan(),
+    getPaperLedger(100),
+    getPaperLedgerSummary(),
+  ]);
 
   const errors = [
     decisionsResult.error,
     automationResult.error,
-    journalResult.error,
     healthResult.error,
     latestScanResult.error,
   ].filter(Boolean) as string[];
-
-  const latestScan = latestScanResult.data;
+  const paperLedgerError = [paperLedgerResult.error, paperLedgerSummaryResult.error]
+    .filter(Boolean)
+    .join(' ');
 
   return (
     <main style={{ display: 'grid', gap: 20 }}>
       <section className="card">
-        <h1 style={{ marginBottom: 6 }}>Actions</h1>
-        <p className="muted" style={{ marginBottom: 18 }}>
-          Items requiring your attention. Configuration, review decisions, and automation controls.
+        <h1 style={{ marginBottom: 8 }}>Dashboard</h1>
+        <p className="muted" style={{ margin: 0 }}>
+          Start here to run a scan, review the latest signals, and move into the page you need.
         </p>
 
-        <OperatorActions schedulerRunning={healthResult.data?.scheduler_running ?? false} />
-
-        {errors.length > 0 ? (
-          <div style={{ marginBottom: 16 }}>
-            {errors.map((err, i) => (
-              <p key={i} className="negative small" style={{ margin: '4px 0' }}>
-                {err}
-              </p>
+        {errors.length ? (
+          <div style={{ display: 'grid', gap: 6, marginTop: 16 }}>
+            {errors.map((error, index) => (
+              <span key={`${error}-${index}`} className="negative small">
+                {error}
+              </span>
             ))}
           </div>
         ) : null}
 
-        <ActionList items={items} />
+        <div className="detail-panel small" style={{ marginTop: 16 }}>
+          <div>
+            <span className="muted">Latest scan:</span>{' '}
+            {formatTimestamp(latestScanResult.data?.created_at)}
+          </div>
+          <div>
+            <span className="muted">Market status:</span>{' '}
+            {latestScanResult.data?.market_status ?? '—'}
+          </div>
+          <div>
+            <span className="muted">Ranked results:</span> {latestScanResult.data?.scan_count ?? 0}
+          </div>
+          <div>
+            <span className="muted">Watchlist size:</span>{' '}
+            {latestScanResult.data?.watchlist_size ?? 0}
+          </div>
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <OperatorActions schedulerRunning={healthResult.data?.scheduler_running ?? false} />
+        </div>
       </section>
 
-      <div className="grid grid-2" style={{ alignItems: 'start', gap: 20 }}>
-        <section className="card">
-          <h2 style={{ marginBottom: 8 }}>Latest run ranking</h2>
-          {latestScanResult.error ? (
-            <p className="negative">{latestScanResult.error}</p>
-          ) : latestScan?.results?.length ? (
-            <RankTable variant="compact" results={latestScan.results} topN={3} />
-          ) : (
-            <p className="muted">No ranked rows from the latest scan yet.</p>
-          )}
-        </section>
+      <TradingWorkspace
+        decisions={decisionsResult.data ?? []}
+        decisionsError={decisionsResult.error}
+        latestScan={latestScanResult.data}
+        initialPaperPositions={paperLedgerResult.data ?? []}
+        initialPaperSummary={paperLedgerSummaryResult.data}
+        paperLedgerError={paperLedgerError || null}
+      />
 
-        <RankBuySimulationPanel latestScan={latestScan} />
-      </div>
-      <GemmaTestButton />
+      <section className="card">
+        <h2 style={{ marginBottom: 8 }}>Open Pages</h2>
+        <p className="muted" style={{ marginBottom: 16 }}>
+          Use the dedicated pages for deeper review and trade journaling.
+        </p>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <Link href="/history" className="button">
+            Scan history
+          </Link>
+          <Link href="/review" className="button">
+            Review queue
+          </Link>
+          <Link href="/journal" className="button">
+            Journal
+          </Link>
+          <Link href="/validation" className="button">
+            Validation
+          </Link>
+        </div>
+      </section>
     </main>
   );
 }

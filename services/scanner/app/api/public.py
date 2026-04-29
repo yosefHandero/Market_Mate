@@ -369,10 +369,17 @@ async def get_automation_status(
 @protected_router.get("/paper/ledger", response_model=list[PaperPositionSummary])
 async def get_paper_ledger(
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     status: str | None = Query(default=None, pattern="^(open|closed)$"),
+    symbol: str | None = Query(default=None, min_length=1),
     scan_repository: ScanRepository = Depends(get_scan_repository),
 ) -> list[PaperPositionSummary]:
-    return scan_repository.list_paper_positions(limit=limit, status=status)
+    return scan_repository.list_paper_positions(
+        limit=limit,
+        offset=offset,
+        status=status,
+        symbol=symbol,
+    )
 
 
 @protected_router.get("/paper/ledger/summary", response_model=PaperLedgerSummaryResponse)

@@ -1,6 +1,6 @@
 'use client';
 
-import { JournalDecision } from '@/lib/types';
+import type { JournalDecision } from '@/lib/types';
 
 const filters: Array<'all' | JournalDecision> = ['all', 'took', 'skipped', 'watching'];
 

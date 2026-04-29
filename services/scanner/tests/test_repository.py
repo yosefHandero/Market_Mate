@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 import app.services.repository as repository_module
 from app.db import Base
 from app.models.journal import JournalEntryORM
-from app.models.scan import ExecutionAuditORM, SignalOutcomeORM
+from app.models.scan import ExecutionAuditORM, PaperPositionORM, SignalOutcomeORM
 from app.schemas import SignalOutcomePerformanceBucket, SignalOutcomeSummary, ValidationBucket
 from app.services.repository import ScanRepository
 
@@ -691,6 +691,161 @@ class RepositoryCalibrationTests(unittest.TestCase):
                         self.assertEqual(row.return_after_15m, 1.0)
                         self.assertEqual(row.return_after_1h, 2.0)
                         self.assertEqual(row.return_after_1d, 3.0)
+            finally:
+                engine.dispose()
+
+    def test_reconcile_allows_manual_audit_backed_paper_position_without_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+                with SessionLocal() as session:
+                    audit = ExecutionAuditORM(
+                        created_at=now,
+                        updated_at=now,
+                        ticker="AAPL",
+                        asset_type="stock",
+                        side="buy",
+                        order_type="market",
+                        qty=1.0,
+                        dry_run=True,
+                        idempotency_key="manual-1",
+                        lifecycle_status="dry_run",
+                        latest_price=190.0,
+                        notional_estimate=190.0,
+                        submitted=False,
+                        broker_status="dry_run",
+                        preview_payload="{}",
+                    )
+                    session.add(audit)
+                    session.flush()
+                    session.add(
+                        PaperPositionORM(
+                            created_at=now,
+                            updated_at=now,
+                            intent_key="manual-1",
+                            execution_audit_id=audit.id,
+                            ticker="AAPL",
+                            asset_type="stock",
+                            side="buy",
+                            quantity=1.0,
+                            simulated_fill_price=190.0,
+                            notional_usd=190.0,
+                            cost_basis_usd=190.0,
+                            status="open",
+                            opened_at=now,
+                            strategy_version="v4.0-layered",
+                            confidence=72.0,
+                        )
+                    )
+                    session.commit()
+
+                with patch.object(repository_module, "SessionLocal", SessionLocal):
+                    report = self.repo.reconcile_paper_loop()
+
+                self.assertTrue(report.ok)
+                self.assertEqual(report.total_issues, 0)
+                self.assertFalse(
+                    any(issue.kind == "paper_position_missing_intent" for issue in report.issues)
+                )
+            finally:
+                engine.dispose()
+
+    def test_paper_ledger_filters_and_summary_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+                with SessionLocal() as session:
+                    session.add_all(
+                        [
+                            PaperPositionORM(
+                                created_at=now,
+                                updated_at=now,
+                                intent_key="open-aapl",
+                                ticker="AAPL",
+                                asset_type="stock",
+                                side="buy",
+                                quantity=1.0,
+                                simulated_fill_price=100.0,
+                                notional_usd=100.0,
+                                cost_basis_usd=100.0,
+                                status="open",
+                                opened_at=now,
+                            ),
+                            PaperPositionORM(
+                                created_at=now,
+                                updated_at=now,
+                                intent_key="closed-aapl-win",
+                                ticker="AAPL",
+                                asset_type="stock",
+                                side="sell",
+                                quantity=1.0,
+                                simulated_fill_price=110.0,
+                                notional_usd=110.0,
+                                cost_basis_usd=100.0,
+                                close_price=110.0,
+                                realized_pnl=10.0,
+                                status="closed",
+                                opened_at=now - timedelta(minutes=2),
+                                closed_at=now - timedelta(minutes=1),
+                            ),
+                            PaperPositionORM(
+                                created_at=now,
+                                updated_at=now,
+                                intent_key="closed-msft-loss",
+                                ticker="MSFT",
+                                asset_type="stock",
+                                side="sell",
+                                quantity=1.0,
+                                simulated_fill_price=95.0,
+                                notional_usd=95.0,
+                                cost_basis_usd=100.0,
+                                close_price=95.0,
+                                realized_pnl=-5.0,
+                                status="closed",
+                                opened_at=now - timedelta(minutes=4),
+                                closed_at=now - timedelta(minutes=3),
+                            ),
+                        ]
+                    )
+                    session.commit()
+
+                with patch.object(repository_module, "SessionLocal", SessionLocal):
+                    filtered = self.repo.list_paper_positions(limit=10, offset=0, symbol="AAPL")
+                    summary = self.repo.get_paper_ledger_summary()
+
+                self.assertEqual([row.ticker for row in filtered], ["AAPL", "AAPL"])
+                self.assertEqual(summary.total_count, 3)
+                self.assertEqual(summary.win_rate_pct, 50.0)
+                self.assertEqual(summary.gross_pnl_usd, 5.0)
+                self.assertEqual(summary.max_drawdown_usd, 5.0)
             finally:
                 engine.dispose()
 

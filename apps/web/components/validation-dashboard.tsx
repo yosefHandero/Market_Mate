@@ -600,6 +600,28 @@ function ReconciliationCard({ reconciliation }: { reconciliation: Reconciliation
   );
 }
 
+function ReconciliationWarningCard({ message }: { message: string }) {
+  return (
+    <div className="card">
+      <div
+        style={{
+          alignItems: 'center',
+          display: 'flex',
+          fontWeight: 'bold',
+          gap: 16,
+          justifyContent: 'space-between',
+        }}
+      >
+        <span>Paper-loop reconciliation</span>
+        <span className="small negative">unavailable</span>
+      </div>
+      <p className="negative small" style={{ marginTop: 8 }}>
+        {message}
+      </p>
+    </div>
+  );
+}
+
 export function ValidationDashboard({
   summary,
   sweep,
@@ -608,6 +630,7 @@ export function ValidationDashboard({
   audits,
   automation,
   reconciliation,
+  reconciliationWarning,
   errors,
 }: {
   summary: ValidationSummary | null;
@@ -617,9 +640,19 @@ export function ValidationDashboard({
   audits: ExecutionAuditSummary[] | null;
   automation: AutomationStatusResponse | null;
   reconciliation?: ReconciliationReportResponse | null;
+  reconciliationWarning?: string | null;
   errors?: string[];
 }) {
-  if (!summary && !sweep && !alignment && !readiness && !audits && !automation && !reconciliation) {
+  if (
+    !summary &&
+    !sweep &&
+    !alignment &&
+    !readiness &&
+    !audits &&
+    !automation &&
+    !reconciliation &&
+    !reconciliationWarning
+  ) {
     return (
       <section className="card">
         <h2 style={{ marginBottom: 8 }}>Edge validation</h2>
@@ -647,7 +680,11 @@ export function ValidationDashboard({
 
       {automation && <AutomationLoopCard automation={automation} />}
 
-      {reconciliation && <ReconciliationCard reconciliation={reconciliation} />}
+      {reconciliation ? (
+        <ReconciliationCard reconciliation={reconciliation} />
+      ) : reconciliationWarning ? (
+        <ReconciliationWarningCard message={reconciliationWarning} />
+      ) : null}
 
       {summary && (
         <details className="card accordion-card">

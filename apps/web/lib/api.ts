@@ -22,6 +22,9 @@ export type ApiResult<T> = {
   error: string | null;
 };
 
+export const RECONCILIATION_UNAVAILABLE_MESSAGE =
+  'Reconciliation unavailable: admin token not configured';
+
 async function readApiResult<T>(path: string): Promise<ApiResult<T>> {
   try {
     return {
@@ -126,19 +129,26 @@ export async function getPaperLedgerSummary(): Promise<ApiResult<PaperLedgerSumm
 }
 
 export async function getReconciliationReport(): Promise<ApiResult<ReconciliationReportResponse>> {
-  const adminToken = process.env.SCANNER_ADMIN_API_TOKEN;
-  const headers: HeadersInit = adminToken
-    ? { Authorization: `Bearer ${adminToken}` }
-    : {};
+  const adminToken = process.env.SCANNER_ADMIN_API_TOKEN?.trim();
+
+  if (!adminToken) {
+    return {
+      data: null,
+      error: RECONCILIATION_UNAVAILABLE_MESSAGE,
+    };
+  }
+
+  const headers: HeadersInit = { Authorization: `Bearer ${adminToken}` };
+
   try {
     return {
       data: await fetchScannerJson<ReconciliationReportResponse>('/paper/reconcile', { headers }),
       error: null,
     };
-  } catch (error) {
+  } catch {
     return {
       data: null,
-      error: error instanceof Error ? error.message : 'Unknown request error.',
+      error: RECONCILIATION_UNAVAILABLE_MESSAGE,
     };
   }
 }

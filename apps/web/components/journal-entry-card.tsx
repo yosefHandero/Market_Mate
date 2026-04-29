@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { JournalEntry } from '@/lib/types';
+import type { JournalEntry } from '@/lib/types';
 import { updateJournalEntry } from '@/lib/api';
 import { JournalEntryActions } from '@/components/journal-entry-actions';
 

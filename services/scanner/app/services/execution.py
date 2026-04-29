@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 
 from sqlalchemy import desc, select
 
@@ -15,6 +16,9 @@ from app.schemas import OrderPlaceRequest, OrderPlaceResponse, OrderPreviewReque
 from app.services.readiness import evaluate_operational_readiness
 from app.services.repository import ScanRepository
 from app.services.risk import RiskService
+
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionService:
@@ -232,6 +236,19 @@ class ExecutionService:
             execution_audit_id=row.id,
         )
 
+    @staticmethod
+    def _estimate_pnl(
+        *,
+        side: str,
+        qty: float,
+        entry_price: float | None,
+        target_price: float | None,
+    ) -> float | None:
+        if entry_price is None or target_price is None or qty <= 0:
+            return None
+        direction = -1 if side == "sell" else 1
+        return round((target_price - entry_price) * qty * direction, 2)
+
     async def preview(self, request: OrderPreviewRequest) -> OrderPreviewResponse:
         self._enforce_operational_readiness()
         ticker = request.ticker.upper()
@@ -253,6 +270,21 @@ class ExecutionService:
             warnings.append(trade_gate.reason)
         elif trade_gate.execution_eligibility == "review":
             warnings.append("Execution requires manual review because evidence or provider quality is not fully clean.")
+        entry_price = request.entry_price or price_for_estimate
+        estimated_pnl = self._estimate_pnl(
+            side=request.side,
+            qty=request.qty,
+            entry_price=entry_price,
+            target_price=request.target_price,
+        )
+        reject_reasons = [trade_gate.reason] if not trade_gate.allowed else []
+        freshness = (
+            "fresh"
+            if getattr(trade_gate, "latest_scan_fresh", None) is True
+            else "stale"
+            if getattr(trade_gate, "latest_scan_fresh", None) is False
+            else "unknown"
+        )
         preview = OrderPreviewResponse(
             ticker=ticker,
             side=request.side,
@@ -263,6 +295,14 @@ class ExecutionService:
             time_in_force=self.settings.execution_default_time_in_force,
             warnings=warnings,
             trade_gate=trade_gate,
+            entry_price=round(entry_price, 4),
+            stop_price=request.stop_price,
+            target_price=request.target_price,
+            position_size=request.qty,
+            estimated_pnl_usd=estimated_pnl,
+            gate_result="allowed" if trade_gate.allowed else "blocked",
+            freshness=freshness,
+            reject_reasons=reject_reasons,
         )
         preview.execution_audit_id = self._write_audit(
             request=request,
@@ -309,6 +349,7 @@ class ExecutionService:
                 raw=preview.model_dump(),
                 trade_gate=preview.trade_gate,
                 execution_audit_id=preview.execution_audit_id,
+                recommended_action_snapshot=request.recommended_action_snapshot,
             )
         if request.dry_run or not self.settings.execution_enabled:
             self._update_audit(
@@ -318,6 +359,26 @@ class ExecutionService:
                 broker_status="dry_run",
                 broker_payload=preview.model_dump(mode="json"),
             )
+            if (
+                request.dry_run
+                and preview.execution_audit_id is not None
+                and preview.trade_gate is not None
+                and preview.trade_gate.allowed
+                and preview.latest_price > 0
+            ):
+                try:
+                    ledger_id = self._scan_repository.record_paper_position_from_audit(
+                        audit_id=preview.execution_audit_id,
+                        simulated_fill_price=float(preview.latest_price),
+                    )
+                except Exception:
+                    ledger_id = None
+                    logger.exception(
+                        "Failed to persist manual dry-run paper position for audit %s.",
+                        preview.execution_audit_id,
+                    )
+            else:
+                ledger_id = None
             return OrderPlaceResponse(
                 ok=True,
                 submitted=False,
@@ -327,6 +388,11 @@ class ExecutionService:
                 raw=preview.model_dump(),
                 trade_gate=preview.trade_gate,
                 execution_audit_id=preview.execution_audit_id,
+                ledger_id=ledger_id,
+                fill_price=preview.latest_price,
+                filled_qty=preview.qty,
+                slippage_assumption_bps=0.0,
+                recommended_action_snapshot=request.recommended_action_snapshot,
             )
 
         self._enforce_live_rollout_caps(request=request, preview=preview)

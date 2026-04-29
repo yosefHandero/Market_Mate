@@ -1,4 +1,4 @@
-import { JournalAnalytics, JournalAnalyticsBucket } from '@/lib/types';
+import type { JournalAnalytics, JournalAnalyticsBucket } from '@/lib/types';
 
 function formatPct(value: number | null) {
   if (value == null) return '—';

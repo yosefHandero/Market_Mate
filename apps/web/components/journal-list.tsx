@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { JournalEntry, JournalDecision } from '@/lib/types';
+import type { JournalDecision, JournalEntry } from '@/lib/types';
 import { updateJournalEntry } from '@/lib/api';
 import { JournalSummary } from '@/components/journal-summary';
 import { JournalEntryCard } from '@/components/journal-entry-card';

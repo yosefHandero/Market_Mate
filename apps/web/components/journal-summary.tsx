@@ -1,4 +1,4 @@
-import { JournalEntry } from '@/lib/types';
+import type { JournalEntry } from '@/lib/types';
 
 export function JournalSummary({ entries }: { entries: JournalEntry[] }) {
   const tookCount = entries.filter((entry) => entry.decision === 'took').length;

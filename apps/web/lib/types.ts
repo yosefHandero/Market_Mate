@@ -1,6 +1,7 @@
 export type MarketStatus = 'bullish' | 'neutral' | 'bearish';
 export type AssetType = 'stock' | 'crypto';
 export type DecisionSignal = 'BUY' | 'SELL' | 'HOLD';
+export type RecommendedAction = 'ignore' | 'review' | 'preview' | 'dry_run' | 'blocked';
 
 export interface GateCheck {
   name: string;
@@ -50,6 +51,7 @@ export interface ScanResult {
   volatility_regime: string;
   benchmark_ticker: string | null;
   benchmark_change_pct: number | null;
+  recommended_action?: RecommendedAction | null;
   gate_passed: boolean;
   gate_reason: string;
   gate_checks: GateCheck[];
@@ -158,7 +160,7 @@ export interface DecisionRow {
   bar_age_minutes: number | null;
   signal_age_minutes: number | null;
   freshness_flags: Record<string, string> | null;
-  recommended_action: 'ignore' | 'review' | 'preview' | 'dry_run' | 'blocked' | null;
+  recommended_action: RecommendedAction | null;
   score_contributions: Record<string, number>;
   strategy_version: string | null;
   short_metric_summary: string;
@@ -360,6 +362,122 @@ export interface ExecutionAuditSummary {
   error_message: string | null;
 }
 
+export type OrderSide = 'buy' | 'sell';
+export type OrderType = 'market' | 'limit';
+export type BrokerName = 'alpaca';
+
+export interface TradeEligibility {
+  ticker: string;
+  asset_type: AssetType;
+  strategy_variant: string;
+  requested_side: OrderSide;
+  required_signal: DecisionSignal;
+  signal_outcome_id: number | null;
+  signal_run_id: string | null;
+  signal_generated_at: string | null;
+  latest_signal: DecisionSignal | null;
+  confidence: number | null;
+  calibration_source: string | null;
+  raw_score: number | null;
+  confidence_label: string;
+  evidence_quality: string | null;
+  evidence_quality_score: number | null;
+  evidence_quality_reasons: string[];
+  execution_eligibility: string | null;
+  strategy_id: string;
+  strategy_version: string;
+  strategy_primary_horizon: string;
+  strategy_entry_assumption: string | null;
+  strategy_exit_assumption: string | null;
+  signal_age_minutes: number | null;
+  confidence_bucket: string | null;
+  raw_score_bucket: string | null;
+  score_band: string | null;
+  horizon: string;
+  gate_evaluation_mode: string | null;
+  evidence_basis: string | null;
+  trust_window_start: string | null;
+  trust_window_end: string | null;
+  latest_scan_age_minutes: number | null;
+  latest_scan_fresh: boolean | null;
+  stored_gate_passed: boolean | null;
+  stored_gate_reason: string | null;
+  gate_consistent_with_signal: boolean | null;
+  allowed: boolean;
+  reason: string;
+  notional_estimate: number;
+  qty: number;
+  signal_evaluated_count: number | null;
+  signal_win_rate: number | null;
+  signal_avg_return: number | null;
+  score_band_evaluated_count: number | null;
+  score_band_win_rate: number | null;
+  score_band_avg_return: number | null;
+  gate_checks: GateCheck[];
+  portfolio_checks: GateCheck[];
+  portfolio_summary: string | null;
+}
+
+export interface OrderPreviewRequest {
+  ticker: string;
+  side: OrderSide;
+  qty: number;
+  order_type?: OrderType;
+  limit_price?: number | null;
+  preview_audit_id?: number | null;
+  idempotency_key?: string | null;
+  mode?: 'dry_run' | null;
+  entry_price?: number | null;
+  stop_price?: number | null;
+  target_price?: number | null;
+  recommended_action_snapshot?: string | null;
+}
+
+export interface OrderPreviewResponse {
+  broker: BrokerName;
+  ticker: string;
+  side: OrderSide;
+  qty: number;
+  order_type: OrderType;
+  notional_estimate: number;
+  latest_price: number;
+  time_in_force: string;
+  warnings: string[];
+  trade_gate: TradeEligibility | null;
+  execution_audit_id: number | null;
+  entry_price: number | null;
+  stop_price: number | null;
+  target_price: number | null;
+  position_size: number | null;
+  estimated_pnl_usd: number | null;
+  gate_result: string | null;
+  freshness: string | null;
+  reject_reasons: string[];
+}
+
+export interface OrderPlaceRequest extends OrderPreviewRequest {
+  dry_run?: boolean;
+}
+
+export interface OrderPlaceResponse {
+  ok: boolean;
+  broker: BrokerName;
+  submitted: boolean;
+  dry_run: boolean;
+  message: string;
+  idempotency_key: string | null;
+  order_id: string | null;
+  status: string | null;
+  raw: Record<string, unknown> | null;
+  trade_gate: TradeEligibility | null;
+  execution_audit_id: number | null;
+  ledger_id: number | null;
+  fill_price: number | null;
+  filled_qty: number | null;
+  slippage_assumption_bps: number | null;
+  recommended_action_snapshot: string | null;
+}
+
 export interface AutomationIntentSummary {
   id: number;
   created_at: string;
@@ -461,6 +579,10 @@ export interface PaperLedgerSummary {
   short_positions: number;
   last_opened_at: string | null;
   last_closed_at: string | null;
+  total_count: number;
+  win_rate_pct: number | null;
+  gross_pnl_usd: number;
+  max_drawdown_usd: number;
 }
 
 export interface ReconciliationIssue {

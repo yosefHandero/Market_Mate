@@ -247,6 +247,49 @@ class MainRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "not_ready")
 
+    def test_orders_place_rejects_non_dry_run_at_boundary(self) -> None:
+        original_admin = main_module.settings.admin_api_token
+        main_module.settings.admin_api_token = "preview-admin"
+        self.addCleanup(setattr, main_module.settings, "admin_api_token", original_admin)
+
+        with patch.object(main_module.execution_service, "place", AsyncMock()) as place_mock:
+            response = self.client.post(
+                "/orders/place",
+                headers={"Authorization": "Bearer preview-admin"},
+                json={
+                    "ticker": "AAPL",
+                    "side": "buy",
+                    "qty": 1,
+                    "order_type": "market",
+                    "dry_run": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "dry_run_required")
+        place_mock.assert_not_awaited()
+
+    def test_read_route_accepts_admin_token_when_read_token_is_configured(self) -> None:
+        original_public = main_module.settings.public_read_access_enabled
+        original_read_token = main_module.settings.read_api_token
+        original_admin_token = main_module.settings.admin_api_token
+        main_module.settings.public_read_access_enabled = False
+        main_module.settings.read_api_token = "read-secret"
+        main_module.settings.admin_api_token = "admin-secret"
+        self.addCleanup(setattr, main_module.settings, "public_read_access_enabled", original_public)
+        self.addCleanup(setattr, main_module.settings, "read_api_token", original_read_token)
+        self.addCleanup(setattr, main_module.settings, "admin_api_token", original_admin_token)
+
+        with patch.object(main_module.scanner_service, "latest", Mock(return_value=None)) as latest_mock:
+            response = self.client.get(
+                "/scan/latest",
+                headers={"Authorization": "Bearer admin-secret"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json())
+        latest_mock.assert_called_once()
+
     def test_trade_eligibility_returns_502_when_price_lookup_fails(self) -> None:
         original_admin = main_module.settings.admin_api_token
         main_module.settings.admin_api_token = "risk-admin"

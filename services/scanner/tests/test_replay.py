@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import AsyncMock
 
+from app.core.strategy_contract import STRATEGY_VERSION
 from app.schemas import ReplayRequest
 from app.services.replay import ReplayService
 
@@ -48,7 +49,7 @@ class ReplayServiceTests(unittest.TestCase):
         )
 
         self.assertGreater(response.summary.total_snapshots, 0)
-        self.assertEqual(response.strategy_version, "v4.0-layered")
+        self.assertEqual(response.strategy_version, STRATEGY_VERSION)
         self.assertEqual(response.strategy_variant, service.settings.scanner_strategy_variant)
         self.assertTrue(
             all(

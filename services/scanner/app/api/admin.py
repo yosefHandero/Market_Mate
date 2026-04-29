@@ -15,6 +15,7 @@ from app.dependencies import (
     get_scheduler_service,
     get_scanner_service,
 )
+from app.errors import AppError
 from app.schemas import (
     JournalEntryCreateRequest,
     JournalEntryResponse,
@@ -154,6 +155,13 @@ async def place_order(
     x_idempotency_key: str | None = Header(default=None),
     execution_service: ExecutionService = Depends(get_execution_service),
 ) -> OrderPlaceResponse:
+    if request.mode != "dry_run" and not request.dry_run:
+        raise AppError(
+            message="Only dry-run paper orders are accepted by this endpoint.",
+            status_code=400,
+            code="dry_run_required",
+        )
+    request.dry_run = True
     if request.idempotency_key is None and x_idempotency_key:
         request.idempotency_key = x_idempotency_key
     return await execution_service.place(request)

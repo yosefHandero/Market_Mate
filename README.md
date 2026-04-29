@@ -44,12 +44,16 @@ cd "apps/web"
 npm run dev
 ```
 
-Start from `apps/web/.env.example` when wiring local dashboard settings.
+Start from `apps/web/.env.local.example` when wiring local dashboard settings.
 
 The dashboard expects the scanner API at `NEXT_PUBLIC_SCANNER_API_BASE` and uses:
 
 - `SCANNER_READ_API_TOKEN` for protected server-side reads
-- `SCANNER_ADMIN_API_TOKEN` for journal proxy writes
+- `SCANNER_ADMIN_API_TOKEN` for journal proxy writes and optional reconciliation checks
+
+Do not put scanner tokens in `NEXT_PUBLIC_*` variables. Only `NEXT_PUBLIC_SCANNER_API_BASE`
+is exposed to the browser; `SCANNER_READ_API_TOKEN` and `SCANNER_ADMIN_API_TOKEN` are
+server-side dashboard settings.
 
 ## Scanner Backend
 
@@ -61,6 +65,33 @@ python -m uvicorn app.main:app --reload --port 8005
 ```
 
 Start from `services/scanner/.env.example` when wiring local scanner settings.
+
+## Environment And Auth Setup
+
+Use the service template for the backend and the web template for the dashboard:
+
+```bash
+cp services/scanner/.env.example services/scanner/.env
+cp apps/web/.env.local.example apps/web/.env.local
+```
+
+Do not copy backend variable names into the dashboard unchanged. The required mapping is:
+
+- `services/scanner`: `READ_API_TOKEN` <-> `apps/web`: `SCANNER_READ_API_TOKEN`
+- `services/scanner`: `ADMIN_API_TOKEN` <-> `apps/web`: `SCANNER_ADMIN_API_TOKEN`
+
+`PUBLIC_READ_ACCESS_ENABLED` controls scanner read endpoints only:
+
+- `PUBLIC_READ_ACCESS_ENABLED=true`: scanner read endpoints accept unauthenticated reads. This
+  is convenient for local development, but not recommended for serious deployments.
+- `PUBLIC_READ_ACCESS_ENABLED=false`: scanner read endpoints require a token. Set
+  `READ_API_TOKEN` in `services/scanner/.env` and set the same value as
+  `SCANNER_READ_API_TOKEN` in `apps/web/.env.local`.
+
+Admin routes always require `ADMIN_API_TOKEN` on the scanner. Set the same value as
+`SCANNER_ADMIN_API_TOKEN` in `apps/web/.env.local` for journal writes. Validation
+reconciliation uses the admin token when present; without it, only that reconciliation
+section runs in degraded mode.
 
 The default watchlists cover ~49 US equities and ~20 crypto pairs. `WATCHLIST` and `CRYPTO_WATCHLIST` are the env vars; SPY and QQQ remain in the stock list for market-status benchmarking but are excluded from scan rows. With defaults, expect `watchlist_size` ~69 and `scan_count` ~67 (minus benchmarks and any symbols Alpaca omits). If scan duration or provider errors grow, trim the lists or lower `SCAN_CONCURRENCY_LIMIT`. See [`services/scanner/docs/operations.md`](services/scanner/docs/operations.md) for detail.
 
@@ -130,7 +161,7 @@ Treat the root Next.js app as an isolated secondary UI unless a future product d
 
 **Do not run `next dev` from the repository root** if you want the scanner product UI; root `package.json` scripts delegate to `apps/web`, but a manual Next run at the repo root serves legacy pages.
 
-Full environment templates: [`services/scanner/.env.example`](services/scanner/.env.example) and [`apps/web/.env.local.example`](apps/web/.env.local.example). By default the scanner API does **not** expose read routes publicly (`PUBLIC_READ_ACCESS_ENABLED=false`); enable public read or set `READ_API_TOKEN` and `SCANNER_READ_API_TOKEN` for the dashboard.
+Full environment templates: [`services/scanner/.env.example`](services/scanner/.env.example) and [`apps/web/.env.local.example`](apps/web/.env.local.example). `apps/web/.env.example` mirrors the dashboard keys for hosts that use that filename, but local Next.js development should use `apps/web/.env.local`.
 
 ### Example admin API calls
 

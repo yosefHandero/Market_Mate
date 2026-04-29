@@ -274,6 +274,94 @@ class AutomationRepository:
             )
             session.commit()
 
+    def record_paper_position_from_audit(
+        self,
+        *,
+        audit_id: int,
+        simulated_fill_price: float,
+        filled_at: datetime | None = None,
+    ) -> int | None:
+        if simulated_fill_price <= 0:
+            return None
+        filled_time = filled_at or self._utc_now()
+        with SessionLocal() as session:
+            audit = session.get(ExecutionAuditORM, audit_id)
+            if audit is None or not audit.dry_run:
+                return None
+
+            intent_key = (audit.idempotency_key or "").strip() or f"manual-audit-{audit.id}"
+
+            existing = session.execute(
+                select(PaperPositionORM)
+                .where(PaperPositionORM.intent_key == intent_key)
+                .limit(1)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing.id
+
+            side = audit.side
+            qty = float(audit.qty or 0.0)
+            if qty <= 0:
+                return None
+
+            if side == "sell":
+                open_position = session.execute(
+                    select(PaperPositionORM)
+                    .where(
+                        PaperPositionORM.ticker == audit.ticker,
+                        PaperPositionORM.status == "open",
+                        PaperPositionORM.side == "buy",
+                    )
+                    .order_by(desc(PaperPositionORM.opened_at), desc(PaperPositionORM.id))
+                    .limit(1)
+                ).scalar_one_or_none()
+                if open_position is not None:
+                    quantity = min(float(open_position.quantity or 0.0), qty)
+                    proceeds = round(quantity * simulated_fill_price, 2)
+                    open_basis = float(open_position.cost_basis_usd or open_position.notional_usd or 0.0)
+                    basis_per_unit = open_basis / max(float(open_position.quantity or 0.0), 1e-9)
+                    realized_pnl = round(proceeds - (basis_per_unit * quantity), 2)
+                    open_position.close_price = simulated_fill_price
+                    open_position.realized_pnl = realized_pnl
+                    open_position.closed_at = filled_time
+                    open_position.status = "closed"
+                    open_position.updated_at = filled_time
+
+            strategy_version = getattr(audit, "trade_gate_horizon", None)
+            if audit.preview_payload:
+                try:
+                    preview_payload = json.loads(audit.preview_payload)
+                except json.JSONDecodeError:
+                    preview_payload = {}
+                trade_gate = preview_payload.get("trade_gate") if isinstance(preview_payload, dict) else None
+                if isinstance(trade_gate, dict):
+                    strategy_version = trade_gate.get("strategy_version") or strategy_version
+
+            position = PaperPositionORM(
+                created_at=filled_time,
+                updated_at=filled_time,
+                intent_key=intent_key,
+                execution_audit_id=audit.id,
+                ticker=audit.ticker,
+                asset_type=audit.asset_type,
+                side=side,
+                quantity=qty,
+                simulated_fill_price=simulated_fill_price,
+                notional_usd=round(qty * simulated_fill_price, 2),
+                cost_basis_usd=round(qty * simulated_fill_price, 2),
+                close_price=simulated_fill_price if side == "sell" else None,
+                realized_pnl=0.0 if side == "sell" else None,
+                status="closed" if side == "sell" else "open",
+                opened_at=filled_time,
+                closed_at=filled_time if side == "sell" else None,
+                strategy_version=strategy_version,
+                confidence=audit.confidence,
+            )
+            session.add(position)
+            session.commit()
+            session.refresh(position)
+            return position.id
+
     def list_recoverable_intents(self, *, now: datetime, limit: int = 25) -> list[AutomationIntentORM]:
         recoverable_statuses = [
             "failed_retryable",

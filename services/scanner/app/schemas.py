@@ -238,6 +238,11 @@ class OrderPreviewRequest(BaseModel):
     limit_price: float | None = Field(default=None, gt=0)
     preview_audit_id: int | None = None
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+    mode: Literal["dry_run"] | None = None
+    entry_price: float | None = Field(default=None, gt=0)
+    stop_price: float | None = Field(default=None, gt=0)
+    target_price: float | None = Field(default=None, gt=0)
+    recommended_action_snapshot: str | None = None
 
     @field_validator("ticker")
     @classmethod
@@ -263,6 +268,14 @@ class OrderPreviewResponse(BaseModel):
     warnings: list[str] = []
     trade_gate: TradeEligibility | None = None
     execution_audit_id: int | None = None
+    entry_price: float | None = None
+    stop_price: float | None = None
+    target_price: float | None = None
+    position_size: float | None = None
+    estimated_pnl_usd: float | None = None
+    gate_result: str | None = None
+    freshness: str | None = None
+    reject_reasons: list[str] = []
 
 
 class OrderPlaceRequest(OrderPreviewRequest):
@@ -281,6 +294,11 @@ class OrderPlaceResponse(BaseModel):
     raw: dict | None = None
     trade_gate: TradeEligibility | None = None
     execution_audit_id: int | None = None
+    ledger_id: int | None = None
+    fill_price: float | None = None
+    filled_qty: float | None = None
+    slippage_assumption_bps: float | None = None
+    recommended_action_snapshot: str | None = None
 
 
 class ExecutionAuditSummary(BaseModel):
@@ -800,6 +818,10 @@ class PaperLedgerSummaryResponse(BaseModel):
     short_positions: int
     last_opened_at: datetime | None = None
     last_closed_at: datetime | None = None
+    total_count: int = 0
+    win_rate_pct: float | None = None
+    gross_pnl_usd: float = 0.0
+    max_drawdown_usd: float = 0.0
 
 
 class PromotionGateResult(BaseModel):

@@ -18,9 +18,16 @@ const sampleRow = (over: Partial<DecisionRow> = {}): DecisionRow => ({
   confidence_label: 'moderate_evidence',
   evidence_quality: 'high',
   evidence_quality_score: 0.85,
+  evidence_quality_reasons: [],
+  data_grade: 'decision',
   execution_eligibility: 'eligible',
   provider_status: 'ok',
   gate_passed: true,
+  bar_age_minutes: 5,
+  signal_age_minutes: 5,
+  freshness_flags: null,
+  recommended_action: 'review',
+  score_contributions: {},
   strategy_version: 'v3',
   short_metric_summary: '—',
   last_updated: '2026-03-20T12:00:00.000Z',
@@ -56,6 +63,15 @@ describe('DecisionPanel compact (homepage)', () => {
     expect(screen.getByText('Price $100.00')).toBeInTheDocument();
     expect(screen.getByText('$50.00 · 0.5 units')).toBeInTheDocument();
     expect(screen.getByText('Simulation details')).toBeInTheDocument();
+  });
+
+  it('does not render inline paper-trade controls', () => {
+    render(React.createElement(DecisionPanel, { variant: 'compact', rows: [sampleRow()] }));
+
+    expect(screen.queryByText('Paper trade')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Preview' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Place dry run' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/paper quantity/i)).not.toBeInTheDocument();
   });
 });
 

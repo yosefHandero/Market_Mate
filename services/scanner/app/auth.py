@@ -36,12 +36,14 @@ def require_read_access(
 ) -> None:
     if not settings.read_auth_required:
         return
-    token = settings.read_api_token or settings.admin_api_token
-    _require_token(
-        provided_values=[authorization, x_api_key],
-        expected_token=token,
-        error_message="Read access requires a valid API token.",
-    )
+    provided = next((token for token in (_extract_token(value) for value in [authorization, x_api_key]) if token), "")
+    expected_tokens = [token for token in [settings.read_api_token, settings.admin_api_token] if token]
+    if not provided or not any(secrets.compare_digest(provided, token) for token in expected_tokens):
+        raise AppError(
+            message="Read access requires a valid API token.",
+            status_code=401,
+            code="unauthorized",
+        )
 
 
 def require_admin_access(

@@ -1,6 +1,6 @@
 'use client';
 
-import { JournalEntry } from '@/lib/types';
+import type { JournalEntry } from '@/lib/types';
 
 type JournalEntryActionsProps = {
   entry: JournalEntry;

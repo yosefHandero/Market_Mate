@@ -1,22 +1,39 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { readErrorMessage } from '@/lib/scanner-api';
 
 interface FeedbackState {
   message: string;
   tone: 'positive' | 'negative' | 'muted';
 }
 
-export function OperatorActions({ schedulerRunning: _schedulerRunning }: { schedulerRunning: boolean }) {
+export function OperatorActions({ schedulerRunning }: { schedulerRunning: boolean }) {
   const [scanBusy, setScanBusy] = useState(false);
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
   const [unavailable, setUnavailable] = useState(false);
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const showFeedback = useCallback((message: string, tone: FeedbackState['tone']) => {
+    if (feedbackTimerRef.current) {
+      clearTimeout(feedbackTimerRef.current);
+    }
+
     setFeedback({ message, tone });
-    const id = setTimeout(() => setFeedback(null), 3000);
-    return () => clearTimeout(id);
+    feedbackTimerRef.current = setTimeout(() => {
+      setFeedback(null);
+      feedbackTimerRef.current = null;
+    }, 3000);
   }, []);
+
+  useEffect(
+    () => () => {
+      if (feedbackTimerRef.current) {
+        clearTimeout(feedbackTimerRef.current);
+      }
+    },
+    [],
+  );
 
   const handleScan = useCallback(async () => {
     setScanBusy(true);
@@ -28,8 +45,7 @@ export function OperatorActions({ schedulerRunning: _schedulerRunning }: { sched
         return;
       }
       if (!res.ok) {
-        const data = (await res.json().catch(() => ({}))) as { detail?: string };
-        showFeedback(data.detail ?? `Scan failed (${res.status})`, 'negative');
+        showFeedback(await readErrorMessage(res), 'negative');
         return;
       }
       const run = (await res.json()) as { scan_count?: number };
@@ -42,11 +58,20 @@ export function OperatorActions({ schedulerRunning: _schedulerRunning }: { sched
   }, [showFeedback]);
 
   if (unavailable) {
-    return <p className="muted small" style={{ marginBottom: 12 }}>Admin controls unavailable.</p>;
+    return (
+      <p className="muted small" style={{ marginBottom: 12 }}>
+        Admin controls unavailable.
+      </p>
+    );
   }
 
   return (
-    <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+    <div
+      style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}
+    >
+      <span className={`small ${schedulerRunning ? 'positive' : 'muted'}`}>
+        {schedulerRunning ? 'Scheduler online' : 'Scheduler idle'}
+      </span>
       <button
         className="button"
         disabled={scanBusy}
@@ -55,9 +80,7 @@ export function OperatorActions({ schedulerRunning: _schedulerRunning }: { sched
       >
         {scanBusy ? 'Running...' : 'Run scan now'}
       </button>
-      {feedback ? (
-        <span className={`small ${feedback.tone}`}>{feedback.message}</span>
-      ) : null}
+      {feedback ? <span className={`small ${feedback.tone}`}>{feedback.message}</span> : null}
     </div>
   );
 }

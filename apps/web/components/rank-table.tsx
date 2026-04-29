@@ -1,96 +1,219 @@
-import { RankMoreDetailsCell } from '@/components/rank-more-details-cell';
+'use client';
+
 import type { DecisionSignal, ScanResult } from '@/lib/types';
 
 function signalBadge(signal: DecisionSignal) {
-  if (signal === 'BUY') return <span className="badge green">BUY</span>;
-  if (signal === 'SELL') return <span className="badge red">SELL</span>;
-  return <span className="badge">HOLD</span>;
+  if (signal === 'BUY') return <span className="badge green">Buy</span>;
+  if (signal === 'SELL') return <span className="badge red">Sell</span>;
+  return <span className="badge">Hold</span>;
 }
 
 type RankTableProps = {
   results: ScanResult[];
-  /** `full` (default): core columns + (more details). `compact`: Rank through Day % only. */
-  variant?: 'full' | 'compact';
-  /** If set, only show this many rows per asset type section. */
   topN?: number;
+  activeTicker?: string;
+  onSelectTicker?: (ticker: string) => void;
 };
 
-function RankSection({
-  title,
-  results,
-  showExtended,
-}: {
-  title: string;
-  results: ScanResult[];
-  showExtended: boolean;
-}) {
-  if (!results.length) return null;
+const CRYPTO_EMPTY_MESSAGE = 'Crypto opportunities will appear here when crypto data is connected.';
 
-  return (
-    <div style={{ marginBottom: 20 }}>
-      <h3 style={{ marginBottom: 8, fontSize: 14, textTransform: 'uppercase', letterSpacing: '0.08em' }} className="muted">
-        {title}
-      </h3>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Rank</th>
-              <th>Ticker</th>
-              <th>Signal</th>
-              <th>Raw score</th>
-              <th>Calibrated score</th>
-              <th>Price</th>
-              <th>Day %</th>
-              {showExtended ? <th>(more details)</th> : null}
-            </tr>
-          </thead>
-          <tbody>
-            {results.map((row, index) => (
-              <tr key={`${row.ticker}-${row.created_at}`}>
-                <td>{index + 1}</td>
-                <td>
-                  <strong>{row.ticker}</strong>
-                </td>
-                <td>{signalBadge(row.decision_signal)}</td>
-                <td className="score">{row.raw_score.toFixed(1)}</td>
-                <td>{row.calibrated_confidence.toFixed(1)}</td>
-                <td>${row.price.toFixed(2)}</td>
-                <td
-                  className={
-                    row.price_change_pct > 0
-                      ? 'positive'
-                      : row.price_change_pct < 0
-                        ? 'negative'
-                        : 'neutral'
-                  }
-                >
-                  {row.price_change_pct.toFixed(2)}%
-                </td>
-                {showExtended ? <RankMoreDetailsCell row={row} /> : null}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
+function formatCurrency(value: number) {
+  return value.toLocaleString(undefined, {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 }
 
-export function RankTable({ results, variant = 'full', topN }: RankTableProps) {
-  const showExtended = variant !== 'compact';
-  let stocks = results.filter((r) => r.asset_type === 'stock');
-  let crypto = results.filter((r) => r.asset_type === 'crypto');
+function formatPercent(value: number) {
+  return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+}
 
-  if (topN != null && topN > 0) {
-    stocks = stocks.slice(0, topN);
-    crypto = crypto.slice(0, topN);
+function formatReason(reason: string) {
+  const trimmed = reason.trim();
+  if (!trimmed) {
+    return 'No summary is available yet.';
+  }
+
+  if (trimmed.length <= 140) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, 137).trimEnd()}...`;
+}
+
+function OpportunityItem({
+  row,
+  rank,
+  activeTicker,
+  onSelectTicker,
+}: {
+  row: ScanResult;
+  rank: number;
+  activeTicker?: string;
+  onSelectTicker?: (ticker: string) => void;
+}) {
+  const isActive = row.ticker === activeTicker;
+  const className = [
+    'opportunity-item',
+    onSelectTicker ? 'is-button' : '',
+    isActive ? 'is-active' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const content = (
+    <>
+      <div className="opportunity-item-top">
+        <div className="opportunity-item-symbol">
+          <span className="opportunity-rank">#{rank}</span>
+          <div>
+            <strong>{row.ticker}</strong>
+            <div className="muted small">
+              {row.strategy_primary_horizon} setup
+              {row.evidence_quality ? ` | ${row.evidence_quality} evidence` : ''}
+            </div>
+          </div>
+        </div>
+        {signalBadge(row.decision_signal)}
+      </div>
+
+      <div className="opportunity-item-metrics">
+        <div className="opportunity-metric">
+          <span className="muted small">Trigger Price</span>
+          <strong>{formatCurrency(row.price)}</strong>
+        </div>
+        <div className="opportunity-metric">
+          <span className="muted small">Confidence</span>
+          <strong>{row.calibrated_confidence.toFixed(1)}</strong>
+        </div>
+        <div className="opportunity-metric">
+          <span className="muted small">Day Move</span>
+          <strong
+            className={
+              row.price_change_pct > 0
+                ? 'positive'
+                : row.price_change_pct < 0
+                  ? 'negative'
+                  : 'neutral'
+            }
+          >
+            {formatPercent(row.price_change_pct)}
+          </strong>
+        </div>
+      </div>
+
+      <p className="opportunity-reason">{formatReason(row.explanation)}</p>
+    </>
+  );
+
+  if (onSelectTicker) {
+    return (
+      <button type="button" className={className} onClick={() => onSelectTicker(row.ticker)}>
+        {content}
+      </button>
+    );
   }
 
   return (
-    <div>
-      <RankSection title="Stocks" results={stocks} showExtended={showExtended} />
-      <RankSection title="Crypto" results={crypto} showExtended={showExtended} />
+    <article className={className}>{content}</article>
+  );
+}
+
+function RankSection({
+  title,
+  description,
+  results,
+  targetCount,
+  emptyMessage,
+  activeTicker,
+  onSelectTicker,
+}: {
+  title: string;
+  description: string;
+  results: ScanResult[];
+  targetCount: number | null;
+  emptyMessage: string;
+  activeTicker?: string;
+  onSelectTicker?: (ticker: string) => void;
+}) {
+  const needsMoreMessage =
+    targetCount != null && results.length > 0 && results.length < targetCount;
+
+  return (
+    <section className="opportunity-group">
+      <div className="opportunity-group-header">
+        <div className="opportunity-group-copy">
+          <h3 style={{ margin: 0 }}>{title}</h3>
+          <p className="muted small" style={{ margin: 0 }}>
+            {description}
+          </p>
+        </div>
+        <span className="badge">
+          {results.length}
+          {targetCount != null ? `/${targetCount}` : ''}
+        </span>
+      </div>
+
+      {results.length ? (
+        <div className="opportunity-items">
+          {results.map((row, index) => (
+            <OpportunityItem
+              key={`${row.ticker}-${row.created_at}`}
+              row={row}
+              rank={index + 1}
+              activeTicker={activeTicker}
+              onSelectTicker={onSelectTicker}
+            />
+          ))}
+        </div>
+      ) : (
+        <p className="muted opportunity-empty">{emptyMessage}</p>
+      )}
+
+      {needsMoreMessage ? (
+        <p className="muted small opportunity-footnote" style={{ margin: 0 }}>
+          Showing {results.length} of {targetCount}. More opportunities will appear here as new
+          scan results qualify.
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+export function RankTable({
+  results,
+  topN,
+  activeTicker,
+  onSelectTicker,
+}: RankTableProps) {
+  const limitedCount = topN != null && topN > 0 ? topN : null;
+  const stockResults = results.filter((result) => result.asset_type === 'stock');
+  const cryptoResults = results.filter((result) => result.asset_type === 'crypto');
+  const stocks = limitedCount != null ? stockResults.slice(0, limitedCount) : stockResults;
+  const crypto = limitedCount != null ? cryptoResults.slice(0, limitedCount) : cryptoResults;
+
+  return (
+    <div className="opportunity-groups">
+      <RankSection
+        title={limitedCount != null ? `Top ${limitedCount} Stocks` : 'Stocks'}
+        description="Highest-ranked stock setups from the latest scan."
+        results={stocks}
+        targetCount={limitedCount}
+        emptyMessage="Stock opportunities will appear here after the next completed scan."
+        activeTicker={activeTicker}
+        onSelectTicker={onSelectTicker}
+      />
+      <RankSection
+        title={limitedCount != null ? `Top ${limitedCount} Crypto` : 'Crypto'}
+        description="Highest-ranked crypto setups from the latest scan."
+        results={crypto}
+        targetCount={limitedCount}
+        emptyMessage={CRYPTO_EMPTY_MESSAGE}
+        activeTicker={activeTicker}
+        onSelectTicker={onSelectTicker}
+      />
     </div>
   );
 }

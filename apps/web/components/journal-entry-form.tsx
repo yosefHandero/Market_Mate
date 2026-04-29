@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { createJournalEntry } from '@/lib/api';
-import { JournalDecision } from '@/lib/types';
+import type { JournalDecision } from '@/lib/types';
 
 const decisions: JournalDecision[] = ['watching', 'took', 'skipped'];
 
@@ -165,7 +165,8 @@ export function JournalEntryForm({
           placeholder="Latest scan run id"
         />
         <div className="small muted" style={{ marginTop: 6 }}>
-          Override this if the journal entry belongs to an older scan. Traceability is better when the run ID matches the original signal.
+          Override this if the journal entry belongs to an older scan. Traceability is better when
+          the run ID matches the original signal.
         </div>
       </div>
 

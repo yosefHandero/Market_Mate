@@ -1,5 +1,7 @@
+'use client';
+
 import type { DecisionSimulationResult, SimulatedDecisionRow } from '@/lib/decision-simulation';
-import { DecisionRow } from '@/lib/types';
+import type { DecisionRow } from '@/lib/types';
 
 function formatConfidence(value: number) {
   return Number.isFinite(value) ? value.toFixed(1) : '—';
@@ -7,6 +9,10 @@ function formatConfidence(value: number) {
 
 function formatEvidenceScore(value: number | null) {
   return value == null || Number.isNaN(value) ? '—' : value.toFixed(2);
+}
+
+function formatEvidenceLabel(row: DecisionRow) {
+  return `${row.evidence_quality ?? '—'} (${formatEvidenceScore(row.evidence_quality_score)})`;
 }
 
 function formatCurrency(value: number | null) {
@@ -137,17 +143,17 @@ export function DecisionPanel({
     <div style={{ display: 'grid', gap: 20 }}>
       <DecisionSection
         title={`Stocks (${stockRows.length})`}
-        items={stockRows}
-        emptyMessage="No stock decisions available yet."
-        showSimulation={Boolean(simulation)}
-      />
-      <DecisionSection
-        title={`Crypto (${cryptoRows.length})`}
-        items={cryptoRows}
-        emptyMessage="No crypto decisions available yet."
-        showSimulation={Boolean(simulation)}
-      />
-    </div>
+      items={stockRows}
+      emptyMessage="No stock decisions available yet."
+      showSimulation={Boolean(simulation)}
+    />
+    <DecisionSection
+      title={`Crypto (${cryptoRows.length})`}
+      items={cryptoRows}
+      emptyMessage="No crypto decisions available yet."
+      showSimulation={Boolean(simulation)}
+    />
+  </div>
   );
 }
 
@@ -188,7 +194,9 @@ function DecisionSectionCompact({
                   </td>
                   <td>{row.signal}</td>
                   <td>{operationalSupportLabel(row)}</td>
-                  <td><ActionBadge action={row.recommended_action} /></td>
+                  <td>
+                    <ActionBadge action={row.recommended_action} />
+                  </td>
                   <td className="muted small">
                     Updated {new Date(row.last_updated).toLocaleString()}
                     <br />
@@ -197,7 +205,8 @@ function DecisionSectionCompact({
                       <>
                         <br />
                         <span className="negative">
-                          {degradedFreshnessCount(row.freshness_flags)} degraded input{degradedFreshnessCount(row.freshness_flags) > 1 ? 's' : ''}
+                          {degradedFreshnessCount(row.freshness_flags)} degraded input
+                          {degradedFreshnessCount(row.freshness_flags) > 1 ? 's' : ''}
                         </span>
                       </>
                     ) : null}
@@ -264,10 +273,10 @@ function DecisionSection({
                       <span className="muted small"> ({row.confidence_label})</span>
                     ) : null}
                   </td>
+                  <td>{formatEvidenceLabel(row)}</td>
                   <td>
-                    {row.evidence_quality ?? '—'} ({formatEvidenceScore(row.evidence_quality_score)})
+                    <ActionBadge action={row.recommended_action} />
                   </td>
-                  <td><ActionBadge action={row.recommended_action} /></td>
                   <td>
                     <details className="inline-details">
                       <summary>View details</summary>
@@ -277,7 +286,8 @@ function DecisionSection({
                           {row.raw_score != null ? formatConfidence(row.raw_score) : '—'}
                         </div>
                         <div>
-                          <span className="muted">Calibration source:</span> {row.calibration_source}
+                          <span className="muted">Calibration source:</span>{' '}
+                          {row.calibration_source}
                         </div>
                         <div>
                           <span className="muted">Data grade:</span> {row.data_grade ?? '—'}
@@ -291,10 +301,12 @@ function DecisionSection({
                           {row.recommended_action ?? '—'}
                         </div>
                         <div>
-                          <span className="muted">Provider status:</span> {row.provider_status ?? '—'}
+                          <span className="muted">Provider status:</span>{' '}
+                          {row.provider_status ?? '—'}
                         </div>
                         <div>
-                          <span className="muted">Bar age:</span> {formatMinutes(row.bar_age_minutes)}
+                          <span className="muted">Bar age:</span>{' '}
+                          {formatMinutes(row.bar_age_minutes)}
                         </div>
                         <div>
                           <span className="muted">Gate passed (scan):</span>{' '}
@@ -310,7 +322,8 @@ function DecisionSection({
                             </ul>
                           </div>
                         ) : null}
-                        {row.freshness_flags && Object.entries(row.freshness_flags).some(([, v]) => v !== 'ok') ? (
+                        {row.freshness_flags &&
+                        Object.entries(row.freshness_flags).some(([, v]) => v !== 'ok') ? (
                           <div>
                             <span className="muted">Freshness warnings:</span>{' '}
                             <span className="negative">
@@ -371,7 +384,9 @@ function SimulationCell({ simulationRow }: { simulationRow: SimulatedDecisionRow
         <span className={`badge ${simulationBadgeTone(simulationRow)}`}>
           {titleCase(simulationRow.simulatedAction)}
         </span>
-        <span className="muted small">{titleCase(simulationRow.eligibility).replace('_', ' ')}</span>
+        <span className="muted small">
+          {titleCase(simulationRow.eligibility).replace('_', ' ')}
+        </span>
         <span className="muted small">Price {formatCurrency(simulationRow.price)}</span>
       </div>
       <div className="small">{simulationSummaryText(simulationRow)}</div>

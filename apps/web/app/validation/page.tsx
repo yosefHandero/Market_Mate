@@ -7,10 +7,19 @@ import {
   getReconciliationReport,
   getThresholdSweep,
   getValidationSummary,
+  RECONCILIATION_UNAVAILABLE_MESSAGE,
 } from '@/lib/api';
 
 export default async function ValidationPage() {
-  const [summaryResult, sweepResult, alignmentResult, readyResult, auditsResult, automationResult, reconciliationResult] = await Promise.all([
+  const [
+    summaryResult,
+    sweepResult,
+    alignmentResult,
+    readyResult,
+    auditsResult,
+    automationResult,
+    reconciliationResult,
+  ] = await Promise.all([
     getValidationSummary(),
     getThresholdSweep(),
     getExecutionAlignment(),
@@ -27,8 +36,10 @@ export default async function ValidationPage() {
     readyResult.error,
     auditsResult.error,
     automationResult.error,
-    reconciliationResult.error,
   ].filter(Boolean) as string[];
+  const reconciliationWarning = reconciliationResult.error
+    ? RECONCILIATION_UNAVAILABLE_MESSAGE
+    : null;
 
   return (
     <main style={{ display: 'grid', gap: 20 }}>
@@ -45,6 +56,7 @@ export default async function ValidationPage() {
           audits={auditsResult.data}
           automation={automationResult.data}
           reconciliation={reconciliationResult.data}
+          reconciliationWarning={reconciliationWarning}
           errors={errors}
         />
       </section>

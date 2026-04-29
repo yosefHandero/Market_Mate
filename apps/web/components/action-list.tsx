@@ -4,15 +4,25 @@ import { useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { JournalEntryForm } from '@/components/journal-entry-form';
 import { updateJournalEntry } from '@/lib/api';
+import { readErrorMessage } from '@/lib/scanner-api';
 import type { ActionItem } from '@/lib/types';
+
+type ActionFeedback = {
+  message: string;
+  tone: 'positive' | 'negative';
+};
 
 function PaperLoopDisabledCard({ item }: { item: ActionItem }) {
   return (
     <div className="history-item" style={{ display: 'grid', gap: 8 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+      <div
+        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}
+      >
         <div>
           <strong>{item.title}</strong>
-          <div className="muted small" style={{ marginTop: 4 }}>{item.subtitle}</div>
+          <div className="muted small" style={{ marginTop: 4 }}>
+            {item.subtitle}
+          </div>
         </div>
         <span className="badge amber">Disabled</span>
       </div>
@@ -27,10 +37,14 @@ function PaperLoopDisabledCard({ item }: { item: ActionItem }) {
 function KillSwitchCard({ item }: { item: ActionItem }) {
   return (
     <div className="history-item" style={{ display: 'grid', gap: 8 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+      <div
+        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}
+      >
         <div>
           <strong>{item.title}</strong>
-          <div className="muted small" style={{ marginTop: 4 }}>{item.subtitle}</div>
+          <div className="muted small" style={{ marginTop: 4 }}>
+            {item.subtitle}
+          </div>
         </div>
         <span className="badge red">Active</span>
       </div>
@@ -45,10 +59,14 @@ function KillSwitchCard({ item }: { item: ActionItem }) {
 function BreakerOpenCard({ item }: { item: ActionItem }) {
   return (
     <div className="history-item" style={{ display: 'grid', gap: 8 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+      <div
+        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}
+      >
         <div>
           <strong>{item.title}</strong>
-          <div className="muted small" style={{ marginTop: 4 }}>{item.subtitle}</div>
+          <div className="muted small" style={{ marginTop: 4 }}>
+            {item.subtitle}
+          </div>
         </div>
         <span className="badge red">Open</span>
       </div>
@@ -63,7 +81,7 @@ function BreakerOpenCard({ item }: { item: ActionItem }) {
 
 function SchedulerStoppedCard({ item }: { item: ActionItem }) {
   const [busy, setBusy] = useState(false);
-  const [feedback, setFeedback] = useState<{ message: string; tone: string } | null>(null);
+  const [feedback, setFeedback] = useState<ActionFeedback | null>(null);
   const router = useRouter();
 
   const handleStart = useCallback(async () => {
@@ -75,8 +93,7 @@ function SchedulerStoppedCard({ item }: { item: ActionItem }) {
         body: JSON.stringify({ action: 'start' }),
       });
       if (!res.ok) {
-        const data = (await res.json().catch(() => ({}))) as { detail?: string };
-        setFeedback({ message: data.detail ?? `Failed (${res.status})`, tone: 'negative' });
+        setFeedback({ message: await readErrorMessage(res), tone: 'negative' });
         return;
       }
       setFeedback({ message: 'Scheduler started', tone: 'positive' });
@@ -90,10 +107,14 @@ function SchedulerStoppedCard({ item }: { item: ActionItem }) {
 
   return (
     <div className="history-item" style={{ display: 'grid', gap: 8 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+      <div
+        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}
+      >
         <div>
           <strong>{item.title}</strong>
-          <div className="muted small" style={{ marginTop: 4 }}>{item.subtitle}</div>
+          <div className="muted small" style={{ marginTop: 4 }}>
+            {item.subtitle}
+          </div>
         </div>
         <button
           className="button"
@@ -104,9 +125,7 @@ function SchedulerStoppedCard({ item }: { item: ActionItem }) {
           {busy ? 'Starting...' : 'Start scheduler'}
         </button>
       </div>
-      {feedback ? (
-        <span className={`small ${feedback.tone}`}>{feedback.message}</span>
-      ) : null}
+      {feedback ? <span className={`small ${feedback.tone}`}>{feedback.message}</span> : null}
     </div>
   );
 }
@@ -117,7 +136,9 @@ function ReviewSignalCard({ item }: { item: ActionItem }) {
     <div className="history-item" style={{ display: 'grid', gap: 10 }}>
       <div>
         <strong>{item.title}</strong>
-        <div className="muted small" style={{ marginTop: 4 }}>{item.subtitle}</div>
+        <div className="muted small" style={{ marginTop: 4 }}>
+          {item.subtitle}
+        </div>
       </div>
       <JournalEntryForm
         defaultTicker={String(m.symbol ?? '')}
@@ -133,12 +154,17 @@ function ReviewSignalCard({ item }: { item: ActionItem }) {
 
 function WatchingEntryCard({ item }: { item: ActionItem }) {
   const [busy, setBusy] = useState(false);
-  const [feedback, setFeedback] = useState<{ message: string; tone: string } | null>(null);
+  const [feedback, setFeedback] = useState<ActionFeedback | null>(null);
   const router = useRouter();
-  const entryId = item.metadata.entry_id as number;
+  const entryId = typeof item.metadata.entry_id === 'number' ? item.metadata.entry_id : null;
 
   const handleDecision = useCallback(
     async (decision: 'took' | 'skipped') => {
+      if (entryId == null) {
+        setFeedback({ message: 'Journal entry id is missing.', tone: 'negative' });
+        return;
+      }
+
       if (!window.confirm(`Mark ${item.metadata.ticker} as ${decision}?`)) return;
       setBusy(true);
       try {
@@ -164,12 +190,14 @@ function WatchingEntryCard({ item }: { item: ActionItem }) {
     <div className="history-item" style={{ display: 'grid', gap: 8 }}>
       <div>
         <strong>{item.title}</strong>
-        <div className="muted small" style={{ marginTop: 4 }}>{item.subtitle}</div>
+        <div className="muted small" style={{ marginTop: 4 }}>
+          {item.subtitle}
+        </div>
       </div>
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         <button
           className="button blue"
-          disabled={busy}
+          disabled={busy || entryId == null}
           onClick={() => handleDecision('took')}
           style={{ width: 'auto', padding: '8px 16px' }}
         >
@@ -177,16 +205,14 @@ function WatchingEntryCard({ item }: { item: ActionItem }) {
         </button>
         <button
           className="button amber"
-          disabled={busy}
+          disabled={busy || entryId == null}
           onClick={() => handleDecision('skipped')}
           style={{ width: 'auto', padding: '8px 16px' }}
         >
           {busy ? 'Updating...' : 'Mark as skipped'}
         </button>
       </div>
-      {feedback ? (
-        <span className={`small ${feedback.tone}`}>{feedback.message}</span>
-      ) : null}
+      {feedback ? <span className={`small ${feedback.tone}`}>{feedback.message}</span> : null}
     </div>
   );
 }
