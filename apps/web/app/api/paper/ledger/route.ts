@@ -1,16 +1,16 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { getScannerApiBase } from '@/lib/scanner-api';
 import {
-  buildScannerAdminHeaders,
-  missingScannerAdminTokenResponse,
+  buildScannerReadHeaders,
+  getScannerServerReadToken,
+  missingScannerReadTokenResponse,
   proxyScannerResponse,
 } from '@/lib/scanner-admin-proxy';
 
-const ADMIN_TOKEN = process.env.SCANNER_ADMIN_API_TOKEN;
-
 export async function GET(request: NextRequest) {
-  if (!ADMIN_TOKEN) {
-    return missingScannerAdminTokenResponse();
+  const readToken = getScannerServerReadToken();
+  if (!readToken) {
+    return missingScannerReadTokenResponse();
   }
 
   const sourceUrl = new URL(request.url);
@@ -26,7 +26,7 @@ export async function GET(request: NextRequest) {
   try {
     const response = await fetch(targetUrl, {
       method: 'GET',
-      headers: buildScannerAdminHeaders(ADMIN_TOKEN),
+      headers: buildScannerReadHeaders(readToken),
       cache: 'no-store',
     });
 

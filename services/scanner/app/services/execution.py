@@ -88,7 +88,7 @@ class ExecutionService:
                     side=preview.side,
                     order_type=preview.order_type,
                     qty=preview.qty,
-                    dry_run=getattr(request, "dry_run", False),
+                    dry_run=True,
                     idempotency_key=getattr(request, "idempotency_key", None),
                     idempotency_payload_hash=self._idempotency_payload_hash(
                         request.model_dump(mode="json")
@@ -118,7 +118,7 @@ class ExecutionService:
                 row.side = preview.side
                 row.order_type = preview.order_type
                 row.qty = preview.qty
-                row.dry_run = getattr(request, "dry_run", False)
+                row.dry_run = True
                 row.idempotency_key = getattr(request, "idempotency_key", None)
                 row.lifecycle_status = "previewed"
                 row.latest_price = preview.latest_price
@@ -312,6 +312,13 @@ class ExecutionService:
         return preview
 
     async def place(self, request: OrderPlaceRequest) -> OrderPlaceResponse:
+        if request.mode != "dry_run" and not request.dry_run:
+            raise AppError(
+                message="Only dry-run paper orders are accepted by this service.",
+                status_code=400,
+                code="dry_run_required",
+            )
+        request.dry_run = True
         self._enforce_execution_safeguards()
         existing = self._find_existing_idempotent_result(request.idempotency_key)
         if existing and existing.lifecycle_status in {"submitted", "dry_run", "blocked"}:

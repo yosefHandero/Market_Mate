@@ -1,22 +1,22 @@
 import { NextResponse } from 'next/server';
 import { getScannerApiBase } from '@/lib/scanner-api';
 import {
-  buildScannerAdminHeaders,
-  missingScannerAdminTokenResponse,
+  buildScannerReadHeaders,
+  getScannerServerReadToken,
+  missingScannerReadTokenResponse,
   proxyScannerResponse,
 } from '@/lib/scanner-admin-proxy';
 
-const ADMIN_TOKEN = process.env.SCANNER_ADMIN_API_TOKEN;
-
 export async function GET() {
-  if (!ADMIN_TOKEN) {
-    return missingScannerAdminTokenResponse();
+  const readToken = getScannerServerReadToken();
+  if (!readToken) {
+    return missingScannerReadTokenResponse();
   }
 
   try {
     const response = await fetch(`${getScannerApiBase()}/paper/ledger/summary`, {
       method: 'GET',
-      headers: buildScannerAdminHeaders(ADMIN_TOKEN),
+      headers: buildScannerReadHeaders(readToken),
       cache: 'no-store',
     });
 

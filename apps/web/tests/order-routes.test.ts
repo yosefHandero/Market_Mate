@@ -21,6 +21,7 @@ describe('order proxy routes', () => {
     vi.restoreAllMocks();
     vi.resetModules();
     delete process.env.SCANNER_ADMIN_API_TOKEN;
+    delete process.env.SCANNER_READ_API_TOKEN;
     delete process.env.NEXT_PUBLIC_SCANNER_API_BASE;
   });
 
@@ -31,6 +32,25 @@ describe('order proxy routes', () => {
         ticker: 'AAPL',
         side: 'buy',
         qty: 1,
+      }),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      detail: 'Server admin token is not configured.',
+    });
+  });
+
+  it('returns 503 for placement when the admin token is missing', async () => {
+    process.env.SCANNER_READ_API_TOKEN = 'read-token';
+
+    const { POST } = await import('@/app/api/orders/place/route');
+    const response = await POST(
+      createJsonRequest('http://localhost/api/orders/place', {
+        ticker: 'AAPL',
+        side: 'buy',
+        qty: 1,
+        mode: 'dry_run',
       }),
     );
 
@@ -212,8 +232,8 @@ describe('order proxy routes', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('forwards paper ledger filters to the scanner admin API', async () => {
-    process.env.SCANNER_ADMIN_API_TOKEN = 'admin-token';
+  it('forwards paper ledger filters using the scanner read token', async () => {
+    process.env.SCANNER_READ_API_TOKEN = 'read-token';
     process.env.NEXT_PUBLIC_SCANNER_API_BASE = 'http://scanner.test';
 
     const fetchMock = vi.fn().mockResolvedValue(
@@ -236,6 +256,47 @@ describe('order proxy routes', () => {
     expect(targetUrl.pathname).toBe('/paper/ledger');
     expect(targetUrl.searchParams.get('status')).toBe('open');
     expect(targetUrl.searchParams.get('symbol')).toBe('AAPL');
+    expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer read-token');
+  });
+
+  it('falls back to the admin token for paper ledger reads when no read token is configured', async () => {
+    process.env.SCANNER_ADMIN_API_TOKEN = 'admin-token';
+    process.env.NEXT_PUBLIC_SCANNER_API_BASE = 'http://scanner.test';
+
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { GET } = await import('@/app/api/paper/ledger/route');
+    const response = await GET(new NextRequest('http://localhost/api/paper/ledger'));
+
+    expect(response.status).toBe(200);
+    const [, init] = fetchMock.mock.calls[0];
     expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer admin-token');
+  });
+
+  it('forwards paper ledger summary using the scanner read token', async () => {
+    process.env.SCANNER_READ_API_TOKEN = 'read-token';
+    process.env.NEXT_PUBLIC_SCANNER_API_BASE = 'http://scanner.test';
+
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ open_positions: 0, closed_positions: 0 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { GET } = await import('@/app/api/paper/ledger/summary/route');
+    const response = await GET();
+
+    expect(response.status).toBe(200);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('http://scanner.test/paper/ledger/summary');
+    expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer read-token');
   });
 });

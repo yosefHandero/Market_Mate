@@ -13,6 +13,12 @@ export function getScannerServerReadToken() {
   return process.env.SCANNER_READ_API_TOKEN || process.env.SCANNER_ADMIN_API_TOKEN || '';
 }
 
+export function buildScannerReadHeaders(readToken: string): Headers {
+  return new Headers({
+    Authorization: `Bearer ${readToken}`,
+  });
+}
+
 export function buildScannerAdminHeaders(adminToken: string, jsonBody = false): Headers {
   const headers = new Headers({
     Authorization: `Bearer ${adminToken}`,

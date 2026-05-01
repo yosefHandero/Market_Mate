@@ -166,6 +166,73 @@ describe('PaperTradingLoop', () => {
     expect(screen.getByText(/Preview is disabled/)).toBeInTheDocument();
   });
 
+  it('shows the available blocked reason and keeps paper actions disabled', () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      React.createElement(PaperTradingLoop, {
+        selectedResult: sampleResult({
+          recommended_action: 'blocked',
+          gate_passed: false,
+          gate_reason: 'Blocked by sample_size: stock BUY bucket has 4 1h outcomes; need 20.',
+          gate_checks: [
+            {
+              name: 'sample_size',
+              passed: false,
+              detail: 'stock BUY bucket has 4 1h outcomes; need 20.',
+            },
+          ],
+          provider_status: 'degraded',
+          provider_warnings: ['directional_news_unavailable'],
+        }),
+        selectedDecision: sampleDecision({
+          recommended_action: 'blocked',
+          execution_eligibility: 'blocked',
+        }),
+        onPaperOrderPlaced: vi.fn(),
+      }),
+    );
+
+    expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Place dry run' })).toBeDisabled();
+    expect(
+      screen.getByText(
+        'Reason: Blocked by sample_size: stock BUY bucket has 4 1h outcomes; need 20.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Provider: degraded/)).toHaveTextContent(
+      'directional news unavailable',
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps ignored actions disabled and explains that no paper action is available', () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      React.createElement(PaperTradingLoop, {
+        selectedResult: sampleResult({
+          decision_signal: 'HOLD',
+          recommended_action: 'ignore',
+          gate_reason: '',
+        }),
+        selectedDecision: sampleDecision({
+          signal: 'HOLD',
+          recommended_action: 'ignore',
+          execution_eligibility: 'not_applicable',
+        }),
+        onPaperOrderPlaced: vi.fn(),
+      }),
+    );
+
+    expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Place dry run' })).toBeDisabled();
+    expect(screen.getByText('Reason: HOLD signal has no paper-trading action.')).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('places a dry-run after preview succeeds and renders an audit receipt', async () => {
     const user = userEvent.setup();
     const onPaperOrderPlaced = vi.fn();

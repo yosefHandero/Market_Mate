@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -220,10 +221,30 @@ class CoinbaseMarketDataService:
 
     def _persist_snapshots(self) -> None:
         self.snapshot_file_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"prices": self.list_snapshots()}
-        tmp_path = self.snapshot_file_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        tmp_path.replace(self.snapshot_file_path)
+        payload = {"prices": [self._snapshots[key] for key in sorted(self._snapshots)]}
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.snapshot_file_path.parent,
+                prefix=f"{self.snapshot_file_path.stem}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                json.dump(payload, tmp_file, indent=2, sort_keys=True)
+            tmp_path.replace(self.snapshot_file_path)
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    logger.warning(
+                        "unable to remove coinbase snapshot temp file",
+                        extra={"event": "coinbase_ws_snapshot_temp_cleanup_failed"},
+                        exc_info=True,
+                    )
 
     def _coerce_payload(self, raw_message: str | bytes | dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(raw_message, dict):

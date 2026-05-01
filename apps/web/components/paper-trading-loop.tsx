@@ -56,6 +56,84 @@ function selectableAction(action: string | null | undefined) {
   return action === 'preview' || action === 'dry_run';
 }
 
+function cleanDetail(value: string | null | undefined) {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed.toLowerCase() === 'passed') return null;
+  return trimmed;
+}
+
+function humanizeKey(value: string) {
+  return value.replace(/_/g, ' ');
+}
+
+function firstUnique(items: Array<string | null | undefined>) {
+  const seen = new Set<string>();
+  return items.flatMap((item) => {
+    const trimmed = cleanDetail(item);
+    if (!trimmed || seen.has(trimmed)) return [];
+    seen.add(trimmed);
+    return [trimmed];
+  });
+}
+
+function formatFreshnessFlags(flags: Record<string, string> | null | undefined) {
+  const entries = Object.entries(flags ?? {}).filter(([, value]) => cleanDetail(value));
+  if (!entries.length) return null;
+  return entries.map(([key, value]) => `${humanizeKey(key)}: ${value}`).join(' | ');
+}
+
+function disabledPreviewContext({
+  action,
+  result,
+  decision,
+}: {
+  action: string | null | undefined;
+  result: ScanResult;
+  decision?: DecisionRow | null;
+}) {
+  const actionLabel = action ?? 'missing';
+  const failedGate = result.gate_checks.find((check) => !check.passed);
+  const reasonCandidates = firstUnique([
+    result.gate_reason,
+    failedGate?.detail,
+    result.evidence_quality_reasons[0],
+    decision?.evidence_quality_reasons[0],
+  ]);
+  const details = reasonCandidates.slice(0, 2).map((reason) => `Reason: ${reason}`);
+
+  if (failedGate && !reasonCandidates.includes(failedGate.detail)) {
+    details.push(`Gate check: ${humanizeKey(failedGate.name)} - ${failedGate.detail}`);
+  }
+
+  const providerStatus = result.provider_status || decision?.provider_status;
+  if (
+    providerStatus &&
+    providerStatus !== 'ok' &&
+    providerStatus !== 'unknown'
+  ) {
+    const warnings = result.provider_warnings.length
+      ? ` (${result.provider_warnings.map(humanizeKey).join(', ')})`
+      : '';
+    details.push(`Provider: ${providerStatus}${warnings}`);
+  } else if (result.provider_warnings.length) {
+    details.push(`Provider: ${result.provider_warnings.map(humanizeKey).join(', ')}`);
+  }
+
+  const freshness = formatFreshnessFlags(result.freshness_flags ?? decision?.freshness_flags);
+  if (freshness) {
+    details.push(`Freshness: ${freshness}`);
+  }
+
+  if (!details.length && action === 'ignore') {
+    details.push(`Reason: ${result.decision_signal} signal has no paper-trading action.`);
+  }
+
+  return {
+    headline: `Preview is disabled because the recommended action is ${actionLabel}.`,
+    details,
+  };
+}
+
 function makeOrderKey(result: ScanResult) {
   return `dashboard-paper-${result.asset_type}-${result.ticker}-${result.decision_signal.toLowerCase()}-${Date.now()}`;
 }
@@ -85,6 +163,13 @@ export function PaperTradingLoop({
   const placeEnabled = Boolean(
     preview && setup && orderKey && preview.gate_result !== 'blocked' && busy == null,
   );
+  const disabledContext = selectedResult
+    ? disabledPreviewContext({
+        action: recommendedAction,
+        result: selectedResult,
+        decision: selectedDecision,
+      })
+    : null;
 
   useEffect(() => {
     setPreview(null);
@@ -195,9 +280,14 @@ export function PaperTradingLoop({
       </div>
 
       {!selectableAction(recommendedAction) ? (
-        <p className="negative small" style={{ marginTop: 12 }}>
-          Preview is disabled because the recommended action is {recommendedAction ?? 'missing'}.
-        </p>
+        <div className="detail-panel small" style={{ marginTop: 16 }}>
+          <div className="negative">{disabledContext?.headline}</div>
+          {disabledContext?.details.map((detail) => (
+            <div key={detail} className="muted">
+              {detail}
+            </div>
+          ))}
+        </div>
       ) : null}
       {error ? <p className="negative small">{error}</p> : null}
 

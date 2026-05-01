@@ -214,19 +214,19 @@ class AutomationRepository:
         intent_id: int,
         simulated_fill_price: float,
         filled_at: datetime | None = None,
-    ) -> None:
+    ) -> int | None:
         filled_time = filled_at or self._utc_now()
         with SessionLocal() as session:
             intent = session.get(AutomationIntentORM, intent_id)
             if intent is None:
-                return
+                return None
             existing = session.execute(
                 select(PaperPositionORM)
                 .where(PaperPositionORM.intent_key == intent.intent_key)
                 .limit(1)
             ).scalar_one_or_none()
             if existing is not None:
-                return
+                return existing.id
 
             if intent.side == "sell":
                 open_position = session.execute(
@@ -239,40 +239,46 @@ class AutomationRepository:
                     .order_by(desc(PaperPositionORM.opened_at), desc(PaperPositionORM.id))
                     .limit(1)
                 ).scalar_one_or_none()
-                if open_position is not None:
-                    quantity = min(float(open_position.quantity or 0.0), float(intent.qty or 0.0))
-                    proceeds = round(quantity * simulated_fill_price, 2)
-                    open_basis = float(open_position.cost_basis_usd or open_position.notional_usd or 0.0)
-                    basis_per_unit = open_basis / max(float(open_position.quantity or 0.0), 1e-9)
-                    realized_pnl = round(proceeds - (basis_per_unit * quantity), 2)
-                    open_position.close_price = simulated_fill_price
-                    open_position.realized_pnl = realized_pnl
-                    open_position.closed_at = filled_time
-                    open_position.status = "closed"
-                    open_position.updated_at = filled_time
-            session.add(
-                PaperPositionORM(
-                    created_at=filled_time,
-                    updated_at=filled_time,
-                    intent_key=intent.intent_key,
-                    execution_audit_id=intent.execution_audit_id,
-                    ticker=intent.symbol,
-                    asset_type=intent.asset_type,
-                    side=intent.side,
-                    quantity=float(intent.qty or 0.0),
-                    simulated_fill_price=simulated_fill_price,
-                    notional_usd=round(float(intent.qty or 0.0) * simulated_fill_price, 2),
-                    cost_basis_usd=round(float(intent.qty or 0.0) * simulated_fill_price, 2),
-                    close_price=simulated_fill_price if intent.side == "sell" else None,
-                    realized_pnl=0.0 if intent.side == "sell" else None,
-                    status="closed" if intent.side == "sell" else "open",
-                    opened_at=filled_time,
-                    closed_at=filled_time if intent.side == "sell" else None,
-                    strategy_version=intent.strategy_version,
-                    confidence=intent.confidence,
-                )
+                if open_position is None:
+                    return None
+                quantity = float(open_position.quantity or 0.0)
+                if quantity <= 0:
+                    return None
+                open_basis = float(open_position.cost_basis_usd or open_position.notional_usd or 0.0)
+                proceeds = round(quantity * simulated_fill_price, 2)
+                realized_pnl = round(proceeds - open_basis, 2)
+                open_position.close_price = simulated_fill_price
+                open_position.realized_pnl = realized_pnl
+                open_position.closed_at = filled_time
+                open_position.status = "closed"
+                open_position.updated_at = filled_time
+                session.commit()
+                return open_position.id
+
+            position = PaperPositionORM(
+                created_at=filled_time,
+                updated_at=filled_time,
+                intent_key=intent.intent_key,
+                execution_audit_id=intent.execution_audit_id,
+                ticker=intent.symbol,
+                asset_type=intent.asset_type,
+                side=intent.side,
+                quantity=float(intent.qty or 0.0),
+                simulated_fill_price=simulated_fill_price,
+                notional_usd=round(float(intent.qty or 0.0) * simulated_fill_price, 2),
+                cost_basis_usd=round(float(intent.qty or 0.0) * simulated_fill_price, 2),
+                close_price=None,
+                realized_pnl=None,
+                status="open",
+                opened_at=filled_time,
+                closed_at=None,
+                strategy_version=intent.strategy_version,
+                confidence=intent.confidence,
             )
+            session.add(position)
             session.commit()
+            session.refresh(position)
+            return position.id
 
     def record_paper_position_from_audit(
         self,
@@ -315,17 +321,21 @@ class AutomationRepository:
                     .order_by(desc(PaperPositionORM.opened_at), desc(PaperPositionORM.id))
                     .limit(1)
                 ).scalar_one_or_none()
-                if open_position is not None:
-                    quantity = min(float(open_position.quantity or 0.0), qty)
-                    proceeds = round(quantity * simulated_fill_price, 2)
-                    open_basis = float(open_position.cost_basis_usd or open_position.notional_usd or 0.0)
-                    basis_per_unit = open_basis / max(float(open_position.quantity or 0.0), 1e-9)
-                    realized_pnl = round(proceeds - (basis_per_unit * quantity), 2)
-                    open_position.close_price = simulated_fill_price
-                    open_position.realized_pnl = realized_pnl
-                    open_position.closed_at = filled_time
-                    open_position.status = "closed"
-                    open_position.updated_at = filled_time
+                if open_position is None:
+                    return None
+                open_quantity = float(open_position.quantity or 0.0)
+                if open_quantity <= 0:
+                    return None
+                open_basis = float(open_position.cost_basis_usd or open_position.notional_usd or 0.0)
+                proceeds = round(open_quantity * simulated_fill_price, 2)
+                realized_pnl = round(proceeds - open_basis, 2)
+                open_position.close_price = simulated_fill_price
+                open_position.realized_pnl = realized_pnl
+                open_position.closed_at = filled_time
+                open_position.status = "closed"
+                open_position.updated_at = filled_time
+                session.commit()
+                return open_position.id
 
             strategy_version = getattr(audit, "trade_gate_horizon", None)
             if audit.preview_payload:
@@ -349,11 +359,11 @@ class AutomationRepository:
                 simulated_fill_price=simulated_fill_price,
                 notional_usd=round(qty * simulated_fill_price, 2),
                 cost_basis_usd=round(qty * simulated_fill_price, 2),
-                close_price=simulated_fill_price if side == "sell" else None,
-                realized_pnl=0.0 if side == "sell" else None,
-                status="closed" if side == "sell" else "open",
+                close_price=None,
+                realized_pnl=None,
+                status="open",
                 opened_at=filled_time,
-                closed_at=filled_time if side == "sell" else None,
+                closed_at=None,
                 strategy_version=strategy_version,
                 confidence=audit.confidence,
             )
