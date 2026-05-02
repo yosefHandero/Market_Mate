@@ -20,6 +20,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <nav className="nav-links">
               <Link href="/">Actions</Link>
               <Link href="/history">History</Link>
+              <Link href="/validation">Validation</Link>
             </nav>
           </div>
         </header>

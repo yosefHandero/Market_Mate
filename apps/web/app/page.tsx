@@ -1,4 +1,3 @@
-import Link from 'next/link';
 import { OperatorActions } from '@/components/operator-actions';
 import { TradingWorkspace } from '@/components/trading-workspace';
 
@@ -95,27 +94,6 @@ export default async function HomePage() {
         initialPaperSummary={paperLedgerSummaryResult.data}
         paperLedgerError={paperLedgerError || null}
       />
-
-      <section className="card">
-        <h2 style={{ marginBottom: 8 }}>Open Pages</h2>
-        <p className="muted" style={{ marginBottom: 16 }}>
-          Use the dedicated pages for deeper review and trade journaling.
-        </p>
-        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-          <Link href="/history" className="button">
-            Scan history
-          </Link>
-          <Link href="/review" className="button">
-            Review queue
-          </Link>
-          <Link href="/journal" className="button">
-            Journal
-          </Link>
-          <Link href="/validation" className="button">
-            Validation
-          </Link>
-        </div>
-      </section>
     </main>
   );
 }
