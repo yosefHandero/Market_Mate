@@ -752,6 +752,104 @@ tr.highlighted-row td {
   gap: 4px;
 }
 
+.readiness-popover {
+  position: relative;
+  display: inline-grid;
+  align-items: start;
+  justify-items: start;
+  max-width: 100%;
+}
+
+.readiness-popover-trigger {
+  display: inline-grid;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: help;
+  font: inherit;
+}
+
+.readiness-popover-trigger:focus-visible {
+  outline: 2px solid rgba(94, 160, 255, 0.8);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+.readiness-score {
+  font-weight: 700;
+}
+
+.readiness-score-high {
+  color: var(--green);
+}
+
+.readiness-score-watch {
+  color: var(--amber);
+}
+
+.readiness-score-low,
+.readiness-score-none {
+  color: var(--red);
+}
+
+.readiness-popover-panel {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 8px);
+  z-index: 30;
+  display: none;
+  width: min(330px, calc(100vw - 48px));
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(8, 15, 26, 0.98);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.32);
+  color: var(--text);
+  line-height: 1.45;
+  white-space: normal;
+}
+
+.readiness-popover-panel[data-open='true'] {
+  display: grid;
+  gap: 10px;
+}
+
+.readiness-popover-header,
+.readiness-factor-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.readiness-factor-list {
+  display: grid;
+  gap: 8px;
+}
+
+.readiness-factor {
+  display: grid;
+  gap: 4px;
+  font-size: 0.78rem;
+}
+
+.readiness-factor-bar {
+  display: block;
+  width: 100%;
+  height: 6px;
+}
+
+.readiness-factor-track {
+  fill: rgba(255, 255, 255, 0.12);
+}
+
+.readiness-factor-fill {
+  fill: var(--blue);
+}
+
 .opportunity-reason,
 .opportunity-empty,
 .opportunity-footnote {

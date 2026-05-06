@@ -6,6 +6,7 @@ import { PaperTradingLoop } from '@/components/paper-trading-loop';
 import { RankTable } from '@/components/rank-table';
 import { getPaperLedger, getPaperLedgerSummary } from '@/lib/trading-desk';
 import type {
+  AutomationStatusResponse,
   DecisionRow,
   PaperLedgerSummary,
   PaperPositionSummary,
@@ -30,6 +31,7 @@ export function TradingWorkspace({
   initialPaperPositions,
   initialPaperSummary,
   paperLedgerError,
+  automation,
 }: {
   decisions: DecisionRow[];
   decisionsError?: string | null;
@@ -37,6 +39,7 @@ export function TradingWorkspace({
   initialPaperPositions: PaperPositionSummary[];
   initialPaperSummary: PaperLedgerSummary | null;
   paperLedgerError?: string | null;
+  automation?: AutomationStatusResponse | null;
 }) {
   const rankedResults = latestScan?.results ?? EMPTY_RESULTS;
   const [activeTicker, setActiveTicker] = useState(rankedResults[0]?.ticker ?? '');
@@ -124,6 +127,8 @@ export function TradingWorkspace({
                 topN={8}
                 activeTicker={selectedResult?.ticker}
                 onSelectTicker={setActiveTicker}
+                decisions={decisions}
+                automation={automation ?? null}
               />
             ) : (
               <p className="muted" style={{ margin: 0 }}>
@@ -136,6 +141,7 @@ export function TradingWorkspace({
             selectedResult={selectedResult}
             selectedDecision={selectedDecision}
             onPaperOrderPlaced={refreshLedger}
+            automation={automation ?? null}
           />
         </div>
       </section>

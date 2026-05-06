@@ -1,8 +1,12 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { ReadinessPopover, readinessProjectionText } from '@/components/readiness-popover';
+import { buildCoinbaseLink } from '@/lib/coinbase-link';
+import { computeTradeReadiness } from '@/lib/readiness';
 import { placeOrder, previewOrder } from '@/lib/trading-desk';
 import type {
+  AutomationStatusResponse,
   DecisionRow,
   OrderPlaceResponse,
   OrderPreviewRequest,
@@ -142,10 +146,12 @@ export function PaperTradingLoop({
   selectedResult,
   selectedDecision,
   onPaperOrderPlaced,
+  automation,
 }: {
   selectedResult: ScanResult | null;
   selectedDecision?: DecisionRow | null;
   onPaperOrderPlaced: (auditId: number | null) => void | Promise<void>;
+  automation?: AutomationStatusResponse | null;
 }) {
   const [preview, setPreview] = useState<OrderPreviewResponse | null>(null);
   const [receipt, setReceipt] = useState<OrderPlaceResponse | null>(null);
@@ -159,6 +165,12 @@ export function PaperTradingLoop({
   );
   const recommendedAction =
     selectedDecision?.recommended_action ?? selectedResult?.recommended_action ?? null;
+  const tradeReadiness = selectedResult
+    ? computeTradeReadiness(selectedResult, selectedDecision ?? null, { automation })
+    : null;
+  const coinbaseLink = selectedResult
+    ? buildCoinbaseLink(selectedResult.ticker, selectedResult.asset_type)
+    : null;
   const previewEnabled = Boolean(setup && selectableAction(recommendedAction) && busy == null);
   const placeEnabled = Boolean(
     preview && setup && orderKey && preview.gate_result !== 'blocked' && busy == null,
@@ -250,6 +262,36 @@ export function PaperTradingLoop({
   return (
     <section className="card">
       <h2 style={{ marginBottom: 8 }}>Paper Trading Loop</h2>
+      {tradeReadiness ? (
+        <div
+          className="desk-readiness-hero"
+          style={{
+            marginBottom: 16,
+            padding: '14px 16px',
+            borderRadius: 8,
+            border: '1px solid var(--border, rgba(255,255,255,0.12))',
+            background: 'var(--surface-elevated, rgba(0,0,0,0.2))',
+          }}
+        >
+          <div className="muted small" style={{ marginBottom: 4 }}>
+            Readiness
+          </div>
+          <div style={{ marginTop: 4 }}>
+            <ReadinessPopover readiness={tradeReadiness} showLabel={false} />
+          </div>
+          <div className="muted small" style={{ marginTop: 10 }}>
+            <span className="muted">Action:</span>{' '}
+            <strong>{recommendedAction ?? 'none'}</strong>
+          </div>
+          <div className="muted small" style={{ marginTop: 6 }}>
+            <span className="muted">Reason:</span> {tradeReadiness.reason}
+          </div>
+          <div className="muted small" style={{ marginTop: 6 }}>
+            <span className="muted">Projection:</span>{' '}
+            {readinessProjectionText(tradeReadiness.projection)}
+          </div>
+        </div>
+      ) : null}
       <div className="desk-summary-grid">
         <div className="desk-kpi desk-kpi-primary">
           <div className="kpi-label">Decision</div>
@@ -277,7 +319,24 @@ export function PaperTradingLoop({
         <button type="button" className="button" onClick={runPlace} disabled={!placeEnabled}>
           {busy === 'place' ? 'Placing...' : 'Place dry run'}
         </button>
+        {coinbaseLink?.available && coinbaseLink.href ? (
+          <a
+            className="button"
+            href={coinbaseLink.href}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {coinbaseLink.label}
+          </a>
+        ) : (
+          <span className="muted small" style={{ alignSelf: 'center' }}>
+            {coinbaseLink?.reason ?? 'Coinbase link unavailable.'}
+          </span>
+        )}
       </div>
+      <p className="muted small" style={{ marginTop: 8, marginBottom: 0 }}>
+        Manual navigation only. The app does not place orders on Coinbase.
+      </p>
 
       {!selectableAction(recommendedAction) ? (
         <div className="detail-panel small" style={{ marginTop: 16 }}>

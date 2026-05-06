@@ -14,7 +14,7 @@ function sampleResult(overrides: Partial<ScanResult> = {}): ScanResult {
     asset_type: 'stock',
     score: 72,
     raw_score: 68,
-    calibrated_confidence: 72,
+    calibrated_confidence: 88,
     calibration_source: 'signal',
     confidence_label: 'moderate_evidence',
     strategy_id: 'scanner-directional',
@@ -87,7 +87,7 @@ const decisions: DecisionRow[] = [
     symbol: 'AAPL',
     asset_type: 'stock',
     signal: 'BUY',
-    confidence: 72,
+    confidence: 88,
     raw_score: 68,
     calibration_source: 'signal',
     confidence_label: 'moderate_evidence',
@@ -208,6 +208,9 @@ describe('TradingWorkspace', () => {
         paperLedgerError: null,
       }),
     );
+
+    expect(screen.queryByText('Confidence')).not.toBeInTheDocument();
+    expect(screen.getAllByText('Readiness').length).toBeGreaterThan(0);
 
     expect(screen.getAllByText('AAPL').length).toBeGreaterThan(0);
     expect(screen.getByText('BUY | preview')).toBeInTheDocument();

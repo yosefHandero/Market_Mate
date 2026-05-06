@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { readErrorMessage } from '@/lib/scanner-api';
 
 interface FeedbackState {
@@ -9,7 +10,9 @@ interface FeedbackState {
 }
 
 export function OperatorActions({ schedulerRunning }: { schedulerRunning: boolean }) {
+  const router = useRouter();
   const [scanBusy, setScanBusy] = useState(false);
+  const [schedulerBusy, setSchedulerBusy] = useState(false);
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
   const [unavailable, setUnavailable] = useState(false);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -57,6 +60,33 @@ export function OperatorActions({ schedulerRunning }: { schedulerRunning: boolea
     }
   }, [showFeedback]);
 
+  const handleScheduler = useCallback(async () => {
+    const action = schedulerRunning ? 'stop' : 'start';
+    setSchedulerBusy(true);
+    try {
+      const res = await fetch('/api/scan/scheduler', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      if (res.status === 503) {
+        setUnavailable(true);
+        showFeedback('Admin controls unavailable', 'muted');
+        return;
+      }
+      if (!res.ok) {
+        showFeedback(await readErrorMessage(res), 'negative');
+        return;
+      }
+      showFeedback(action === 'start' ? 'Scheduler started' : 'Scheduler stopped', 'positive');
+      router.refresh();
+    } catch {
+      showFeedback('Network error updating scheduler', 'negative');
+    } finally {
+      setSchedulerBusy(false);
+    }
+  }, [router, schedulerRunning, showFeedback]);
+
   if (unavailable) {
     return (
       <p className="muted small" style={{ marginBottom: 12 }}>
@@ -79,6 +109,20 @@ export function OperatorActions({ schedulerRunning }: { schedulerRunning: boolea
         style={{ width: 'auto', padding: '8px 16px' }}
       >
         {scanBusy ? 'Running...' : 'Run scan now'}
+      </button>
+      <button
+        className="button"
+        disabled={schedulerBusy}
+        onClick={handleScheduler}
+        style={{ width: 'auto', padding: '8px 16px' }}
+      >
+        {schedulerBusy
+          ? schedulerRunning
+            ? 'Stopping...'
+            : 'Starting...'
+          : schedulerRunning
+            ? 'Stop scheduler'
+            : 'Start scheduler'}
       </button>
       {feedback ? <span className={`small ${feedback.tone}`}>{feedback.message}</span> : null}
     </div>

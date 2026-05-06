@@ -14,7 +14,7 @@ function sampleResult(overrides: Partial<ScanResult> = {}): ScanResult {
     asset_type: 'stock',
     score: 72,
     raw_score: 68,
-    calibrated_confidence: 72,
+    calibrated_confidence: 88,
     calibration_source: 'signal',
     confidence_label: 'moderate_evidence',
     strategy_id: 'scanner-directional',
@@ -72,7 +72,7 @@ const sampleDecision = (overrides: Partial<DecisionRow> = {}): DecisionRow => ({
   symbol: 'AAPL',
   asset_type: 'stock',
   signal: 'BUY',
-  confidence: 72,
+  confidence: 88,
   raw_score: 68,
   calibration_source: 'signal',
   confidence_label: 'moderate_evidence',
@@ -162,6 +162,9 @@ describe('PaperTradingLoop', () => {
       }),
     );
 
+    expect(screen.getByText('Readiness')).toBeInTheDocument();
+    expect(screen.getByText('65%')).toBeInTheDocument();
+    expect(screen.getByText(/Watch only: review pending/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
     expect(screen.getByText(/Preview is disabled/)).toBeInTheDocument();
   });
@@ -194,6 +197,8 @@ describe('PaperTradingLoop', () => {
       }),
     );
 
+    expect(screen.getByText('Readiness')).toBeInTheDocument();
+    expect(screen.getByText(/sample size/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Place dry run' })).toBeDisabled();
     expect(
@@ -227,6 +232,7 @@ describe('PaperTradingLoop', () => {
       }),
     );
 
+    expect(screen.getByText(/Low actionability: HOLD signal/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Place dry run' })).toBeDisabled();
     expect(screen.getByText('Reason: HOLD signal has no paper-trading action.')).toBeInTheDocument();
@@ -249,6 +255,10 @@ describe('PaperTradingLoop', () => {
         onPaperOrderPlaced,
       }),
     );
+
+    expect(screen.getByText('90%')).toBeInTheDocument();
+    expect(screen.getByText('preview', { selector: 'strong' })).toBeInTheDocument();
+    expect(screen.getByText(/Actionable: gates passed/)).toBeInTheDocument();
 
     const placeButton = screen.getByRole('button', { name: 'Place dry run' });
     expect(placeButton).toBeDisabled();

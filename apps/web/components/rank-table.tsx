@@ -1,6 +1,9 @@
 'use client';
 
-import type { DecisionSignal, ScanResult } from '@/lib/types';
+import type { KeyboardEvent } from 'react';
+import { ReadinessPopover } from '@/components/readiness-popover';
+import { computeTradeReadiness } from '@/lib/readiness';
+import type { AutomationStatusResponse, DecisionRow, DecisionSignal, ScanResult } from '@/lib/types';
 
 function signalBadge(signal: DecisionSignal) {
   if (signal === 'BUY') return <span className="badge green">Buy</span>;
@@ -13,6 +16,8 @@ type RankTableProps = {
   topN?: number;
   activeTicker?: string;
   onSelectTicker?: (ticker: string) => void;
+  decisions?: DecisionRow[];
+  automation?: AutomationStatusResponse | null;
 };
 
 const CRYPTO_EMPTY_MESSAGE = 'Crypto opportunities will appear here when crypto data is connected.';
@@ -48,11 +53,15 @@ function OpportunityItem({
   rank,
   activeTicker,
   onSelectTicker,
+  decision,
+  automation,
 }: {
   row: ScanResult;
   rank: number;
   activeTicker?: string;
   onSelectTicker?: (ticker: string) => void;
+  decision?: DecisionRow | null;
+  automation?: AutomationStatusResponse | null;
 }) {
   const isActive = row.ticker === activeTicker;
   const className = [
@@ -62,6 +71,16 @@ function OpportunityItem({
   ]
     .filter(Boolean)
     .join(' ');
+
+  const readiness = computeTradeReadiness(row, decision ?? null, { automation });
+  const selectTicker = () => onSelectTicker?.(row.ticker);
+  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (!onSelectTicker) return;
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      selectTicker();
+    }
+  };
 
   const content = (
     <>
@@ -85,8 +104,10 @@ function OpportunityItem({
           <strong>{formatCurrency(row.price)}</strong>
         </div>
         <div className="opportunity-metric">
-          <span className="muted small">Confidence</span>
-          <strong>{row.calibrated_confidence.toFixed(1)}</strong>
+          <ReadinessPopover readiness={readiness} />
+          <div className="muted small" style={{ marginTop: 4, lineHeight: 1.25 }}>
+            {readiness.reason}
+          </div>
         </div>
         <div className="opportunity-metric">
           <span className="muted small">Day Move</span>
@@ -110,9 +131,15 @@ function OpportunityItem({
 
   if (onSelectTicker) {
     return (
-      <button type="button" className={className} onClick={() => onSelectTicker(row.ticker)}>
+      <article
+        role="button"
+        tabIndex={0}
+        className={className}
+        onClick={selectTicker}
+        onKeyDown={handleKeyDown}
+      >
         {content}
-      </button>
+      </article>
     );
   }
 
@@ -129,6 +156,8 @@ function RankSection({
   emptyMessage,
   activeTicker,
   onSelectTicker,
+  decisionsBySymbol,
+  automation,
 }: {
   title: string;
   description: string;
@@ -137,6 +166,8 @@ function RankSection({
   emptyMessage: string;
   activeTicker?: string;
   onSelectTicker?: (ticker: string) => void;
+  decisionsBySymbol: Map<string, DecisionRow>;
+  automation?: AutomationStatusResponse | null;
 }) {
   const needsMoreMessage =
     targetCount != null && results.length > 0 && results.length < targetCount;
@@ -165,6 +196,8 @@ function RankSection({
               rank={index + 1}
               activeTicker={activeTicker}
               onSelectTicker={onSelectTicker}
+              decision={decisionsBySymbol.get(row.ticker) ?? null}
+              automation={automation}
             />
           ))}
         </div>
@@ -187,12 +220,16 @@ export function RankTable({
   topN,
   activeTicker,
   onSelectTicker,
+  decisions = [],
+  automation = null,
 }: RankTableProps) {
   const limitedCount = topN != null && topN > 0 ? topN : null;
   const stockResults = results.filter((result) => result.asset_type === 'stock');
   const cryptoResults = results.filter((result) => result.asset_type === 'crypto');
   const stocks = limitedCount != null ? stockResults.slice(0, limitedCount) : stockResults;
   const crypto = limitedCount != null ? cryptoResults.slice(0, limitedCount) : cryptoResults;
+
+  const decisionsBySymbol = new Map(decisions.map((d) => [d.symbol, d]));
 
   return (
     <div className="opportunity-groups">
@@ -204,6 +241,8 @@ export function RankTable({
         emptyMessage="Stock opportunities will appear here after the next completed scan."
         activeTicker={activeTicker}
         onSelectTicker={onSelectTicker}
+        decisionsBySymbol={decisionsBySymbol}
+        automation={automation}
       />
       <RankSection
         title={limitedCount != null ? `Top ${limitedCount} Crypto` : 'Crypto'}
@@ -213,6 +252,8 @@ export function RankTable({
         emptyMessage={CRYPTO_EMPTY_MESSAGE}
         activeTicker={activeTicker}
         onSelectTicker={onSelectTicker}
+        decisionsBySymbol={decisionsBySymbol}
+        automation={automation}
       />
     </div>
   );
