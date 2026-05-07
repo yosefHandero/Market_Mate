@@ -3,19 +3,134 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { readErrorMessage } from '@/lib/scanner-api';
+import type { HealthResponse } from '@/lib/types';
 
 interface FeedbackState {
   message: string;
   tone: 'positive' | 'negative' | 'muted';
 }
 
-export function OperatorActions({ schedulerRunning }: { schedulerRunning: boolean }) {
+interface SchedulerSnapshot {
+  enabled: boolean;
+  running: boolean;
+  nextScanDueAt: string | null;
+  lastRunStartedAt: string | null;
+  lastError: string | null;
+}
+
+interface OperatorActionsProps {
+  schedulerEnabled?: boolean;
+  schedulerRunning: boolean;
+  nextScanDueAt?: string | null;
+  lastSchedulerRunStartedAt?: string | null;
+  lastSchedulerError?: string | null;
+  readyzPollAttempts?: number;
+  readyzPollIntervalMs?: number;
+}
+
+const READYZ_POLL_ATTEMPTS = 5;
+const READYZ_POLL_INTERVAL_MS = 1000;
+const WORKER_NOT_RUNNING_MESSAGE =
+  'Scheduler enabled, but worker is not running. Start it with: python -m app.worker from services/scanner/.';
+
+function schedulerSnapshotFromProps({
+  schedulerEnabled,
+  schedulerRunning,
+  nextScanDueAt,
+  lastSchedulerRunStartedAt,
+  lastSchedulerError,
+}: OperatorActionsProps): SchedulerSnapshot {
+  return {
+    enabled: schedulerEnabled ?? schedulerRunning,
+    running: schedulerRunning,
+    nextScanDueAt: nextScanDueAt ?? null,
+    lastRunStartedAt: lastSchedulerRunStartedAt ?? null,
+    lastError: lastSchedulerError ?? null,
+  };
+}
+
+function schedulerSnapshotFromReadyz(health: Partial<HealthResponse>): SchedulerSnapshot {
+  const running = health.scheduler_running === true;
+
+  return {
+    enabled: health.scheduler_enabled === true || running,
+    running,
+    nextScanDueAt: health.next_scan_due_at ?? null,
+    lastRunStartedAt: health.last_scheduler_run_started_at ?? null,
+    lastError: health.last_scheduler_error ?? null,
+  };
+}
+
+function getReadyzUrl() {
+  const scannerBase = process.env.NEXT_PUBLIC_SCANNER_API_BASE || 'http://localhost:8005';
+  return `${scannerBase.replace(/\/$/, '')}/readyz`;
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function formatTimestamp(value: string | null): string {
+  if (!value) {
+    return 'none';
+  }
+
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    return value;
+  }
+
+  return new Date(timestamp).toLocaleString();
+}
+
+function truncateSchedulerError(value: string | null): string {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return 'none';
+  }
+
+  return trimmed.length > 120 ? `${trimmed.slice(0, 117)}...` : trimmed;
+}
+
+export function OperatorActions(props: OperatorActionsProps) {
+  const {
+    schedulerEnabled,
+    schedulerRunning,
+    nextScanDueAt,
+    lastSchedulerRunStartedAt,
+    lastSchedulerError,
+    readyzPollAttempts = READYZ_POLL_ATTEMPTS,
+    readyzPollIntervalMs = READYZ_POLL_INTERVAL_MS,
+  } = props;
   const router = useRouter();
   const [scanBusy, setScanBusy] = useState(false);
   const [schedulerBusy, setSchedulerBusy] = useState(false);
+  const [schedulerSnapshot, setSchedulerSnapshot] = useState<SchedulerSnapshot>(() =>
+    schedulerSnapshotFromProps(props),
+  );
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
   const [unavailable, setUnavailable] = useState(false);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setSchedulerSnapshot(
+      schedulerSnapshotFromProps({
+        schedulerEnabled,
+        schedulerRunning,
+        nextScanDueAt,
+        lastSchedulerRunStartedAt,
+        lastSchedulerError,
+      }),
+    );
+  }, [
+    lastSchedulerError,
+    lastSchedulerRunStartedAt,
+    nextScanDueAt,
+    schedulerEnabled,
+    schedulerRunning,
+  ]);
 
   const showFeedback = useCallback((message: string, tone: FeedbackState['tone']) => {
     if (feedbackTimerRef.current) {
@@ -60,8 +175,42 @@ export function OperatorActions({ schedulerRunning }: { schedulerRunning: boolea
     }
   }, [showFeedback]);
 
+  const fetchReadyzSnapshot = useCallback(async (): Promise<SchedulerSnapshot | null> => {
+    try {
+      const res = await fetch(getReadyzUrl(), { cache: 'no-store' });
+      if (!res.ok) {
+        return null;
+      }
+
+      return schedulerSnapshotFromReadyz((await res.json()) as Partial<HealthResponse>);
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const pollSchedulerRunning = useCallback(async () => {
+    let latestSnapshot: SchedulerSnapshot | null = null;
+
+    for (let attempt = 1; attempt <= readyzPollAttempts; attempt += 1) {
+      const snapshot = await fetchReadyzSnapshot();
+      if (snapshot) {
+        latestSnapshot = snapshot;
+        setSchedulerSnapshot(snapshot);
+        if (snapshot.running) {
+          return { running: true, snapshot };
+        }
+      }
+
+      if (attempt < readyzPollAttempts) {
+        await delay(readyzPollIntervalMs);
+      }
+    }
+
+    return { running: false, snapshot: latestSnapshot };
+  }, [fetchReadyzSnapshot, readyzPollAttempts, readyzPollIntervalMs]);
+
   const handleScheduler = useCallback(async () => {
-    const action = schedulerRunning ? 'stop' : 'start';
+    const action = schedulerSnapshot.enabled ? 'stop' : 'start';
     setSchedulerBusy(true);
     try {
       const res = await fetch('/api/scan/scheduler', {
@@ -78,14 +227,33 @@ export function OperatorActions({ schedulerRunning }: { schedulerRunning: boolea
         showFeedback(await readErrorMessage(res), 'negative');
         return;
       }
-      showFeedback(action === 'start' ? 'Scheduler started' : 'Scheduler stopped', 'positive');
+
+      if (action === 'start') {
+        const result = await pollSchedulerRunning();
+        if (!result.snapshot) {
+          setSchedulerSnapshot((current) => ({ ...current, enabled: true, running: false }));
+        }
+        showFeedback(
+          result.running ? 'Scheduler enabled and worker is running' : WORKER_NOT_RUNNING_MESSAGE,
+          result.running ? 'positive' : 'negative',
+        );
+      } else {
+        setSchedulerSnapshot((current) => ({
+          ...current,
+          enabled: false,
+          running: false,
+          nextScanDueAt: null,
+        }));
+        showFeedback('Scheduler disabled', 'positive');
+      }
+
       router.refresh();
     } catch {
       showFeedback('Network error updating scheduler', 'negative');
     } finally {
       setSchedulerBusy(false);
     }
-  }, [router, schedulerRunning, showFeedback]);
+  }, [pollSchedulerRunning, router, schedulerSnapshot.enabled, showFeedback]);
 
   if (unavailable) {
     return (
@@ -95,13 +263,23 @@ export function OperatorActions({ schedulerRunning }: { schedulerRunning: boolea
     );
   }
 
+  const schedulerStatusClass = schedulerSnapshot.running
+    ? 'positive'
+    : schedulerSnapshot.enabled
+      ? 'neutral'
+      : 'muted';
+  const schedulerStatusLabel = schedulerSnapshot.enabled
+    ? schedulerSnapshot.running
+      ? 'Scheduler enabled, worker running'
+      : 'Scheduler enabled, worker not running'
+    : 'Scheduler disabled';
+  const schedulerError = truncateSchedulerError(schedulerSnapshot.lastError);
+
   return (
     <div
       style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}
     >
-      <span className={`small ${schedulerRunning ? 'positive' : 'muted'}`}>
-        {schedulerRunning ? 'Scheduler online' : 'Scheduler idle'}
-      </span>
+      <span className={`small ${schedulerStatusClass}`}>{schedulerStatusLabel}</span>
       <button
         className="button"
         disabled={scanBusy}
@@ -110,20 +288,33 @@ export function OperatorActions({ schedulerRunning }: { schedulerRunning: boolea
       >
         {scanBusy ? 'Running...' : 'Run scan now'}
       </button>
-      <button
-        className="button"
-        disabled={schedulerBusy}
-        onClick={handleScheduler}
-        style={{ width: 'auto', padding: '8px 16px' }}
-      >
-        {schedulerBusy
-          ? schedulerRunning
-            ? 'Stopping...'
-            : 'Starting...'
-          : schedulerRunning
-            ? 'Stop scheduler'
-            : 'Start scheduler'}
-      </button>
+      <div style={{ display: 'grid', gap: 4 }}>
+        <button
+          className="button"
+          disabled={schedulerBusy}
+          onClick={handleScheduler}
+          style={{ width: 'auto', padding: '8px 16px' }}
+        >
+          {schedulerBusy
+            ? schedulerSnapshot.enabled
+              ? 'Stopping...'
+              : 'Starting...'
+            : schedulerSnapshot.enabled
+              ? 'Stop scheduler'
+              : 'Start scheduler'}
+        </button>
+        <div className="small muted" style={{ display: 'grid', gap: 2, lineHeight: 1.35 }}>
+          <span className={schedulerStatusClass}>
+            Scheduler enabled: {schedulerSnapshot.enabled ? 'yes' : 'no'} | Worker running:{' '}
+            {schedulerSnapshot.running ? 'yes' : 'no'}
+          </span>
+          <span>Next scan due: {formatTimestamp(schedulerSnapshot.nextScanDueAt)}</span>
+          <span>Last run started: {formatTimestamp(schedulerSnapshot.lastRunStartedAt)}</span>
+          <span title={schedulerSnapshot.lastError ?? undefined}>
+            Last scheduler error: {schedulerError}
+          </span>
+        </div>
+      </div>
       {feedback ? <span className={`small ${feedback.tone}`}>{feedback.message}</span> : null}
     </div>
   );

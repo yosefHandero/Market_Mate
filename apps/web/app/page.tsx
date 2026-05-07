@@ -89,7 +89,13 @@ export default async function HomePage() {
         </div>
 
         <div style={{ marginTop: 16 }}>
-          <OperatorActions schedulerRunning={healthResult.data?.scheduler_running ?? false} />
+          <OperatorActions
+            schedulerEnabled={healthResult.data?.scheduler_enabled ?? false}
+            schedulerRunning={healthResult.data?.scheduler_running ?? false}
+            nextScanDueAt={healthResult.data?.next_scan_due_at}
+            lastSchedulerRunStartedAt={healthResult.data?.last_scheduler_run_started_at}
+            lastSchedulerError={healthResult.data?.last_scheduler_error}
+          />
         </div>
       </section>
 
