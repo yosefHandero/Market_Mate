@@ -1,3 +1,4 @@
+import { DashboardStatusBanner } from '@/components/dashboard-status-banner';
 import { OperatorActions } from '@/components/operator-actions';
 import { TradingWorkspace } from '@/components/trading-workspace';
 
@@ -63,6 +64,12 @@ export default async function HomePage() {
           </div>
         ) : null}
 
+        <DashboardStatusBanner
+          health={healthResult.data}
+          automation={automationResult.data}
+          latestScan={latestScanResult.data}
+        />
+
         <div className="detail-panel small" style={{ marginTop: 16 }}>
           <div>
             <span className="muted">Latest scan:</span>{' '}
@@ -93,6 +100,7 @@ export default async function HomePage() {
         initialPaperPositions={paperLedgerResult.data ?? []}
         initialPaperSummary={paperLedgerSummaryResult.data}
         paperLedgerError={paperLedgerError || null}
+        automation={automationResult.data}
       />
     </main>
   );

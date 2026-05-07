@@ -11,7 +11,9 @@ import type { TradeReadiness } from '@/lib/readiness';
 const readiness: TradeReadiness = {
   score: 82,
   tone: 'high',
+  band: 'high',
   reason: 'Actionable: gates passed and data is fresh.',
+  reasons: ['Actionable: gates passed and data is fresh.'],
   action: 'preview',
   baseScore: 82,
   projection: 'stable',

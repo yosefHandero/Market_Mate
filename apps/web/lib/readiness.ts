@@ -7,6 +7,7 @@ import type {
 } from '@/lib/types';
 
 export type ReadinessTone = 'high' | 'watch' | 'low' | 'none';
+export type ReadinessBand = ReadinessTone;
 
 export type ReadinessFactorKey =
   | 'signal_confidence'
@@ -33,7 +34,9 @@ export type ReadinessFactor = {
 export type TradeReadiness = {
   score: number;
   tone: ReadinessTone;
+  band: ReadinessBand;
   reason: string;
+  reasons: string[];
   action: RecommendedAction | null;
   baseScore: number;
   factors: ReadinessFactor[];
@@ -43,15 +46,6 @@ export type TradeReadiness = {
 
 export type TradeReadinessOptions = {
   automation?: AutomationStatusResponse | null;
-};
-
-const WEIGHTS: Record<ReadinessFactorKey, number> = {
-  signal_confidence: 0.32,
-  actionability: 0.18,
-  gate_status: 0.16,
-  provider_health: 0.14,
-  freshness: 0.12,
-  risk_setup: 0.08,
 };
 
 function clamp(value: number, min: number, max: number): number {
@@ -72,6 +66,14 @@ function finitePositive(value: unknown): number | null {
 
 function providerNorm(status: string | null | undefined): string {
   return (status ?? '').trim().toLowerCase();
+}
+
+function isProviderCritical(status: string): boolean {
+  return status === 'critical' || status === 'error';
+}
+
+function isProviderOk(status: string): boolean {
+  return status === 'ok' || status === 'healthy';
 }
 
 function evidenceNorm(quality: string | null | undefined): string {
@@ -104,7 +106,7 @@ function badFreshnessEntries(
   flags: Record<string, string> | null | undefined,
 ): Array<[string, string]> {
   if (!flags) return [];
-  return Object.entries(flags).filter(([, value]) => value.trim().toLowerCase() !== 'ok');
+  return Object.entries(flags).filter(([, value]) => String(value).trim().toLowerCase() !== 'ok');
 }
 
 function firstBadFreshnessEntry(
@@ -123,11 +125,33 @@ function baseConfidence(result: ScanResult, decision: DecisionRow | null | undef
       finitePositive(result.score) ??
       finitePositive(result.raw_score) ??
       finitePositive(decision?.confidence) ??
-      finitePositive(decision?.raw_score) ??
       0,
     0,
     100,
   );
+}
+
+function baseConfidenceSource(
+  result: ScanResult,
+  decision: DecisionRow | null | undefined,
+): string {
+  if (finitePositive(result.calibrated_confidence) != null) return 'calibrated confidence';
+  if (finitePositive(result.score) != null) return 'score';
+  if (finitePositive(result.raw_score) != null) return 'raw score';
+  if (finitePositive(decision?.confidence) != null) return 'decision confidence';
+  return 'no positive confidence';
+}
+
+function finiteBarAge(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function isFreshData(
+  flags: Record<string, string> | null | undefined,
+  barAgeMinutes: number | null | undefined,
+): boolean {
+  const age = finiteBarAge(barAgeMinutes);
+  return age != null && age <= 30 && badFreshnessEntries(flags).length === 0;
 }
 
 /** Same geometry as `buildDryRunSetup` in paper-trading-loop (avoid circular import). */
@@ -161,7 +185,12 @@ function riskStructureValid(
   return target >= entry && stop <= entry;
 }
 
-function rewardRiskRatio(side: 'buy' | 'sell', entry: number, stop: number, target: number): number {
+function rewardRiskRatio(
+  side: 'buy' | 'sell',
+  entry: number,
+  stop: number,
+  target: number,
+): number {
   const riskPerUnit = Math.abs(entry - stop);
   const rewardPerUnit = Math.abs(target - entry);
   if (riskPerUnit <= 0) return 0;
@@ -194,7 +223,7 @@ function actionScore(action: RecommendedAction | null): ReadinessFactor {
     return {
       key: 'actionability',
       label: 'Actionability',
-      score: 92,
+      score: 100,
       reason: 'Paper preview or dry-run is selectable.',
     };
   }
@@ -202,40 +231,42 @@ function actionScore(action: RecommendedAction | null): ReadinessFactor {
     return {
       key: 'actionability',
       label: 'Actionability',
-      score: 58,
-      reason: 'Review/watch action requires operator judgment first.',
+      score: 65,
+      reason: 'Review/watch action caps readiness at 65.',
     };
   }
   if (action === 'blocked') {
     return {
       key: 'actionability',
       label: 'Actionability',
-      score: 26,
-      reason: 'Trade gate blocked paper action.',
+      score: 35,
+      reason: 'Blocked action caps readiness at 35.',
     };
   }
   if (action === 'ignore') {
     return {
       key: 'actionability',
       label: 'Actionability',
-      score: 22,
-      reason: 'Ignore means no paper action is currently recommended.',
+      score: 30,
+      reason: 'Ignore caps readiness at 30.',
     };
   }
   return {
     key: 'actionability',
     label: 'Actionability',
-    score: 35,
-    reason: 'Recommended action is missing.',
+    score: 40,
+    reason: 'Missing or unknown action caps readiness at 40.',
   };
 }
 
 function gateScore(result: ScanResult, decision: DecisionRow | null | undefined): ReadinessFactor {
-  if (result.gate_passed || decision?.gate_passed) {
+  const gateFailed = result.gate_passed === false || decision?.gate_passed === false;
+
+  if (!gateFailed && (result.gate_passed || decision?.gate_passed)) {
     return {
       key: 'gate_status',
       label: 'Gate status',
-      score: 90,
+      score: 100,
       reason: 'Configured trade gates passed.',
     };
   }
@@ -243,7 +274,7 @@ function gateScore(result: ScanResult, decision: DecisionRow | null | undefined)
     return {
       key: 'gate_status',
       label: 'Gate status',
-      score: 28,
+      score: 35,
       reason: 'Only the sample-size gate is blocking confidence.',
     };
   }
@@ -251,33 +282,33 @@ function gateScore(result: ScanResult, decision: DecisionRow | null | undefined)
     return {
       key: 'gate_status',
       label: 'Gate status',
-      score: 30,
+      score: 35,
       reason: 'Gate is not actionable while the signal is HOLD.',
     };
   }
-  if (result.gate_passed === false || decision?.gate_passed === false) {
+  if (gateFailed) {
     const failed = failedGateChecks(result)[0];
     return {
       key: 'gate_status',
       label: 'Gate status',
-      score: 16,
+      score: 35,
       reason: cleanGateMessage(result.gate_reason) ?? failed?.detail ?? 'One or more gates failed.',
     };
   }
   return {
     key: 'gate_status',
     label: 'Gate status',
-    score: 45,
+    score: 60,
     reason: 'Gate state is unavailable.',
   };
 }
 
 function providerScore(status: string): ReadinessFactor {
-  if (status === 'ok' || status === 'healthy') {
+  if (isProviderOk(status)) {
     return {
       key: 'provider_health',
       label: 'Provider health',
-      score: 90,
+      score: 100,
       reason: 'Provider status is OK.',
     };
   }
@@ -285,22 +316,22 @@ function providerScore(status: string): ReadinessFactor {
     return {
       key: 'provider_health',
       label: 'Provider health',
-      score: 60,
-      reason: 'Provider is degraded, but this is a penalty rather than a hard stop.',
+      score: 80,
+      reason: 'Provider is degraded, applying a penalty rather than a hard stop.',
     };
   }
-  if (status === 'critical' || status === 'error') {
+  if (isProviderCritical(status)) {
     return {
       key: 'provider_health',
       label: 'Provider health',
-      score: 12,
+      score: 40,
       reason: `Provider status is ${status}.`,
     };
   }
   return {
     key: 'provider_health',
     label: 'Provider health',
-    score: 48,
+    score: 60,
     reason: 'Provider status is unknown.',
   };
 }
@@ -310,37 +341,65 @@ function freshnessScore(
   barAgeMinutes: number | null | undefined,
 ): ReadinessFactor {
   const badEntries = badFreshnessEntries(flags);
-  const age = typeof barAgeMinutes === 'number' && Number.isFinite(barAgeMinutes)
-    ? barAgeMinutes
-    : null;
-  let score = 92;
+  const age = finiteBarAge(barAgeMinutes);
+  let score = 100;
   const reasons: string[] = [];
 
-  if (age != null) {
-    if (age > 360) {
-      score = Math.min(score, 5);
-      reasons.push(`bars ${Math.round(age)}m old`);
-    } else if (age > 120) {
-      score = Math.min(score, 22);
-      reasons.push(`bars ${Math.round(age)}m old`);
-    } else if (age > 30) {
-      score = Math.min(score, 55);
-      reasons.push(`bars ${Math.round(age)}m old`);
-    }
+  if (badEntries.length) {
+    const penalty = Math.min(badEntries.length * 5, 15);
+    score -= penalty;
+    const [key, value] = badEntries[0];
+    reasons.push(`${badEntries.length} freshness flag${badEntries.length === 1 ? '' : 's'}`);
+    reasons.push(`${humanizeKey(key)}: ${value}`);
   }
 
-  if (badEntries.length) {
-    score = Math.max(5, score - badEntries.length * 18);
-    const [key, value] = badEntries[0];
-    reasons.push(`${humanizeKey(key)}: ${value}`);
+  if (age != null) {
+    if (age > 30) {
+      score -= 10;
+      reasons.push(`bars ${Math.round(age)}m old`);
+    }
+    if (age > 120) {
+      score = Math.min(score, 30);
+    }
+    if (age > 1440) {
+      score = Math.min(score, 10);
+    }
+  } else {
+    reasons.push('Bar age is unavailable.');
   }
 
   return {
     key: 'freshness',
     label: 'Freshness',
-    score,
+    score: clamp(score, 0, 100),
     reason: reasons.length ? reasons.join(' | ') : 'Data freshness is OK.',
   };
+}
+
+function riskPenalty(result: ScanResult): { penalty: number; reason: string | null } {
+  if (!isUsablePrice(result.price) || !isKnownSignal(result.decision_signal)) {
+    return {
+      penalty: 12,
+      reason: 'Risk setup structure is incomplete.',
+    };
+  }
+
+  const { entry, stop, target, side } = dryRunPrices(result);
+  if (!riskStructureValid(side, entry, stop, target)) {
+    return {
+      penalty: 12,
+      reason: 'Derived stop/target structure is not valid.',
+    };
+  }
+
+  if (rewardRiskRatio(side, entry, stop, target) < 1) {
+    return {
+      penalty: 4,
+      reason: 'Reward/risk is below 1:1.',
+    };
+  }
+
+  return { penalty: 0, reason: null };
 }
 
 function riskScore(result: ScanResult): ReadinessFactor {
@@ -359,7 +418,7 @@ function riskScore(result: ScanResult): ReadinessFactor {
     return {
       key: 'risk_setup',
       label: 'Risk setup',
-      score: 30,
+      score: 88,
       reason: 'Derived stop/target structure is not valid.',
     };
   }
@@ -369,7 +428,7 @@ function riskScore(result: ScanResult): ReadinessFactor {
     return {
       key: 'risk_setup',
       label: 'Risk setup',
-      score: 68,
+      score: 96,
       reason: 'Reward/risk is below 1:1.',
     };
   }
@@ -377,19 +436,48 @@ function riskScore(result: ScanResult): ReadinessFactor {
   return {
     key: 'risk_setup',
     label: 'Risk setup',
-    score: 88,
+    score: 100,
     reason: 'Derived paper risk structure is usable.',
   };
 }
 
-function signalFactor(baseScore: number, result: ScanResult): ReadinessFactor {
+function evidencePenalty(
+  result: ScanResult,
+  decision: DecisionRow | null | undefined,
+): {
+  penalty: number;
+  reasons: string[];
+} {
   const eq = evidenceNorm(result.evidence_quality);
-  let score = baseScore;
-  if (eq === 'low') score = Math.max(0, score - 8);
-  else if (eq === 'moderate') score = Math.max(0, score - 3);
-  if ((result.evidence_quality_reasons?.length ?? 0) > 2) {
-    score = Math.max(0, score - 4);
+  const qualityReasons = result.evidence_quality_reasons?.length
+    ? result.evidence_quality_reasons
+    : (decision?.evidence_quality_reasons ?? []);
+  let penalty = 0;
+  const reasons: string[] = [];
+
+  if (eq === 'low') {
+    penalty += 8;
+    reasons.push('Low evidence quality subtracts 8.');
+  } else if (eq === 'moderate') {
+    penalty += 2;
+    reasons.push('Moderate evidence quality subtracts 2.');
   }
+  if (qualityReasons.length > 2) {
+    penalty += 4;
+    reasons.push('More than two evidence reasons subtracts 4.');
+  }
+
+  return { penalty, reasons };
+}
+
+function signalFactor(
+  baseScore: number,
+  result: ScanResult,
+  decision: DecisionRow | null | undefined,
+): ReadinessFactor {
+  const evidence = evidencePenalty(result, decision);
+  const score = Math.max(0, baseScore - evidence.penalty);
+  const source = baseConfidenceSource(result, decision);
 
   return {
     key: 'signal_confidence',
@@ -397,7 +485,7 @@ function signalFactor(baseScore: number, result: ScanResult): ReadinessFactor {
     score,
     reason:
       baseScore > 0
-        ? `Base confidence ${Math.round(baseScore)} from scanner evidence.`
+        ? `Base confidence ${Math.round(baseScore)} from ${source}.`
         : 'No positive confidence value was available.',
   };
 }
@@ -417,13 +505,8 @@ function hardStopReason(
   if (!isUsablePrice(result.price)) {
     return 'Hard stop: missing or invalid trigger price.';
   }
-  if (!isKnownSignal(result.decision_signal)) {
-    return 'Hard stop: signal is unknown.';
-  }
-  const age = typeof barAgeMinutes === 'number' && Number.isFinite(barAgeMinutes)
-    ? barAgeMinutes
-    : null;
-  if ((provider === 'critical' || provider === 'error') && age != null && age > 360) {
+  const age = finiteBarAge(barAgeMinutes);
+  if (isProviderCritical(provider) && age != null && age > 360) {
     return 'Hard stop: provider is critical and bars are stale over 6 hours.';
   }
   return null;
@@ -463,7 +546,7 @@ function pickReadinessReason(
     return 'Watch only: review pending.';
   }
 
-  if (provider === 'critical' || provider === 'error') {
+  if (isProviderCritical(provider)) {
     return `Low trust: provider ${provider}.`;
   }
   if (provider === 'degraded') {
@@ -504,7 +587,7 @@ function pickProjection({
   if (isSampleSizeOnlyBlocked(result)) {
     return 'blocked_until_sample_size';
   }
-  if (provider === 'degraded' || provider === 'critical' || provider === 'error' || freshness.score < 60) {
+  if (provider === 'degraded' || isProviderCritical(provider) || freshness.score < 60) {
     return 'decaying';
   }
   if (action === 'review' || action === 'blocked') {
@@ -520,34 +603,33 @@ function applyFloors({
   score,
   result,
   provider,
-  freshness,
   action,
+  flags,
+  barAge,
 }: {
   score: number;
   result: ScanResult;
   provider: string;
-  freshness: ReadinessFactor;
   action: RecommendedAction | null;
+  flags: Record<string, string> | null | undefined;
+  barAge: number | null | undefined;
 }): number {
   let floored = score;
-  const nonCriticalProvider = provider !== 'critical' && provider !== 'error';
+  const nonCriticalProvider = !isProviderCritical(provider);
+  const fresh = isFreshData(flags, barAge);
 
-  if (isUsablePrice(result.price) && isKnownSignal(result.decision_signal) && nonCriticalProvider) {
+  if (isUsablePrice(result.price) && nonCriticalProvider) {
     floored = Math.max(floored, 8);
   }
 
-  if (
-    isSampleSizeOnlyBlocked(result) &&
-    freshness.score >= 75 &&
-    (provider === 'ok' || provider === 'healthy')
-  ) {
+  if (isSampleSizeOnlyBlocked(result) && fresh && isProviderOk(provider)) {
     floored = Math.max(floored, 15);
   }
 
   if (
     (result.decision_signal === 'HOLD' || action === 'ignore') &&
-    freshness.score >= 75 &&
-    (provider === 'ok' || provider === 'healthy')
+    fresh &&
+    isProviderOk(provider)
   ) {
     floored = Math.max(floored, 12);
   }
@@ -562,8 +644,8 @@ export function formatReadiness(score: number): string {
 export function readinessTone(score: number): ReadinessTone {
   const s = roundedScore(score);
   if (s >= 70) return 'high';
-  if (s >= 40) return 'watch';
-  if (s >= 15) return 'low';
+  if (s >= 50) return 'watch';
+  if (s >= 25) return 'low';
   return 'none';
 }
 
@@ -586,7 +668,7 @@ export function computeTradeReadiness(
   const barAge = result.bar_age_minutes ?? decision?.bar_age_minutes ?? null;
   const hardStop = hardStopReason(result, provider, barAge, options?.automation);
 
-  const signal = signalFactor(baseScore, result);
+  const signal = signalFactor(baseScore, result, decision);
   const actionability = actionScore(action);
   const gate = gateScore(result, decision);
   const providerHealth = providerScore(provider);
@@ -594,23 +676,85 @@ export function computeTradeReadiness(
   const risk = riskScore(result);
   const factors: ReadinessFactor[] = [signal, actionability, gate, providerHealth, freshness, risk];
 
-  let score = factors.reduce((sum, factor) => sum + factor.score * WEIGHTS[factor.key], 0);
-  score = Math.min(score, actionCap(action));
-  if (provider === 'degraded') {
-    score = Math.min(score, 80);
-  } else if (provider === 'critical' || provider === 'error') {
-    score = Math.min(score, 38);
+  let score = baseScore;
+  const reasons: string[] = [];
+  const cap = actionCap(action);
+
+  if (score > cap) {
+    reasons.push(`Action cap limited readiness to ${cap}.`);
   }
-  if (freshness.score < 30) {
+  score = Math.min(score, cap);
+
+  const sampleSizeOnly = isSampleSizeOnlyBlocked(result);
+  const gateFailed = result.gate_passed === false || decision?.gate_passed === false;
+  if (gateFailed && !sampleSizeOnly) {
+    score *= 0.6;
+    score = Math.min(score, 35);
+    reasons.push('Non-sample-size gate failure applied a 0.6 multiplier and 35 cap.');
+  }
+
+  if (isProviderCritical(provider)) {
+    score *= 0.4;
+    reasons.push(`Provider ${provider || 'critical'} applied a 0.4 multiplier.`);
+  } else if (provider === 'degraded') {
+    score *= 0.8;
+    reasons.push('Provider degraded applied a 0.8 multiplier.');
+  }
+
+  const badFreshness = badFreshnessEntries(result.freshness_flags ?? decision?.freshness_flags);
+  if (badFreshness.length) {
+    const freshnessPenalty = Math.min(badFreshness.length * 5, 15);
+    score -= freshnessPenalty;
+    reasons.push(
+      `${badFreshness.length} freshness flag${badFreshness.length === 1 ? '' : 's'} subtracted ${freshnessPenalty}.`,
+    );
+  }
+
+  const finiteAge = finiteBarAge(barAge);
+  if (finiteAge != null && finiteAge > 30) {
+    score -= 10;
+    reasons.push(`Bars ${Math.round(finiteAge)}m old subtracted 10.`);
+  }
+  if (finiteAge != null && finiteAge > 120) {
     score = Math.min(score, 30);
+    reasons.push('Bars older than 120m capped readiness at 30.');
   }
-  score = applyFloors({ score, result, provider, freshness, action });
+  if (finiteAge != null && finiteAge > 1440) {
+    score = Math.min(score, 10);
+    reasons.push('Bars older than 24h capped readiness at 10.');
+  }
+
+  const evidence = evidencePenalty(result, decision);
+  if (evidence.penalty > 0) {
+    score -= evidence.penalty;
+    reasons.push(...evidence.reasons);
+  }
+
+  const riskImpact = riskPenalty(result);
+  if (riskImpact.penalty > 0) {
+    score -= riskImpact.penalty;
+    if (riskImpact.reason) reasons.push(`${riskImpact.reason} Subtracted ${riskImpact.penalty}.`);
+  }
+
+  score = clamp(score, 0, 100);
+  score = applyFloors({
+    score,
+    result,
+    provider,
+    action,
+    flags: result.freshness_flags ?? decision?.freshness_flags,
+    barAge,
+  });
+  score = Math.min(score, cap);
 
   if (hardStop) {
     score = 0;
   }
 
   score = roundedScore(score);
+  const tone = readinessTone(score);
+  const primaryReason = pickReadinessReason(result, decision, hardStop);
+  const allReasons = Array.from(new Set([primaryReason, ...reasons]));
   const projection = pickProjection({
     result,
     action,
@@ -622,8 +766,10 @@ export function computeTradeReadiness(
 
   return {
     score,
-    tone: readinessTone(score),
-    reason: pickReadinessReason(result, decision, hardStop),
+    tone,
+    band: tone,
+    reason: primaryReason,
+    reasons: allReasons,
     action,
     baseScore: roundedScore(baseScore),
     factors: factors.map((factor) => ({ ...factor, score: roundedScore(factor.score) })),

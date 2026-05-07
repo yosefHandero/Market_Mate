@@ -102,9 +102,11 @@ describe('readiness helpers', () => {
   it('maps tone to buckets', () => {
     expect(readinessTone(90)).toBe('high');
     expect(readinessTone(70)).toBe('high');
-    expect(readinessTone(45)).toBe('watch');
-    expect(readinessTone(15)).toBe('low');
-    expect(readinessTone(10)).toBe('none');
+    expect(readinessTone(69)).toBe('watch');
+    expect(readinessTone(50)).toBe('watch');
+    expect(readinessTone(49)).toBe('low');
+    expect(readinessTone(25)).toBe('low');
+    expect(readinessTone(24)).toBe('none');
   });
 
   it('produces high readiness for eligible fresh provider-ok preview row', () => {
@@ -115,6 +117,12 @@ describe('readiness helpers', () => {
   });
 
   it('falls back from calibrated confidence to score, raw score, and decision confidence', () => {
+    const scoreFallback = computeTradeReadiness(
+      baseScan({ calibrated_confidence: 0, score: 68 }),
+      sampleDecision(),
+    );
+    expect(scoreFallback.baseScore).toBe(68);
+    expect(scoreFallback.score).toBeGreaterThanOrEqual(60);
     expect(
       computeTradeReadiness(
         baseScan({ calibrated_confidence: 0, score: 61, raw_score: 74 }),
@@ -143,9 +151,12 @@ describe('readiness helpers', () => {
     expect(r.score).toBeLessThanOrEqual(65);
     expect(r.score).toBeGreaterThanOrEqual(40);
     expect(r.tone).toBe('watch');
-    expect(explainTradeReadiness(baseScan({ recommended_action: 'review' }), sampleDecision({ recommended_action: 'review' }))).toContain(
-      'Watch only',
-    );
+    expect(
+      explainTradeReadiness(
+        baseScan({ recommended_action: 'review' }),
+        sampleDecision({ recommended_action: 'review' }),
+      ),
+    ).toContain('Watch only');
   });
 
   it('produces low readiness for blocked row with gate reason', () => {
@@ -154,7 +165,11 @@ describe('readiness helpers', () => {
       gate_passed: false,
       gate_reason: 'Blocked by sample_size: need 20.',
       gate_checks: [
-        { name: 'sample_size', passed: false, detail: 'stock BUY bucket has 4 1h outcomes; need 20.' },
+        {
+          name: 'sample_size',
+          passed: false,
+          detail: 'stock BUY bucket has 4 1h outcomes; need 20.',
+        },
       ],
     });
     const r = computeTradeReadiness(scan, sampleDecision({ recommended_action: 'blocked' }));
@@ -171,19 +186,23 @@ describe('readiness helpers', () => {
       recommended_action: 'ignore',
       calibrated_confidence: 90,
     });
-    const r = computeTradeReadiness(scan, sampleDecision({ signal: 'HOLD', recommended_action: 'ignore' }));
+    const r = computeTradeReadiness(
+      scan,
+      sampleDecision({ signal: 'HOLD', recommended_action: 'ignore' }),
+    );
     expect(r.score).toBeGreaterThanOrEqual(10);
     expect(r.score).toBeLessThanOrEqual(30);
     expect(r.reason).toContain('HOLD');
   });
 
   it('penalizes provider degraded without automatically zeroing readiness', () => {
+    const healthy = computeTradeReadiness(baseScan(), sampleDecision());
     const r = computeTradeReadiness(
       baseScan({ provider_status: 'degraded' }),
       sampleDecision({ provider_status: 'degraded' }),
     );
-    expect(r.score).toBeGreaterThanOrEqual(55);
-    expect(r.score).toBeLessThanOrEqual(80);
+    expect(r.score).toBeGreaterThan(0);
+    expect(r.score).toBeLessThan(healthy.score);
     expect(r.projection).toBe('decaying');
   });
 
@@ -210,6 +229,11 @@ describe('readiness helpers', () => {
     expect(r.hardStop).toBe(true);
   });
 
+  it('hard-stops a missing or invalid price', () => {
+    expect(computeTradeReadiness(baseScan({ price: 0 }), sampleDecision()).score).toBe(0);
+    expect(computeTradeReadiness(baseScan({ price: Number.NaN }), sampleDecision()).score).toBe(0);
+  });
+
   it('returns required factors and a projection', () => {
     const r = computeTradeReadiness(baseScan(), sampleDecision());
     expect(r.factors.map((factor) => factor.key)).toEqual([
@@ -220,6 +244,8 @@ describe('readiness helpers', () => {
       'freshness',
       'risk_setup',
     ]);
+    expect(r.band).toBe(r.tone);
+    expect(r.reasons.length).toBeGreaterThan(0);
     expect(r.projection).toBe('stable');
   });
 

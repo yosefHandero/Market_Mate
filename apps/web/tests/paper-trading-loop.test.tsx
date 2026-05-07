@@ -256,7 +256,7 @@ describe('PaperTradingLoop', () => {
       }),
     );
 
-    expect(screen.getByText('90%')).toBeInTheDocument();
+    expect(screen.getByText('88%')).toBeInTheDocument();
     expect(screen.getByText('preview', { selector: 'strong' })).toBeInTheDocument();
     expect(screen.getByText(/Actionable: gates passed/)).toBeInTheDocument();
 
