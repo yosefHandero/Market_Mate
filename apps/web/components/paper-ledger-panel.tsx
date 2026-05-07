@@ -1,10 +1,18 @@
 'use client';
 
+import { useState } from 'react';
+import { reconcilePaperLedger } from '@/lib/api';
 import type { PaperLedgerSummary, PaperPositionSummary } from '@/lib/types';
 
+function safeNumber(value: number | null | undefined): number | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  return Object.is(value, -0) ? 0 : value;
+}
+
 function formatCurrency(value: number | null | undefined) {
-  if (value == null || Number.isNaN(value)) return '--';
-  return value.toLocaleString(undefined, {
+  const safeValue = safeNumber(value);
+  if (safeValue == null) return '--';
+  return safeValue.toLocaleString(undefined, {
     style: 'currency',
     currency: 'USD',
     minimumFractionDigits: 2,
@@ -13,11 +21,24 @@ function formatCurrency(value: number | null | undefined) {
 }
 
 function formatQuantity(value: number | null | undefined) {
-  if (value == null || Number.isNaN(value)) return '--';
-  return value.toLocaleString(undefined, {
+  const safeValue = safeNumber(value);
+  if (safeValue == null) return '--';
+  return safeValue.toLocaleString(undefined, {
     minimumFractionDigits: 0,
     maximumFractionDigits: 6,
   });
+}
+
+function formatPercent(value: number | null | undefined) {
+  const safeValue = safeNumber(value);
+  if (safeValue == null) return '--';
+  return `${safeValue.toFixed(2)}%`;
+}
+
+function formatCount(value: number | null | undefined, fallback: number) {
+  const safeValue = safeNumber(value);
+  if (safeValue == null) return String(fallback);
+  return String(Math.max(0, Math.round(safeValue)));
 }
 
 function formatTimestamp(value: string | null | undefined) {
@@ -102,7 +123,9 @@ function PositionTable({
                     <td className={pnl == null ? 'muted' : pnl >= 0 ? 'positive' : 'negative'}>
                       {pnl == null ? 'unsupported' : formatCurrency(pnl)}
                     </td>
-                    <td>{position.execution_audit_id ? `#${position.execution_audit_id}` : '--'}</td>
+                    <td>
+                      {position.execution_audit_id ? `#${position.execution_audit_id}` : '--'}
+                    </td>
                     <td>
                       <span className="muted small">{formatTimestamp(position.opened_at)}</span>
                     </td>
@@ -140,10 +163,25 @@ export function PaperLedgerPanel({
 }) {
   const openPositions = positions.filter((position) => position.status === 'open');
   const closedPositions = positions.filter((position) => position.status === 'closed');
+  const [reconciling, setReconciling] = useState(false);
+  const [reconcileStatus, setReconcileStatus] = useState<string | null>(null);
   const estimatedUnrealized = openPositions.reduce((sum, position) => {
     const pnl = estimateUnrealizedPnl(position, latestPrices);
     return pnl == null ? sum : sum + pnl;
   }, 0);
+
+  const runReconcile = async () => {
+    setReconciling(true);
+    setReconcileStatus(null);
+    try {
+      const report = await reconcilePaperLedger();
+      setReconcileStatus(report.ok ? 'ok' : `issues: ${report.total_issues}`);
+    } catch {
+      setReconcileStatus('issues: 1');
+    } finally {
+      setReconciling(false);
+    }
+  };
 
   return (
     <section id="paper-ledger" className="card">
@@ -154,15 +192,31 @@ export function PaperLedgerPanel({
             Dry-run positions and outcomes from the scanner execution audit trail.
           </p>
         </div>
-        <button
-          type="button"
-          className="button"
-          onClick={onRefresh}
-          disabled={refreshing}
-          style={{ width: 'auto', padding: '8px 14px', alignSelf: 'start' }}
-        >
-          {refreshing ? 'Refreshing...' : 'Refresh ledger'}
-        </button>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'start', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            className="button"
+            onClick={runReconcile}
+            disabled={reconciling}
+            style={{ width: 'auto', padding: '8px 14px' }}
+          >
+            {reconciling ? 'Reconciling...' : 'Reconcile now'}
+          </button>
+          <button
+            type="button"
+            className="button"
+            onClick={onRefresh}
+            disabled={refreshing}
+            style={{ width: 'auto', padding: '8px 14px' }}
+          >
+            {refreshing ? 'Refreshing...' : 'Refresh ledger'}
+          </button>
+          {reconcileStatus ? (
+            <span className="badge" aria-live="polite">
+              {reconcileStatus}
+            </span>
+          ) : null}
+        </div>
       </div>
 
       {errorMessage ? (
@@ -174,19 +228,18 @@ export function PaperLedgerPanel({
       <div className="detail-panel small" style={{ marginTop: 16 }}>
         <div>
           <span className="muted">Total trades:</span>{' '}
-          {summary?.total_count ?? positions.length}
+          {formatCount(summary?.total_count, positions.length)}
         </div>
         <div>
-          <span className="muted">Win rate:</span>{' '}
-          {summary?.win_rate_pct == null ? '--' : `${summary.win_rate_pct.toFixed(2)}%`}
+          <span className="muted">Win rate:</span> {formatPercent(summary?.win_rate_pct)}
         </div>
         <div>
           <span className="muted">Open positions:</span>{' '}
-          {summary?.open_positions ?? openPositions.length}
+          {formatCount(summary?.open_positions, openPositions.length)}
         </div>
         <div>
           <span className="muted">Closed positions:</span>{' '}
-          {summary?.closed_positions ?? closedPositions.length}
+          {formatCount(summary?.closed_positions, closedPositions.length)}
         </div>
         <div>
           <span className="muted">Total paper notional:</span>{' '}
@@ -197,8 +250,7 @@ export function PaperLedgerPanel({
           {formatCurrency(summary?.total_realized_pnl ?? null)}
         </div>
         <div>
-          <span className="muted">Gross P/L:</span>{' '}
-          {formatCurrency(summary?.gross_pnl_usd ?? null)}
+          <span className="muted">Gross P/L:</span> {formatCurrency(summary?.gross_pnl_usd ?? null)}
         </div>
         <div>
           <span className="muted">Max drawdown:</span>{' '}

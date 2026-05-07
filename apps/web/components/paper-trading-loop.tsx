@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { ReadinessPopover, readinessProjectionText } from '@/components/readiness-popover';
+import { createJournalEntry } from '@/lib/api';
 import { buildCoinbaseLink } from '@/lib/coinbase-link';
 import { computeTradeReadiness } from '@/lib/readiness';
 import { placeOrder, previewOrder } from '@/lib/trading-desk';
@@ -110,11 +111,7 @@ function disabledPreviewContext({
   }
 
   const providerStatus = result.provider_status || decision?.provider_status;
-  if (
-    providerStatus &&
-    providerStatus !== 'ok' &&
-    providerStatus !== 'unknown'
-  ) {
+  if (providerStatus && providerStatus !== 'ok' && providerStatus !== 'unknown') {
     const warnings = result.provider_warnings.length
       ? ` (${result.provider_warnings.map(humanizeKey).join(', ')})`
       : '';
@@ -156,8 +153,13 @@ export function PaperTradingLoop({
   const [preview, setPreview] = useState<OrderPreviewResponse | null>(null);
   const [receipt, setReceipt] = useState<OrderPlaceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [journalMessage, setJournalMessage] = useState<{
+    tone: 'positive' | 'negative';
+    message: string;
+  } | null>(null);
   const [busy, setBusy] = useState<'preview' | 'place' | null>(null);
   const [orderKey, setOrderKey] = useState<string | null>(null);
+  const [takeNote, setTakeNote] = useState('');
 
   const setup = useMemo(
     () => (selectedResult ? buildDryRunSetup(selectedResult) : null),
@@ -187,13 +189,16 @@ export function PaperTradingLoop({
     setPreview(null);
     setReceipt(null);
     setError(null);
+    setJournalMessage(null);
     setOrderKey(null);
+    setTakeNote('');
   }, [selectedResult?.asset_type, selectedResult?.decision_signal, selectedResult?.ticker]);
 
   const runPreview = async () => {
     if (!setup || !previewEnabled) return;
     setBusy('preview');
     setError(null);
+    setJournalMessage(null);
     setReceipt(null);
     setPreview(null);
     setOrderKey(null);
@@ -220,6 +225,7 @@ export function PaperTradingLoop({
     if (!setup || !preview || !orderKey || !placeEnabled) return;
     setBusy('place');
     setError(null);
+    setJournalMessage(null);
 
     try {
       const result = await placeOrder({
@@ -238,6 +244,28 @@ export function PaperTradingLoop({
       setReceipt(result);
       if (!duplicateReceipt) {
         await onPaperOrderPlaced(result.execution_audit_id ?? null);
+        const note = takeNote.trim();
+        if (note && selectedResult) {
+          try {
+            await createJournalEntry({
+              ticker: selectedResult.ticker,
+              run_id: null,
+              decision: 'took',
+              entry_price: result.fill_price ?? setup.entry_price ?? preview.entry_price,
+              exit_price: null,
+              pnl_pct: null,
+              notes: note,
+              signal_label: selectedResult.signal_label || null,
+              score: Number.isFinite(selectedResult.score) ? selectedResult.score : null,
+              news_source: selectedResult.news_source || null,
+              override_reason: note,
+              action_state: 'took',
+            });
+            setJournalMessage({ tone: 'positive', message: 'Journal note saved.' });
+          } catch {
+            setJournalMessage({ tone: 'negative', message: 'Journal note was not saved.' });
+          }
+        }
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Dry-run placement failed.');
@@ -254,7 +282,9 @@ export function PaperTradingLoop({
     return (
       <section className="card">
         <h2 style={{ marginBottom: 8 }}>Paper Trading Loop</h2>
-        <p className="muted" style={{ margin: 0 }}>Select a ranked opportunity to begin.</p>
+        <p className="muted" style={{ margin: 0 }}>
+          Select a ranked opportunity to begin.
+        </p>
       </section>
     );
   }
@@ -280,8 +310,7 @@ export function PaperTradingLoop({
             <ReadinessPopover readiness={tradeReadiness} showLabel={false} />
           </div>
           <div className="muted small" style={{ marginTop: 10 }}>
-            <span className="muted">Action:</span>{' '}
-            <strong>{recommendedAction ?? 'none'}</strong>
+            <span className="muted">Action:</span> <strong>{recommendedAction ?? 'none'}</strong>
           </div>
           <div className="muted small" style={{ marginTop: 6 }}>
             <span className="muted">Reason:</span> {tradeReadiness.reason}
@@ -320,12 +349,7 @@ export function PaperTradingLoop({
           {busy === 'place' ? 'Placing...' : 'Place dry run'}
         </button>
         {coinbaseLink?.available && coinbaseLink.href ? (
-          <a
-            className="button"
-            href={coinbaseLink.href}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
+          <a className="button" href={coinbaseLink.href} target="_blank" rel="noopener noreferrer">
             {coinbaseLink.label}
           </a>
         ) : (
@@ -338,6 +362,23 @@ export function PaperTradingLoop({
         Manual navigation only. The app does not place orders on Coinbase.
       </p>
 
+      {selectableAction(recommendedAction) ? (
+        <div style={{ marginTop: 16 }}>
+          <label className="form-label" htmlFor="paper-take-note">
+            Why I took this (optional)
+          </label>
+          <textarea
+            id="paper-take-note"
+            className="textarea"
+            rows={3}
+            value={takeNote}
+            onChange={(event) => setTakeNote(event.target.value)}
+            placeholder="Quick note for the journal..."
+            maxLength={2000}
+          />
+        </div>
+      ) : null}
+
       {!selectableAction(recommendedAction) ? (
         <div className="detail-panel small" style={{ marginTop: 16 }}>
           <div className="negative">{disabledContext?.headline}</div>
@@ -349,6 +390,9 @@ export function PaperTradingLoop({
         </div>
       ) : null}
       {error ? <p className="negative small">{error}</p> : null}
+      {journalMessage ? (
+        <p className={`${journalMessage.tone} small`}>{journalMessage.message}</p>
+      ) : null}
 
       {preview ? (
         <div className="opportunity-item-metrics" style={{ marginTop: 16 }}>
@@ -359,16 +403,13 @@ export function PaperTradingLoop({
             <span className="muted">Freshness:</span> {preview.freshness ?? 'unknown'}
           </div>
           <div>
-            <span className="muted">Est. P/L:</span>{' '}
-            {formatCurrency(preview.estimated_pnl_usd)}
+            <span className="muted">Est. P/L:</span> {formatCurrency(preview.estimated_pnl_usd)}
           </div>
           <div>
             <span className="muted">Audit:</span> {preview.execution_audit_id ?? '--'}
           </div>
           {preview.reject_reasons.length ? (
-            <div className="negative">
-              Reject reasons: {preview.reject_reasons.join(' | ')}
-            </div>
+            <div className="negative">Reject reasons: {preview.reject_reasons.join(' | ')}</div>
           ) : null}
         </div>
       ) : null}

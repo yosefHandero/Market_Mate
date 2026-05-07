@@ -152,3 +152,16 @@ export async function getReconciliationReport(): Promise<ApiResult<Reconciliatio
     };
   }
 }
+
+export async function reconcilePaperLedger(): Promise<ReconciliationReportResponse> {
+  const res = await fetch('/api/paper/reconcile', {
+    method: 'POST',
+    cache: 'no-store',
+  });
+
+  if (!res.ok) {
+    throw new Error(await readErrorMessage(res));
+  }
+
+  return (await res.json()) as ReconciliationReportResponse;
+}

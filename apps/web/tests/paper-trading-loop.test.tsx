@@ -147,6 +147,29 @@ function orderPlaceResponse(overrides: Record<string, unknown> = {}) {
   );
 }
 
+function journalEntryResponse(overrides: Record<string, unknown> = {}) {
+  return new Response(
+    JSON.stringify({
+      id: 99,
+      ticker: 'AAPL',
+      run_id: null,
+      decision: 'took',
+      entry_price: 100,
+      exit_price: null,
+      pnl_pct: null,
+      notes: 'Thesis held after preview.',
+      created_at: '2026-04-22T18:05:00.000Z',
+      signal_label: 'aggressive',
+      score: 72,
+      news_source: 'marketaux',
+      override_reason: 'Thesis held after preview.',
+      action_state: 'took',
+      ...overrides,
+    }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  );
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -235,7 +258,9 @@ describe('PaperTradingLoop', () => {
     expect(screen.getByText(/Low actionability: HOLD signal/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Place dry run' })).toBeDisabled();
-    expect(screen.getByText('Reason: HOLD signal has no paper-trading action.')).toBeInTheDocument();
+    expect(
+      screen.getByText('Reason: HOLD signal has no paper-trading action.'),
+    ).toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -281,6 +306,82 @@ describe('PaperTradingLoop', () => {
     );
     expect(JSON.parse(String(placeInit?.body))).toEqual(
       expect.objectContaining({ recommended_action_snapshot: 'preview' }),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('posts an optional journal note after a successful dry-run place', async () => {
+    const user = userEvent.setup();
+    const onPaperOrderPlaced = vi.fn();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(orderPreviewResponse())
+      .mockResolvedValueOnce(orderPlaceResponse())
+      .mockResolvedValueOnce(journalEntryResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      React.createElement(PaperTradingLoop, {
+        selectedResult: sampleResult(),
+        selectedDecision: sampleDecision(),
+        onPaperOrderPlaced,
+      }),
+    );
+
+    await user.type(screen.getByLabelText(/Why I took this/), 'Thesis held after preview.');
+    await user.click(screen.getByRole('button', { name: 'Preview' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Place dry run' })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole('button', { name: 'Place dry run' }));
+
+    expect(await screen.findByText('Journal note saved.')).toBeInTheDocument();
+    const journalCall = fetchMock.mock.calls.find(
+      ([url]) => String(url) === '/api/journal/entries',
+    );
+    expect(journalCall).toBeTruthy();
+    expect(JSON.parse(String(journalCall?.[1]?.body))).toEqual(
+      expect.objectContaining({
+        ticker: 'AAPL',
+        decision: 'took',
+        entry_price: 100,
+        notes: 'Thesis held after preview.',
+        signal_label: 'aggressive',
+        score: 72,
+        news_source: 'marketaux',
+        override_reason: 'Thesis held after preview.',
+        action_state: 'took',
+      }),
+    );
+    expect(onPaperOrderPlaced).toHaveBeenCalledWith(44);
+  });
+
+  it('skips journal creation when the optional note is blank', async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(orderPreviewResponse())
+      .mockResolvedValueOnce(orderPlaceResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      React.createElement(PaperTradingLoop, {
+        selectedResult: sampleResult(),
+        selectedDecision: sampleDecision(),
+        onPaperOrderPlaced: vi.fn(),
+      }),
+    );
+
+    await user.type(screen.getByLabelText(/Why I took this/), '   ');
+    await user.click(screen.getByRole('button', { name: 'Preview' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Place dry run' })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole('button', { name: 'Place dry run' }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/api/journal/entries')).toBe(
+      false,
     );
   });
 
@@ -344,7 +445,9 @@ describe('PaperTradingLoop', () => {
     );
 
     await user.click(screen.getByRole('button', { name: 'Preview' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Place dry run' })).toBeEnabled());
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Place dry run' })).toBeEnabled(),
+    );
     await user.click(screen.getByRole('button', { name: 'Place dry run' }));
 
     rerender(
@@ -358,7 +461,9 @@ describe('PaperTradingLoop', () => {
     currentNow = 2000;
     await waitFor(() => expect(screen.getByText('TSLA')).toBeInTheDocument());
     await user.click(screen.getByRole('button', { name: 'Preview' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Place dry run' })).toBeEnabled());
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Place dry run' })).toBeEnabled(),
+    );
     await user.click(screen.getByRole('button', { name: 'Place dry run' }));
 
     const firstPlaceHeaders = new Headers(fetchMock.mock.calls[1][1]?.headers);

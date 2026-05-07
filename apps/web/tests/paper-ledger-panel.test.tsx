@@ -4,7 +4,7 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import React from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PaperLedgerPanel } from '@/components/paper-ledger-panel';
 import type { PaperLedgerSummary, PaperPositionSummary } from '@/lib/types';
 
@@ -65,6 +65,26 @@ const summary: PaperLedgerSummary = {
   max_drawdown_usd: 0,
 };
 
+const emptySummary: PaperLedgerSummary = {
+  open_positions: Number.NaN,
+  closed_positions: Number.NaN,
+  total_notional_usd: -0,
+  total_realized_pnl: -0,
+  total_closed_notional_usd: -0,
+  long_positions: 0,
+  short_positions: 0,
+  last_opened_at: null,
+  last_closed_at: null,
+  total_count: Number.NaN,
+  win_rate_pct: Number.NaN,
+  gross_pnl_usd: -0,
+  max_drawdown_usd: -0,
+};
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe('PaperLedgerPanel', () => {
   it('shows open and closed paper positions with ledger performance', () => {
     render(
@@ -106,6 +126,80 @@ describe('PaperLedgerPanel', () => {
     await user.click(screen.getByRole('button', { name: 'Refresh ledger' }));
 
     expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs reconciliation and shows ok', async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          generated_at: '2026-04-22T18:10:00.000Z',
+          ok: true,
+          total_issues: 0,
+          issues: [],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(
+      React.createElement(PaperLedgerPanel, {
+        positions,
+        summary,
+        errorMessage: null,
+        latestPrices: { 'STOCK:AAPL': 103 },
+        refreshing: false,
+        onRefresh: vi.fn(),
+      }),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Reconcile now' }));
+
+    expect(await screen.findByText('ok')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith('/api/paper/reconcile', {
+      method: 'POST',
+      cache: 'no-store',
+    });
+  });
+
+  it('shows issue count when reconciliation errors', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 500 })));
+
+    render(
+      React.createElement(PaperLedgerPanel, {
+        positions,
+        summary,
+        errorMessage: null,
+        latestPrices: { 'STOCK:AAPL': 103 },
+        refreshing: false,
+        onRefresh: vi.fn(),
+      }),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Reconcile now' }));
+
+    expect(await screen.findByText('issues: 1')).toBeInTheDocument();
+  });
+
+  it('renders an empty ledger summary without NaN or negative zero displays', () => {
+    const { container } = render(
+      React.createElement(PaperLedgerPanel, {
+        positions: [],
+        summary: emptySummary,
+        errorMessage: null,
+        latestPrices: {},
+        refreshing: false,
+        onRefresh: vi.fn(),
+      }),
+    );
+
+    expect(screen.getByText('No open paper positions yet.')).toBeInTheDocument();
+    expect(screen.getByText('No closed paper positions yet.')).toBeInTheDocument();
+    expect(container).not.toHaveTextContent('NaN');
+    expect(container).not.toHaveTextContent('-$0.00');
+    expect(container).not.toHaveTextContent('-0.00%');
   });
 
   it('marks the row matching the highlighted audit id', () => {
