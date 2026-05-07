@@ -7,6 +7,7 @@ apps/web/.next
 __pycache__
 *.pyc
 *.db
+services/scanner/news_cache.json
 services/scanner/var/
 /dist
 .DS_Store
@@ -29,3 +30,15 @@ yarn-error.log*
 /build
 .vercel
 .idea
+
+# Local scratch artifacts
+.cursor/
+codex-changes.diff
+**/codex-changes.diff
+**/codex-changes.diff~
+latest-*-diff.txt
+latest-safe-diff.txt
+latest-full-diff.txt
+latest-ui-polish-diff.txt
+services/scanner/*.db
+services/scanner/backups/
