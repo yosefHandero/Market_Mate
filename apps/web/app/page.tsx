@@ -1,5 +1,6 @@
 import { DashboardStatusBanner } from '@/components/dashboard-status-banner';
 import { OperatorActions } from '@/components/operator-actions';
+import { PersonalAlerts } from '@/components/personal-alerts';
 import { TradingWorkspace } from '@/components/trading-workspace';
 
 import {
@@ -10,6 +11,25 @@ import {
   getPaperLedgerSummary,
   getReadyz,
 } from '@/lib/api';
+import { buildFrequentWatchTickers } from '@/lib/personal-alerts';
+import type { JournalEntry } from '@/lib/types';
+
+type JournalEntriesResult = {
+  data: JournalEntry[] | null;
+  error: string | null;
+};
+
+async function getJournalEntriesForAlerts(): Promise<JournalEntriesResult> {
+  const api = (await import('@/lib/api')) as unknown as {
+    getJournalEntries?: (limit?: number) => Promise<JournalEntriesResult>;
+  };
+
+  if (!Object.prototype.hasOwnProperty.call(api, 'getJournalEntries') || !api.getJournalEntries) {
+    return { data: [], error: null };
+  }
+
+  return api.getJournalEntries(500);
+}
 
 function formatTimestamp(value: string | null | undefined) {
   if (!value) {
@@ -27,6 +47,7 @@ export default async function HomePage() {
     latestScanResult,
     paperLedgerResult,
     paperLedgerSummaryResult,
+    alertJournalEntriesResult,
   ] = await Promise.all([
     getLatestDecisions(),
     getAutomationStatus(),
@@ -34,6 +55,7 @@ export default async function HomePage() {
     getLatestScan(),
     getPaperLedger(100),
     getPaperLedgerSummary(),
+    getJournalEntriesForAlerts(),
   ]);
 
   const errors = [
@@ -45,6 +67,7 @@ export default async function HomePage() {
   const paperLedgerError = [paperLedgerResult.error, paperLedgerSummaryResult.error]
     .filter(Boolean)
     .join(' ');
+  const alertWatchTickers = buildFrequentWatchTickers(alertJournalEntriesResult.data ?? []);
 
   return (
     <main style={{ display: 'grid', gap: 20 }}>
@@ -95,6 +118,15 @@ export default async function HomePage() {
             nextScanDueAt={healthResult.data?.next_scan_due_at}
             lastSchedulerRunStartedAt={healthResult.data?.last_scheduler_run_started_at}
             lastSchedulerError={healthResult.data?.last_scheduler_error}
+          />
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <PersonalAlerts
+            initialLatestScan={latestScanResult.data}
+            journalEntries={alertJournalEntriesResult.data ?? []}
+            watchTickers={alertWatchTickers}
+            journalError={alertJournalEntriesResult.error}
           />
         </div>
       </section>
