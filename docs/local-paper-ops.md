@@ -136,6 +136,17 @@ Backend guard (for your confidence): `POST /orders/place` returns **400** with c
 - Provider or trust degradation flags dominating results  
 - You cannot reconcile audits ↔ ledger ↔ notes  
 
+## Personal cheatsheet
+
+```cmd
+scripts\local-clean.bat
+scripts\local-clean.bat --yes
+scripts\backup-db.bat --dry-run
+scripts\backup-db.bat
+services\scanner\scripts\run_worker_local.bat
+curl -s http://localhost:8005/readyz
+```
+
 ## Reminder
 
 **Real-money trading remains disabled** on this local paper path. This tool is for **decision support, dry-run execution rehearsal, and ledger/audit practice** — not for live order submission.
