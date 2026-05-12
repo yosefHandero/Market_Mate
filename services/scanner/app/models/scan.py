@@ -137,6 +137,7 @@ class ExecutionAuditORM(Base):
     dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     idempotency_payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    recommended_action_snapshot: Mapped[str | None] = mapped_column(String(16), nullable=True)
     lifecycle_status: Mapped[str] = mapped_column(String(32), default="previewed", index=True)
     latest_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     notional_estimate: Mapped[float | None] = mapped_column(Float, nullable=True)

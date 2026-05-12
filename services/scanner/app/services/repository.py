@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
@@ -1017,10 +1018,13 @@ class ScanRepository:
                 horizon=horizon,
             )
         execution_eligibility = strategy_metadata.execution_eligibility
+        evidence_quality = strategy_metadata.evidence_quality
         if decision_signal == "HOLD":
             recommended_action = "ignore"
-        elif execution_eligibility == "eligible":
+        elif execution_eligibility == "eligible" and evidence_quality in {"high", "moderate"}:
             recommended_action = "dry_run"
+        elif execution_eligibility == "eligible" and evidence_quality in {"low", "degraded"}:
+            recommended_action = "preview"
         elif execution_eligibility == "review":
             recommended_action = "review"
         else:
@@ -1038,7 +1042,7 @@ class ScanRepository:
             raw_score=result.score,
             calibration_source=calibration_source,
             confidence_label=strategy_metadata.confidence_label,
-            evidence_quality=strategy_metadata.evidence_quality,
+            evidence_quality=evidence_quality,
             evidence_quality_score=strategy_metadata.evidence_quality_score,
             evidence_quality_reasons=strategy_metadata.evidence_quality_reasons,
             data_grade=getattr(result, "data_grade", strategy_metadata.data_grade),
@@ -1777,6 +1781,20 @@ class ScanRepository:
     def reconcile_paper_loop(self) -> ReconciliationReportResponse:
         issues: list[ReconciliationIssue] = []
         generated_at = datetime.now(timezone.utc)
+
+        def preview_strategy_version(row: ExecutionAuditORM | None) -> str | None:
+            if row is None or not getattr(row, "preview_payload", None):
+                return None
+            try:
+                preview_payload = json.loads(row.preview_payload)
+            except json.JSONDecodeError:
+                return None
+            trade_gate = preview_payload.get("trade_gate") if isinstance(preview_payload, dict) else None
+            if not isinstance(trade_gate, dict):
+                return None
+            strategy_version = trade_gate.get("strategy_version")
+            return str(strategy_version) if strategy_version is not None else None
+
         with SessionLocal() as session:
             intents = {
                 row.intent_key: row
@@ -1787,10 +1805,22 @@ class ScanRepository:
                 for row in session.execute(select(ExecutionAuditORM)).scalars().all()
             }
             positions = session.execute(select(PaperPositionORM)).scalars().all()
+        positions_by_intent_key = {row.intent_key: row for row in positions}
         for position in positions:
             intent = intents.get(position.intent_key)
             audit = audits.get(position.execution_audit_id) if position.execution_audit_id is not None else None
             is_manual_audit_position = audit is not None and bool(getattr(audit, "dry_run", False))
+            quantity = float(position.quantity or 0.0)
+            cost_basis_usd = float(position.cost_basis_usd or 0.0)
+            if quantity <= 0 or cost_basis_usd <= 0:
+                issues.append(
+                    ReconciliationIssue(
+                        kind="paper_position_invalid_quantity",
+                        detail=f"Paper position {position.id} has invalid quantity or cost basis.",
+                        paper_position_id=position.id,
+                        execution_audit_id=position.execution_audit_id,
+                    )
+                )
             if intent is None and not is_manual_audit_position:
                 issues.append(
                     ReconciliationIssue(
@@ -1808,11 +1838,46 @@ class ScanRepository:
                         execution_audit_id=position.execution_audit_id,
                     )
                 )
+            if audit is not None:
+                audit_idempotency_key = (audit.idempotency_key or "").strip()
+                if (
+                    audit_idempotency_key
+                    and position.intent_key != audit_idempotency_key
+                    and not position.intent_key.startswith("manual-audit-")
+                ):
+                    issues.append(
+                        ReconciliationIssue(
+                            kind="paper_position_intent_key_audit_mismatch",
+                            detail=(
+                                f"Paper position {position.id} intent key does not match "
+                                f"audit {audit.id} idempotency key."
+                            ),
+                            paper_position_id=position.id,
+                            execution_audit_id=audit.id,
+                        )
+                    )
+                audit_strategy_version = preview_strategy_version(audit)
+                if (
+                    position.strategy_version is not None
+                    and audit_strategy_version is not None
+                    and str(position.strategy_version) != audit_strategy_version
+                ):
+                    issues.append(
+                        ReconciliationIssue(
+                            kind="paper_position_strategy_version_mismatch",
+                            detail=(
+                                f"Paper position {position.id} strategy_version "
+                                f"{position.strategy_version} differs from audit {audit.id} "
+                                f"trade_gate strategy_version {audit_strategy_version}."
+                            ),
+                            paper_position_id=position.id,
+                            execution_audit_id=audit.id,
+                        )
+                    )
         for intent in intents.values():
             if intent.status != "dry_run_complete":
                 continue
-            linked = [row for row in positions if row.intent_key == intent.intent_key]
-            if not linked:
+            if intent.intent_key not in positions_by_intent_key:
                 issues.append(
                     ReconciliationIssue(
                         kind="dry_run_without_ledger",
@@ -1821,11 +1886,45 @@ class ScanRepository:
                         execution_audit_id=intent.execution_audit_id,
                     )
                 )
+        for audit in audits.values():
+            audit_idempotency_key = (audit.idempotency_key or "").strip()
+            expected_position_keys = {f"manual-audit-{audit.id}"}
+            if audit_idempotency_key:
+                expected_position_keys.add(audit_idempotency_key)
+            has_matching_position = any(key in positions_by_intent_key for key in expected_position_keys)
+            if (
+                bool(getattr(audit, "dry_run", False))
+                and audit.lifecycle_status == "dry_run"
+                and audit.trade_gate_allowed is True
+                and not has_matching_position
+            ):
+                issues.append(
+                    ReconciliationIssue(
+                        kind="dry_run_audit_without_ledger",
+                        detail=f"Audit {audit.id} is dry_run without a matching paper ledger row.",
+                        execution_audit_id=audit.id,
+                    )
+                )
+            if (
+                bool(getattr(audit, "dry_run", False))
+                and (audit.side or "").lower() == "sell"
+                and audit.lifecycle_status == "failed"
+                and audit.error_message == "sell_without_open_position"
+            ):
+                issues.append(
+                    ReconciliationIssue(
+                        kind="sell_without_open_position",
+                        detail=f"Audit {audit.id} attempted a paper SELL without an open BUY position.",
+                        execution_audit_id=audit.id,
+                    )
+                )
+        issues_by_kind = Counter(issue.kind for issue in issues)
         return ReconciliationReportResponse(
             generated_at=generated_at,
             ok=not issues,
             total_issues=len(issues),
             issues=issues,
+            issues_by_kind=dict(issues_by_kind),
         )
 
     def get_portfolio_guardrail_snapshot(

@@ -34,8 +34,16 @@ class SchedulerService:
     def state(self):
         return self.repository.get_state()
 
+    def _reset_missed_run_on_startup(self) -> None:
+        if not self.settings.scheduler_run_missed_on_startup:
+            return
+        self.repository.reset_missed_run_on_startup(
+            interval_seconds=self.settings.scan_interval_seconds
+        )
+
     async def run_forever(self) -> None:
         instance_id = self.settings.app_instance_id
+        self._reset_missed_run_on_startup()
         while True:
             acquired = self.repository.acquire_lease(instance_id)
             if acquired:

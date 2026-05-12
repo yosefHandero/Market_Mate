@@ -29,6 +29,7 @@ Base = declarative_base()
 # Register ORM tables on Base.metadata (create_all / schema patches).
 from app.models.journal import JournalEntryORM  # noqa: E402, F401
 from app.models.scan import AutomationIntentORM, ExecutionAuditORM, PaperLoopBreakerORM, PaperPositionORM  # noqa: E402, F401
+from app.models.system import MaintenanceStateORM, SchedulerStateORM  # noqa: E402, F401
 
 REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
     "scan_runs": {
@@ -134,6 +135,7 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "dry_run": "BOOLEAN DEFAULT 0",
         "idempotency_key": "VARCHAR(128)",
         "idempotency_payload_hash": "VARCHAR(64)",
+        "recommended_action_snapshot": "VARCHAR(16)",
         "lifecycle_status": "VARCHAR(32) DEFAULT 'previewed'",
         "latest_price": "FLOAT",
         "notional_estimate": "FLOAT",
@@ -167,6 +169,13 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "last_run_finished_at": "DATETIME",
         "last_error": "TEXT",
         "created_at": "DATETIME",
+        "updated_at": "DATETIME",
+    },
+    "maintenance_state": {
+        "key": "VARCHAR(64)",
+        "last_sync_signal_returns_at": "DATETIME",
+        "last_backfill_audit_links_at": "DATETIME",
+        "last_recover_due_intents_at": "DATETIME",
         "updated_at": "DATETIME",
     },
     "automation_intents": {

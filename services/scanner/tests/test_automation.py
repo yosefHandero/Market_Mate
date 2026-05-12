@@ -146,6 +146,63 @@ class AutomationServiceTests(unittest.TestCase):
         service.settings.app_instance_id = "scanner-test"
         return service
 
+    def _add_execution_audit(self, session, *, now: datetime, **overrides) -> ExecutionAuditORM:
+        values = {
+            "created_at": now,
+            "updated_at": now,
+            "ticker": "AAPL",
+            "asset_type": "stock",
+            "side": "sell",
+            "order_type": "market",
+            "qty": 1.0,
+            "dry_run": True,
+            "idempotency_key": "paperloop:sell-without-open",
+            "lifecycle_status": "dry_run",
+            "latest_price": 200.0,
+            "notional_estimate": 200.0,
+            "trade_gate_allowed": True,
+            "submitted": False,
+            "broker_status": "dry_run",
+            "preview_payload": json.dumps({"trade_gate": {"strategy_version": "v4.0-layered"}}),
+        }
+        values.update(overrides)
+        audit = ExecutionAuditORM(**values)
+        session.add(audit)
+        session.flush()
+        return audit
+
+    def _add_intent_for_audit(self, session, *, now: datetime, audit: ExecutionAuditORM) -> AutomationIntentORM:
+        intent = AutomationIntentORM(
+            created_at=now,
+            updated_at=now,
+            run_id="run-sell-without-open",
+            symbol=audit.ticker,
+            asset_type=audit.asset_type,
+            side=audit.side,
+            qty=audit.qty,
+            strategy_version="v4.0-layered",
+            confidence=80.0,
+            horizon="1h",
+            intent_key=audit.idempotency_key or f"manual-audit-{audit.id}",
+            intent_hash="hash",
+            status="pending",
+            idempotency_key=audit.idempotency_key,
+            execution_audit_id=audit.id,
+            request_payload_json=json.dumps(
+                {
+                    "ticker": audit.ticker,
+                    "side": audit.side,
+                    "qty": audit.qty,
+                    "order_type": "market",
+                    "dry_run": True,
+                    "idempotency_key": audit.idempotency_key,
+                }
+            ),
+        )
+        session.add(intent)
+        session.flush()
+        return intent
+
     def test_shadow_mode_records_intent_without_execution_call(self) -> None:
         temp_dir, engine, SessionLocal = self._build_session_local()
         try:
@@ -387,6 +444,82 @@ class AutomationServiceTests(unittest.TestCase):
             self.assertEqual(len(ledger_rows), 1)
             self.assertEqual(ledger_rows[0].ticker, "AAPL")
             self.assertEqual(ledger_rows[0].status, "open")
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
+    def test_record_paper_position_sell_without_open_marks_audit_failed(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+            with patch.object(automation_repository_module, "SessionLocal", SessionLocal):
+                with SessionLocal() as session:
+                    audit = self._add_execution_audit(session, now=now)
+                    untouched = self._add_execution_audit(
+                        session,
+                        now=now,
+                        idempotency_key="paperloop:untouched",
+                    )
+                    intent = self._add_intent_for_audit(session, now=now, audit=audit)
+                    audit_id = audit.id
+                    untouched_id = untouched.id
+                    intent_id = intent.id
+                    session.commit()
+
+                position_id = AutomationRepository().record_paper_position(
+                    intent_id=intent_id,
+                    simulated_fill_price=201.0,
+                    filled_at=now + timedelta(minutes=1),
+                )
+
+                with SessionLocal() as session:
+                    audit = session.get(ExecutionAuditORM, audit_id)
+                    untouched = session.get(ExecutionAuditORM, untouched_id)
+                    ledger_rows = session.query(PaperPositionORM).all()
+
+            self.assertIsNone(position_id)
+            self.assertEqual(ledger_rows, [])
+            self.assertEqual(audit.lifecycle_status, "failed")
+            self.assertEqual(audit.error_message, "sell_without_open_position")
+            self.assertEqual(untouched.lifecycle_status, "dry_run")
+            self.assertIsNone(untouched.error_message)
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
+    def test_record_paper_position_from_audit_sell_without_open_marks_audit_failed(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+            with patch.object(automation_repository_module, "SessionLocal", SessionLocal):
+                with SessionLocal() as session:
+                    audit = self._add_execution_audit(session, now=now)
+                    untouched = self._add_execution_audit(
+                        session,
+                        now=now,
+                        idempotency_key="paperloop:untouched-audit",
+                    )
+                    audit_id = audit.id
+                    untouched_id = untouched.id
+                    session.commit()
+
+                position_id = AutomationRepository().record_paper_position_from_audit(
+                    audit_id=audit_id,
+                    simulated_fill_price=201.0,
+                    filled_at=now + timedelta(minutes=1),
+                )
+
+                with SessionLocal() as session:
+                    audit = session.get(ExecutionAuditORM, audit_id)
+                    untouched = session.get(ExecutionAuditORM, untouched_id)
+                    ledger_rows = session.query(PaperPositionORM).all()
+
+            self.assertIsNone(position_id)
+            self.assertEqual(ledger_rows, [])
+            self.assertEqual(audit.lifecycle_status, "failed")
+            self.assertEqual(audit.error_message, "sell_without_open_position")
+            self.assertEqual(untouched.lifecycle_status, "dry_run")
+            self.assertIsNone(untouched.error_message)
         finally:
             engine.dispose()
             temp_dir.cleanup()

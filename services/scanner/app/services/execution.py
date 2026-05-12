@@ -47,6 +47,15 @@ class ExecutionService:
                 code="not_ready",
             )
 
+    def _enforce_kill_switch(self) -> None:
+        if not self.settings.paper_loop_kill_switch:
+            return
+        raise AppError(
+            message="Paper-loop kill switch is enabled; order paths are halted.",
+            status_code=409,
+            code="kill_switch_enabled",
+        )
+
     def _asset_type_for_symbol(self, symbol: str) -> str:
         return "crypto" if "/" in symbol else "stock"
 
@@ -93,6 +102,7 @@ class ExecutionService:
                     idempotency_payload_hash=self._idempotency_payload_hash(
                         request.model_dump(mode="json")
                     ),
+                    recommended_action_snapshot=request.recommended_action_snapshot,
                     lifecycle_status="previewed",
                     latest_price=preview.latest_price,
                     notional_estimate=preview.notional_estimate,
@@ -120,6 +130,7 @@ class ExecutionService:
                 row.qty = preview.qty
                 row.dry_run = True
                 row.idempotency_key = getattr(request, "idempotency_key", None)
+                row.recommended_action_snapshot = request.recommended_action_snapshot
                 row.lifecycle_status = "previewed"
                 row.latest_price = preview.latest_price
                 row.notional_estimate = preview.notional_estimate
@@ -234,6 +245,7 @@ class ExecutionService:
             status=row.broker_status,
             raw=raw_payload or preview_payload,
             execution_audit_id=row.id,
+            recommended_action_snapshot=row.recommended_action_snapshot,
         )
 
     @staticmethod
@@ -251,6 +263,7 @@ class ExecutionService:
 
     async def preview(self, request: OrderPreviewRequest) -> OrderPreviewResponse:
         self._enforce_operational_readiness()
+        self._enforce_kill_switch()
         ticker = request.ticker.upper()
         if self._asset_type_for_symbol(ticker) == "crypto":
             latest_price = await self.alpaca.get_latest_crypto_price(ticker)
@@ -319,6 +332,7 @@ class ExecutionService:
                 code="dry_run_required",
             )
         request.dry_run = True
+        self._enforce_kill_switch()
         self._enforce_execution_safeguards()
         existing = self._find_existing_idempotent_result(request.idempotency_key)
         if existing and existing.lifecycle_status in {"submitted", "dry_run", "blocked"}:

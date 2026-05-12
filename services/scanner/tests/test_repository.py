@@ -21,6 +21,77 @@ class RepositoryCalibrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = ScanRepository()
 
+    def _build_session_local(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        database_path = Path(temp_dir.name) / "scanner.db"
+        engine = create_engine(
+            f"sqlite:///{database_path.as_posix()}",
+            future=True,
+            connect_args={"check_same_thread": False},
+        )
+        SessionLocal = sessionmaker(
+            bind=engine,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+            future=True,
+        )
+        Base.metadata.create_all(engine)
+        return temp_dir, engine, SessionLocal
+
+    def _add_execution_audit(self, session, *, now: datetime, **overrides) -> ExecutionAuditORM:
+        values = {
+            "created_at": now,
+            "updated_at": now,
+            "ticker": "AAPL",
+            "asset_type": "stock",
+            "side": "buy",
+            "order_type": "market",
+            "qty": 1.0,
+            "dry_run": True,
+            "idempotency_key": "paperloop:test",
+            "lifecycle_status": "dry_run",
+            "latest_price": 190.0,
+            "notional_estimate": 190.0,
+            "trade_gate_allowed": True,
+            "submitted": False,
+            "broker_status": "dry_run",
+            "preview_payload": json.dumps({"trade_gate": {"strategy_version": "v4.0-layered"}}),
+        }
+        values.update(overrides)
+        audit = ExecutionAuditORM(**values)
+        session.add(audit)
+        session.flush()
+        return audit
+
+    def _paper_position(
+        self,
+        *,
+        now: datetime,
+        audit: ExecutionAuditORM,
+        intent_key: str | None = None,
+        **overrides,
+    ) -> PaperPositionORM:
+        values = {
+            "created_at": now,
+            "updated_at": now,
+            "intent_key": intent_key or audit.idempotency_key or f"manual-audit-{audit.id}",
+            "execution_audit_id": audit.id,
+            "ticker": audit.ticker,
+            "asset_type": audit.asset_type,
+            "side": "buy",
+            "quantity": 1.0,
+            "simulated_fill_price": 190.0,
+            "notional_usd": 190.0,
+            "cost_basis_usd": 190.0,
+            "status": "open",
+            "opened_at": now,
+            "strategy_version": "v4.0-layered",
+            "confidence": 72.0,
+        }
+        values.update(overrides)
+        return PaperPositionORM(**values)
+
     def _outcome_row(
         self,
         *,
@@ -764,6 +835,272 @@ class RepositoryCalibrationTests(unittest.TestCase):
             finally:
                 engine.dispose()
 
+    def test_reconcile_detects_dry_run_audit_without_ledger(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+            with SessionLocal() as session:
+                audit = self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:missing-ledger",
+                )
+                audit_id = audit.id
+                session.commit()
+
+            with patch.object(repository_module, "SessionLocal", SessionLocal):
+                report = self.repo.reconcile_paper_loop()
+
+            self.assertFalse(report.ok)
+            self.assertEqual(report.total_issues, 1)
+            self.assertEqual(report.issues[0].kind, "dry_run_audit_without_ledger")
+            self.assertEqual(report.issues[0].execution_audit_id, audit_id)
+            self.assertEqual(report.issues_by_kind, {"dry_run_audit_without_ledger": 1})
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
+    def test_reconcile_detects_invalid_paper_position_quantity(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+            with SessionLocal() as session:
+                audit = self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:invalid-position",
+                )
+                position = self._paper_position(
+                    now=now,
+                    audit=audit,
+                    quantity=0.0,
+                )
+                session.add(position)
+                session.commit()
+
+            with patch.object(repository_module, "SessionLocal", SessionLocal):
+                report = self.repo.reconcile_paper_loop()
+
+            self.assertFalse(report.ok)
+            self.assertEqual(report.total_issues, 1)
+            self.assertEqual(report.issues[0].kind, "paper_position_invalid_quantity")
+            self.assertEqual(report.issues_by_kind, {"paper_position_invalid_quantity": 1})
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
+    def test_reconcile_detects_paper_position_strategy_version_mismatch(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+            with SessionLocal() as session:
+                audit = self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:strategy-mismatch",
+                    preview_payload=json.dumps({"trade_gate": {"strategy_version": "v4.1-layered"}}),
+                )
+                session.add(self._paper_position(now=now, audit=audit, strategy_version="v4.0-layered"))
+                session.commit()
+
+            with patch.object(repository_module, "SessionLocal", SessionLocal):
+                report = self.repo.reconcile_paper_loop()
+
+            self.assertFalse(report.ok)
+            self.assertEqual(report.total_issues, 1)
+            self.assertEqual(report.issues[0].kind, "paper_position_strategy_version_mismatch")
+            self.assertEqual(report.issues_by_kind, {"paper_position_strategy_version_mismatch": 1})
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
+    def test_reconcile_detects_paper_position_intent_key_audit_mismatch(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+            with SessionLocal() as session:
+                audit = self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:expected-key",
+                    trade_gate_allowed=None,
+                )
+                session.add(
+                    self._paper_position(
+                        now=now,
+                        audit=audit,
+                        intent_key="paperloop:wrong-key",
+                    )
+                )
+                session.commit()
+
+            with patch.object(repository_module, "SessionLocal", SessionLocal):
+                report = self.repo.reconcile_paper_loop()
+
+            self.assertFalse(report.ok)
+            self.assertEqual(report.total_issues, 1)
+            self.assertEqual(report.issues[0].kind, "paper_position_intent_key_audit_mismatch")
+            self.assertEqual(report.issues_by_kind, {"paper_position_intent_key_audit_mismatch": 1})
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
+    def test_reconcile_report_includes_issues_by_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+                with SessionLocal() as session:
+                    session.add(
+                        PaperPositionORM(
+                            created_at=now,
+                            updated_at=now,
+                            intent_key="missing-intent-aapl",
+                            ticker="AAPL",
+                            asset_type="stock",
+                            side="buy",
+                            quantity=1.0,
+                            simulated_fill_price=190.0,
+                            notional_usd=190.0,
+                            cost_basis_usd=190.0,
+                            status="open",
+                            opened_at=now,
+                            strategy_version="v4.0-layered",
+                            confidence=72.0,
+                        )
+                    )
+                    session.commit()
+
+                with patch.object(repository_module, "SessionLocal", SessionLocal):
+                    report = self.repo.reconcile_paper_loop()
+
+                self.assertFalse(report.ok)
+                self.assertEqual(report.total_issues, 1)
+                self.assertEqual(
+                    [issue.kind for issue in report.issues],
+                    ["paper_position_missing_intent"],
+                )
+                self.assertEqual(
+                    report.issues_by_kind,
+                    {"paper_position_missing_intent": 1},
+                )
+            finally:
+                engine.dispose()
+
+    def test_reconcile_clean_ledger_returns_zero_issues_and_empty_issues_by_kind(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+            with SessionLocal() as session:
+                audit = self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:clean",
+                )
+                session.add(self._paper_position(now=now, audit=audit))
+                session.commit()
+
+            with patch.object(repository_module, "SessionLocal", SessionLocal):
+                report = self.repo.reconcile_paper_loop()
+
+            self.assertTrue(report.ok)
+            self.assertEqual(report.total_issues, 0)
+            self.assertEqual(report.issues, [])
+            self.assertEqual(report.issues_by_kind, {})
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
+    def test_reconcile_new_issue_kinds_are_counted_in_issues_by_kind(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+            with SessionLocal() as session:
+                missing_ledger = self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:missing-ledger",
+                )
+                invalid_position = self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:invalid-position",
+                )
+                strategy_mismatch = self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:strategy-mismatch",
+                    preview_payload=json.dumps({"trade_gate": {"strategy_version": "v4.1-layered"}}),
+                )
+                intent_mismatch = self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:expected-key",
+                    trade_gate_allowed=None,
+                )
+                self._add_execution_audit(
+                    session,
+                    now=now,
+                    idempotency_key="paperloop:sell-without-open",
+                    side="sell",
+                    lifecycle_status="failed",
+                    error_message="sell_without_open_position",
+                )
+                session.add_all(
+                    [
+                        self._paper_position(
+                            now=now,
+                            audit=invalid_position,
+                            quantity=0.0,
+                        ),
+                        self._paper_position(
+                            now=now,
+                            audit=strategy_mismatch,
+                            strategy_version="v4.0-layered",
+                        ),
+                        self._paper_position(
+                            now=now,
+                            audit=intent_mismatch,
+                            intent_key="paperloop:wrong-key",
+                        ),
+                    ]
+                )
+                self.assertIsNotNone(missing_ledger.id)
+                session.commit()
+
+            with patch.object(repository_module, "SessionLocal", SessionLocal):
+                report = self.repo.reconcile_paper_loop()
+
+            self.assertFalse(report.ok)
+            self.assertEqual(
+                report.issues_by_kind,
+                {
+                    "paper_position_invalid_quantity": 1,
+                    "paper_position_strategy_version_mismatch": 1,
+                    "paper_position_intent_key_audit_mismatch": 1,
+                    "dry_run_audit_without_ledger": 1,
+                    "sell_without_open_position": 1,
+                },
+            )
+            self.assertEqual(sum(report.issues_by_kind.values()), report.total_issues)
+            self.assertEqual(report.total_issues, 5)
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
     def test_paper_ledger_filters_and_summary_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"
@@ -1123,6 +1460,115 @@ class RepositoryCalibrationTests(unittest.TestCase):
                         self.assertIsNotNone(audit.trust_window_end)
             finally:
                 engine.dispose()
+
+    def _decision_result(self, *, decision_signal: str = "BUY") -> SimpleNamespace:
+        return SimpleNamespace(
+            ticker="AAPL",
+            asset_type="stock",
+            score=67.5,
+            price_change_pct=1.2,
+            relative_volume=2.4,
+            options_flow_score=58.0,
+            created_at=datetime(2026, 4, 4, 12, 0, tzinfo=timezone.utc),
+            decision_signal=decision_signal,
+            calibration_source="score_band",
+            provider_status="ok",
+            gate_passed=True,
+            data_grade="decision",
+            bar_age_minutes=3.5,
+            freshness_flags_json=None,
+            layer_details_json=None,
+        )
+
+    def _decision_strategy_metadata(
+        self,
+        *,
+        evidence_quality: str = "moderate",
+        execution_eligibility: str = "eligible",
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            confidence_label="calibrated_confidence",
+            evidence_quality=evidence_quality,
+            evidence_quality_score=0.74,
+            evidence_quality_reasons=(),
+            data_grade="decision",
+            execution_eligibility=execution_eligibility,
+            strategy_version="v3.0-explicit",
+        )
+
+    def _recommended_action_for(
+        self,
+        *,
+        signal: str = "BUY",
+        evidence_quality: str = "moderate",
+        execution_eligibility: str = "eligible",
+    ) -> str | None:
+        with patch.object(
+            self.repo,
+            "_strategy_metadata_from_row",
+            return_value=self._decision_strategy_metadata(
+                evidence_quality=evidence_quality,
+                execution_eligibility=execution_eligibility,
+            ),
+        ):
+            return self.repo._build_decision_row(self._decision_result(decision_signal=signal)).recommended_action
+
+    def test_build_decision_row_returns_preview_for_low_evidence_eligible(self) -> None:
+        recommended_action = self._recommended_action_for(
+            evidence_quality="low",
+            execution_eligibility="eligible",
+        )
+
+        self.assertEqual(recommended_action, "preview")
+
+    def test_build_decision_row_returns_preview_for_degraded_evidence_eligible(self) -> None:
+        recommended_action = self._recommended_action_for(
+            evidence_quality="degraded",
+            execution_eligibility="eligible",
+        )
+
+        self.assertEqual(recommended_action, "preview")
+
+    def test_build_decision_row_returns_dry_run_for_high_evidence_eligible(self) -> None:
+        recommended_action = self._recommended_action_for(
+            evidence_quality="high",
+            execution_eligibility="eligible",
+        )
+
+        self.assertEqual(recommended_action, "dry_run")
+
+    def test_build_decision_row_returns_dry_run_for_moderate_evidence_eligible(self) -> None:
+        recommended_action = self._recommended_action_for(
+            evidence_quality="moderate",
+            execution_eligibility="eligible",
+        )
+
+        self.assertEqual(recommended_action, "dry_run")
+
+    def test_build_decision_row_hold_returns_ignore(self) -> None:
+        recommended_action = self._recommended_action_for(
+            signal="HOLD",
+            evidence_quality="high",
+            execution_eligibility="eligible",
+        )
+
+        self.assertEqual(recommended_action, "ignore")
+
+    def test_build_decision_row_review_returns_review(self) -> None:
+        recommended_action = self._recommended_action_for(
+            evidence_quality="low",
+            execution_eligibility="review",
+        )
+
+        self.assertEqual(recommended_action, "review")
+
+    def test_build_decision_row_blocked_returns_blocked(self) -> None:
+        recommended_action = self._recommended_action_for(
+            evidence_quality="high",
+            execution_eligibility="blocked",
+        )
+
+        self.assertEqual(recommended_action, "blocked")
 
     def test_build_decision_row_includes_evidence_reasons_and_freshness_flags(self) -> None:
         result = SimpleNamespace(

@@ -20,3 +20,13 @@ class SchedulerStateORM(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+class MaintenanceStateORM(Base):
+    __tablename__ = "maintenance_state"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_sync_signal_returns_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_backfill_audit_links_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_recover_due_intents_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

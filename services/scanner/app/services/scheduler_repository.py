@@ -46,6 +46,16 @@ class SchedulerRepository:
             return value
         return value.astimezone(timezone.utc).replace(tzinfo=None)
 
+    def _has_unclean_prior_run(
+        self,
+        *,
+        last_run_started_at: datetime | None,
+        last_run_finished_at: datetime | None,
+    ) -> bool:
+        started_at = self._as_comparable_utc(last_run_started_at)
+        finished_at = self._as_comparable_utc(last_run_finished_at)
+        return bool(started_at is not None and (finished_at is None or finished_at < started_at))
+
     def _default_state(self) -> SchedulerStateORM:
         now = self._utc_now()
         return SchedulerStateORM(
@@ -182,8 +192,39 @@ class SchedulerRepository:
             row = session.get(SchedulerStateORM, self._KEY)
             if row is None:
                 return False
+            if self._has_unclean_prior_run(
+                last_run_started_at=row.last_run_started_at,
+                last_run_finished_at=row.last_run_finished_at,
+            ):
+                return False
             next_run_at = self._as_comparable_utc(row.next_run_at)
             return bool(row.enabled and (next_run_at is None or next_run_at <= now))
+
+    def reset_missed_run_on_startup(
+        self,
+        *,
+        interval_seconds: int,
+        now: datetime | None = None,
+    ) -> bool:
+        now_value = self._as_comparable_utc(now) if now is not None else self._utc_now()
+        with SessionLocal() as session:
+            row = session.get(SchedulerStateORM, self._KEY)
+            if row is None or not row.enabled:
+                return False
+            if self._has_unclean_prior_run(
+                last_run_started_at=row.last_run_started_at,
+                last_run_finished_at=row.last_run_finished_at,
+            ):
+                return False
+            last_run_finished_at = self._as_comparable_utc(row.last_run_finished_at)
+            if last_run_finished_at is None:
+                return False
+            if now_value - last_run_finished_at < timedelta(seconds=interval_seconds):
+                return False
+            row.next_run_at = now_value
+            row.updated_at = now_value
+            session.commit()
+            return True
 
     def mark_run_started(self, instance_id: str) -> None:
         now = self._utc_now()

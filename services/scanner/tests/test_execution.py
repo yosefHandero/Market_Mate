@@ -89,6 +89,412 @@ class ExecutionServiceTests(unittest.TestCase):
             finally:
                 engine.dispose()
 
+    def test_preview_audit_persists_recommended_action_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                service = ExecutionService()
+                original_kill = service.settings.paper_loop_kill_switch
+                original_require = service.settings.require_readyz_for_execution
+                self.addCleanup(setattr, service.settings, "paper_loop_kill_switch", original_kill)
+                self.addCleanup(setattr, service.settings, "require_readyz_for_execution", original_require)
+                service.settings.paper_loop_kill_switch = False
+                service.settings.require_readyz_for_execution = False
+                service.alpaca.get_latest_price = AsyncMock(return_value=100.0)
+                service.risk.evaluate_trade = lambda **_: TradeEligibility(
+                    ticker="AAPL",
+                    asset_type="stock",
+                    requested_side="buy",
+                    required_signal="BUY",
+                    horizon="1h",
+                    execution_eligibility="eligible",
+                    latest_scan_fresh=True,
+                    allowed=True,
+                    reason="Eligible.",
+                    notional_estimate=100.0,
+                    qty=1.0,
+                )
+
+                with patch.object(execution_module, "SessionLocal", SessionLocal):
+                    preview = asyncio.run(
+                        service.preview(
+                            execution_module.OrderPreviewRequest(
+                                ticker="AAPL",
+                                side="buy",
+                                qty=1,
+                                mode="dry_run",
+                                recommended_action_snapshot="preview",
+                            )
+                        )
+                    )
+                    with SessionLocal() as session:
+                        audit = session.query(ExecutionAuditORM).one()
+
+                self.assertIsNotNone(preview.execution_audit_id)
+                self.assertEqual(audit.recommended_action_snapshot, "preview")
+            finally:
+                engine.dispose()
+
+    def test_audit_allows_null_recommended_action_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                service = ExecutionService()
+                original_kill = service.settings.paper_loop_kill_switch
+                original_require = service.settings.require_readyz_for_execution
+                self.addCleanup(setattr, service.settings, "paper_loop_kill_switch", original_kill)
+                self.addCleanup(setattr, service.settings, "require_readyz_for_execution", original_require)
+                service.settings.paper_loop_kill_switch = False
+                service.settings.require_readyz_for_execution = False
+                service.alpaca.get_latest_price = AsyncMock(return_value=100.0)
+                service.risk.evaluate_trade = lambda **_: TradeEligibility(
+                    ticker="AAPL",
+                    asset_type="stock",
+                    requested_side="buy",
+                    required_signal="BUY",
+                    horizon="1h",
+                    execution_eligibility="eligible",
+                    latest_scan_fresh=True,
+                    allowed=True,
+                    reason="Eligible.",
+                    notional_estimate=100.0,
+                    qty=1.0,
+                )
+
+                with patch.object(execution_module, "SessionLocal", SessionLocal):
+                    preview = asyncio.run(
+                        service.preview(
+                            execution_module.OrderPreviewRequest(
+                                ticker="AAPL",
+                                side="buy",
+                                qty=1,
+                                mode="dry_run",
+                            )
+                        )
+                    )
+                    with SessionLocal() as session:
+                        audit = session.query(ExecutionAuditORM).one()
+
+                self.assertIsNotNone(preview.execution_audit_id)
+                self.assertIsNone(audit.recommended_action_snapshot)
+            finally:
+                engine.dispose()
+
+    def test_preview_blocked_when_kill_switch_enabled_returns_409(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                service = ExecutionService()
+                original_kill = service.settings.paper_loop_kill_switch
+                original_require = service.settings.require_readyz_for_execution
+                self.addCleanup(setattr, service.settings, "paper_loop_kill_switch", original_kill)
+                self.addCleanup(setattr, service.settings, "require_readyz_for_execution", original_require)
+                service.settings.paper_loop_kill_switch = True
+                service.settings.require_readyz_for_execution = False
+                service.alpaca.get_latest_price = AsyncMock(return_value=190.0)
+
+                with patch.object(execution_module, "SessionLocal", SessionLocal):
+                    with self.assertRaises(AppError) as ctx:
+                        asyncio.run(
+                            service.preview(
+                                execution_module.OrderPreviewRequest(
+                                    ticker="AAPL",
+                                    side="buy",
+                                    qty=1,
+                                )
+                            )
+                        )
+                    with SessionLocal() as session:
+                        audit_count = session.query(ExecutionAuditORM).count()
+                        position_count = session.query(PaperPositionORM).count()
+
+                self.assertEqual(ctx.exception.status_code, 409)
+                self.assertEqual(ctx.exception.code, "kill_switch_enabled")
+                self.assertIn("kill switch", ctx.exception.message)
+                service.alpaca.get_latest_price.assert_not_awaited()
+                self.assertEqual(audit_count, 0)
+                self.assertEqual(position_count, 0)
+            finally:
+                engine.dispose()
+
+    def test_place_blocked_when_kill_switch_enabled_returns_409(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                service = ExecutionService()
+                original_kill = service.settings.paper_loop_kill_switch
+                original_require = service.settings.require_readyz_for_execution
+                self.addCleanup(setattr, service.settings, "paper_loop_kill_switch", original_kill)
+                self.addCleanup(setattr, service.settings, "require_readyz_for_execution", original_require)
+                service.settings.paper_loop_kill_switch = True
+                service.settings.require_readyz_for_execution = False
+                service.alpaca.get_latest_price = AsyncMock(return_value=190.0)
+                service.alpaca.submit_order = AsyncMock()
+
+                with patch.object(execution_module, "SessionLocal", SessionLocal):
+                    with self.assertRaises(AppError) as ctx:
+                        asyncio.run(
+                            service.place(
+                                OrderPlaceRequest(
+                                    ticker="AAPL",
+                                    side="buy",
+                                    qty=1,
+                                    dry_run=True,
+                                    idempotency_key="manual-kill-1",
+                                )
+                            )
+                        )
+                    with SessionLocal() as session:
+                        audit_count = session.query(ExecutionAuditORM).count()
+                        position_count = session.query(PaperPositionORM).count()
+
+                self.assertEqual(ctx.exception.status_code, 409)
+                self.assertEqual(ctx.exception.code, "kill_switch_enabled")
+                service.alpaca.get_latest_price.assert_not_awaited()
+                service.alpaca.submit_order.assert_not_awaited()
+                self.assertEqual(audit_count, 0)
+                self.assertEqual(position_count, 0)
+            finally:
+                engine.dispose()
+
+    def test_kill_switch_block_does_not_write_recommended_action_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                service = ExecutionService()
+                original_kill = service.settings.paper_loop_kill_switch
+                original_require = service.settings.require_readyz_for_execution
+                self.addCleanup(setattr, service.settings, "paper_loop_kill_switch", original_kill)
+                self.addCleanup(setattr, service.settings, "require_readyz_for_execution", original_require)
+                service.settings.paper_loop_kill_switch = True
+                service.settings.require_readyz_for_execution = False
+                service.alpaca.get_latest_price = AsyncMock(return_value=190.0)
+                service.alpaca.submit_order = AsyncMock()
+
+                with patch.object(execution_module, "SessionLocal", SessionLocal):
+                    with self.assertRaises(AppError):
+                        asyncio.run(
+                            service.preview(
+                                execution_module.OrderPreviewRequest(
+                                    ticker="AAPL",
+                                    side="buy",
+                                    qty=1,
+                                    recommended_action_snapshot="preview",
+                                )
+                            )
+                        )
+                    with self.assertRaises(AppError):
+                        asyncio.run(
+                            service.place(
+                                OrderPlaceRequest(
+                                    ticker="AAPL",
+                                    side="buy",
+                                    qty=1,
+                                    dry_run=True,
+                                    idempotency_key="kill-snapshot-1",
+                                    recommended_action_snapshot="dry_run",
+                                )
+                            )
+                        )
+                    with SessionLocal() as session:
+                        audit_count = session.query(ExecutionAuditORM).count()
+
+                service.alpaca.get_latest_price.assert_not_awaited()
+                service.alpaca.submit_order.assert_not_awaited()
+                self.assertEqual(audit_count, 0)
+            finally:
+                engine.dispose()
+
+    def test_kill_switch_disabled_preserves_existing_preview_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                service = ExecutionService()
+                original_kill = service.settings.paper_loop_kill_switch
+                original_require = service.settings.require_readyz_for_execution
+                self.addCleanup(setattr, service.settings, "paper_loop_kill_switch", original_kill)
+                self.addCleanup(setattr, service.settings, "require_readyz_for_execution", original_require)
+                service.settings.paper_loop_kill_switch = False
+                service.settings.require_readyz_for_execution = False
+                service.alpaca.get_latest_price = AsyncMock(return_value=100.0)
+                service.risk.evaluate_trade = lambda **_: TradeEligibility(
+                    ticker="AAPL",
+                    asset_type="stock",
+                    requested_side="buy",
+                    required_signal="BUY",
+                    horizon="1h",
+                    execution_eligibility="eligible",
+                    latest_scan_fresh=True,
+                    allowed=True,
+                    reason="Eligible.",
+                    notional_estimate=100.0,
+                    qty=1.0,
+                )
+
+                with patch.object(execution_module, "SessionLocal", SessionLocal):
+                    preview = asyncio.run(
+                        service.preview(
+                            execution_module.OrderPreviewRequest(
+                                ticker="AAPL",
+                                side="buy",
+                                qty=1,
+                                mode="dry_run",
+                            )
+                        )
+                    )
+                    with SessionLocal() as session:
+                        audit = session.query(ExecutionAuditORM).one()
+
+                self.assertEqual(preview.ticker, "AAPL")
+                self.assertEqual(preview.gate_result, "allowed")
+                self.assertIsNotNone(preview.execution_audit_id)
+                self.assertEqual(audit.lifecycle_status, "previewed")
+            finally:
+                engine.dispose()
+
+    def test_place_audit_persists_recommended_action_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                service = ExecutionService()
+                original_kill = service.settings.paper_loop_kill_switch
+                original_require = service.settings.require_readyz_for_execution
+                self.addCleanup(setattr, service.settings, "paper_loop_kill_switch", original_kill)
+                self.addCleanup(setattr, service.settings, "require_readyz_for_execution", original_require)
+                service.settings.paper_loop_kill_switch = False
+                service.settings.require_readyz_for_execution = False
+                service.alpaca.get_latest_price = AsyncMock(return_value=100.0)
+                service.risk.evaluate_trade = lambda **_: TradeEligibility(
+                    ticker="AAPL",
+                    asset_type="stock",
+                    requested_side="buy",
+                    required_signal="BUY",
+                    horizon="1h",
+                    execution_eligibility="eligible",
+                    latest_scan_fresh=True,
+                    allowed=True,
+                    reason="Eligible.",
+                    notional_estimate=100.0,
+                    qty=1.0,
+                )
+
+                with patch.object(execution_module, "SessionLocal", SessionLocal), patch.object(
+                    automation_repository_module,
+                    "SessionLocal",
+                    SessionLocal,
+                ):
+                    response = asyncio.run(
+                        service.place(
+                            OrderPlaceRequest(
+                                ticker="AAPL",
+                                side="buy",
+                                qty=1,
+                                dry_run=True,
+                                idempotency_key="snapshot-place-1",
+                                recommended_action_snapshot="dry_run",
+                            )
+                        )
+                    )
+                    with SessionLocal() as session:
+                        audit = session.query(ExecutionAuditORM).one()
+
+                self.assertTrue(response.ok)
+                self.assertEqual(response.recommended_action_snapshot, "dry_run")
+                self.assertEqual(audit.recommended_action_snapshot, "dry_run")
+            finally:
+                engine.dispose()
+
     def test_place_rejects_non_dry_run_at_service_layer(self) -> None:
         service = ExecutionService()
         service.alpaca.get_latest_price = AsyncMock()

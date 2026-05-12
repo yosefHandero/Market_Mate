@@ -240,6 +240,11 @@ class AutomationRepository:
                     .limit(1)
                 ).scalar_one_or_none()
                 if open_position is None:
+                    if intent.execution_audit_id is not None:
+                        audit = session.get(ExecutionAuditORM, intent.execution_audit_id)
+                        if audit is not None:
+                            self._mark_sell_without_open_audit_failed(audit, filled_time)
+                            session.commit()
                     return None
                 quantity = float(open_position.quantity or 0.0)
                 if quantity <= 0:
@@ -322,6 +327,8 @@ class AutomationRepository:
                     .limit(1)
                 ).scalar_one_or_none()
                 if open_position is None:
+                    self._mark_sell_without_open_audit_failed(audit, filled_time)
+                    session.commit()
                     return None
                 open_quantity = float(open_position.quantity or 0.0)
                 if open_quantity <= 0:
@@ -371,6 +378,15 @@ class AutomationRepository:
             session.commit()
             session.refresh(position)
             return position.id
+
+    def _mark_sell_without_open_audit_failed(
+        self,
+        audit: ExecutionAuditORM,
+        updated_at: datetime,
+    ) -> None:
+        audit.error_message = "sell_without_open_position"
+        audit.lifecycle_status = "failed"
+        audit.updated_at = updated_at
 
     def list_recoverable_intents(self, *, now: datetime, limit: int = 25) -> list[AutomationIntentORM]:
         recoverable_statuses = [

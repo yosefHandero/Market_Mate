@@ -17,7 +17,10 @@ import app.db as db_module
 import app.services.execution as execution_module
 import app.services.readiness as readiness_module
 from app.db import SchemaStatus
-from app.dependencies import execution_service as global_execution_service
+from app.dependencies import (
+    execution_service as global_execution_service,
+    scheduler_service as global_scheduler_service,
+)
 
 
 class MainRouteTests(unittest.TestCase):
@@ -54,6 +57,26 @@ class MainRouteTests(unittest.TestCase):
         self.public_schema_status_mock = Mock(return_value=schema_status)
         self.readiness_schema_status_mock = Mock(return_value=schema_status)
         self.startup_schema_status_mock = Mock(return_value=schema_status)
+        self.startup_maintenance_mock = AsyncMock(
+            return_value=types.SimpleNamespace(
+                repaired_signal_outcome_returns=None,
+                relinked_execution_audits=None,
+                recovered_automation_intents=None,
+                ran_tasks=(),
+                skipped_tasks=(),
+            )
+        )
+        self.scheduler_state_mock = Mock(
+            return_value=types.SimpleNamespace(
+                enabled=False,
+                running=False,
+                interval_seconds=300,
+                next_run_at=None,
+                last_run_started_at=None,
+                last_run_finished_at=None,
+                last_error=None,
+            )
+        )
         fresh_scan = datetime.now(timezone.utc) - timedelta(minutes=5)
         coinbase_settings = main_module.coinbase_market_data_service.settings
         original_coinbase_ws_enabled = coinbase_settings.coinbase_ws_enabled
@@ -69,6 +92,12 @@ class MainRouteTests(unittest.TestCase):
             patch.object(readiness_module, "get_schema_status", self.readiness_schema_status_mock),
             patch.object(readiness_module, "check_database_connection", Mock(return_value=True)),
             patch.object(main_module, "get_schema_status", self.startup_schema_status_mock),
+            patch.object(
+                main_module.StartupMaintenanceService,
+                "run_if_due",
+                self.startup_maintenance_mock,
+            ),
+            patch.object(global_scheduler_service, "state", self.scheduler_state_mock),
             patch.object(
                 main_module.scan_repository,
                 "get_latest_run_timestamp",
@@ -192,6 +221,25 @@ class MainRouteTests(unittest.TestCase):
 
         forbidden_patch.assert_not_called()
         self.startup_schema_status_mock.assert_called()
+
+    def test_lifespan_runs_startup_maintenance_service(self) -> None:
+        with patch.object(
+            main_module.scan_repository,
+            "sync_signal_outcome_returns",
+            Mock(side_effect=AssertionError("startup must use StartupMaintenanceService")),
+        ), patch.object(
+            main_module.scan_repository,
+            "backfill_execution_audit_signal_links",
+            Mock(side_effect=AssertionError("startup must use StartupMaintenanceService")),
+        ), patch.object(
+            main_module.automation_service,
+            "recover_due_intents",
+            AsyncMock(side_effect=AssertionError("startup must use StartupMaintenanceService")),
+        ):
+            with TestClient(main_module.create_app()):
+                pass
+
+        self.startup_maintenance_mock.assert_awaited_once()
 
     def test_readyz_reports_stale_scan_as_not_ready(self) -> None:
         with patch.object(

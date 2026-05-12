@@ -26,6 +26,7 @@ from app.dependencies import (
 from app.errors import AppError
 from app.logging_utils import configure_logging
 from app.middleware import RequestContextMiddleware
+from app.services.startup_maintenance import StartupMaintenanceService
 
 settings = get_settings()
 configure_logging()
@@ -50,18 +51,22 @@ async def lifespan(_: FastAPI):
             "missing_items": schema_status.missing_items,
         },
     )
-    repaired_rows = scan_repository.sync_signal_outcome_returns()
-    relinked_audits = scan_repository.backfill_execution_audit_signal_links()
-    recovered_automation_intents = await automation_service.recover_due_intents()
+    startup_maintenance_result = await StartupMaintenanceService(
+        sync_signal_outcome_returns=scan_repository.sync_signal_outcome_returns,
+        backfill_execution_audit_signal_links=scan_repository.backfill_execution_audit_signal_links,
+        recover_due_intents=automation_service.recover_due_intents,
+    ).run_if_due()
     logger.info(
         "startup completed",
         extra={
             "event": "startup",
             "schema_ok": schema_status.ok,
             "missing_schema_items": schema_status.missing_items,
-            "repaired_signal_outcome_returns": repaired_rows,
-            "relinked_execution_audits": relinked_audits,
-            "recovered_automation_intents": recovered_automation_intents,
+            "repaired_signal_outcome_returns": startup_maintenance_result.repaired_signal_outcome_returns,
+            "relinked_execution_audits": startup_maintenance_result.relinked_execution_audits,
+            "recovered_automation_intents": startup_maintenance_result.recovered_automation_intents,
+            "startup_maintenance_ran_tasks": list(startup_maintenance_result.ran_tasks),
+            "startup_maintenance_skipped_tasks": list(startup_maintenance_result.skipped_tasks),
         },
     )
     try:

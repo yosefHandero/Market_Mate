@@ -334,6 +334,7 @@ class ExecutionAuditSummary(BaseModel):
     gate_consistent_with_signal: bool | None = None
     trade_gate_allowed: bool | None = None
     trade_gate_reason: str | None = None
+    recommended_action_snapshot: str | None = None
     submitted: bool = False
     broker_order_id: str | None = None
     broker_status: str | None = None
@@ -852,6 +853,7 @@ class ReconciliationReportResponse(BaseModel):
     ok: bool
     total_issues: int
     issues: list[ReconciliationIssue] = []
+    issues_by_kind: dict[str, int] = {}
 
 
 class StrategySignalContractResponse(BaseModel):
