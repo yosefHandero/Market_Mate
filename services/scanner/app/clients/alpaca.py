@@ -19,6 +19,7 @@ class AlpacaClient:
         }
         self._async_client = httpx.AsyncClient(timeout=self.timeout)
         self._guard = AsyncProviderGuard("alpaca", pace_seconds=0.1)
+        self._last_alpaca_served_stale = False
 
     async def _request_json(self, method: str, url: str, **kwargs: Any) -> Any:
         await self._guard.throttle()
@@ -34,6 +35,11 @@ class AlpacaClient:
 
     def _latest_cache_key(self, namespace: str, symbols: list[str], timeframe: str) -> tuple[str, tuple[str, ...], str]:
         return namespace, tuple(sorted(symbol.upper() for symbol in symbols if symbol)), timeframe
+
+    def consume_last_stale_flag(self) -> bool:
+        served_stale = self._last_alpaca_served_stale
+        self._last_alpaca_served_stale = False
+        return served_stale
 
     def _require_credentials(self) -> None:
         if not self.settings.alpaca_api_key or not self.settings.alpaca_api_secret:
@@ -178,12 +184,16 @@ class AlpacaClient:
         self._require_credentials()
         if not symbols:
             return {}
-        return await self._guard.cached_call(
-            key=self._latest_cache_key("stocks", symbols, timeframe),
+        key = self._latest_cache_key("stocks", symbols, timeframe)
+        bars = await self._guard.cached_call(
+            key=key,
             ttl_seconds=self.settings.alpaca_latest_data_cache_seconds,
             stale_ttl_seconds=max(self.settings.alpaca_latest_data_cache_seconds * 6, 15),
             fetcher=lambda: self._get_latest_bars_uncached(symbols=symbols, timeframe=timeframe),
         )
+        if self._guard.last_served_stale_for(key):
+            self._last_alpaca_served_stale = True
+        return bars
 
     async def get_latest_crypto_bars(
         self,
@@ -193,12 +203,16 @@ class AlpacaClient:
         self._require_credentials()
         if not symbols:
             return {}
-        return await self._guard.cached_call(
-            key=self._latest_cache_key("crypto", symbols, timeframe),
+        key = self._latest_cache_key("crypto", symbols, timeframe)
+        bars = await self._guard.cached_call(
+            key=key,
             ttl_seconds=self.settings.alpaca_latest_data_cache_seconds,
             stale_ttl_seconds=max(self.settings.alpaca_latest_data_cache_seconds * 6, 15),
             fetcher=lambda: self._get_latest_crypto_bars_uncached(symbols=symbols, timeframe=timeframe),
         )
+        if self._guard.last_served_stale_for(key):
+            self._last_alpaca_served_stale = True
+        return bars
 
     async def _get_latest_bars_uncached(
         self,

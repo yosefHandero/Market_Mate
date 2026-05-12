@@ -159,6 +159,53 @@ class ScannerService:
         )
         return round((comparable_observed - comparable_parsed).total_seconds() / 60, 2)
 
+    @staticmethod
+    def _as_utc_datetime(value: datetime) -> datetime:
+        return value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+    def _coinbase_ws_age_minutes(self, item: dict, observed_at: datetime) -> float | None:
+        timestamp = item.get("coinbase_price_received_at")
+        if timestamp is None:
+            return None
+        if isinstance(timestamp, datetime):
+            parsed = timestamp
+        elif isinstance(timestamp, str):
+            try:
+                parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        return round((self._as_utc_datetime(observed_at) - self._as_utc_datetime(parsed)).total_seconds() / 60, 2)
+
+    def _effective_bar_age_minutes(self, *, asset_type: str, item: dict, observed_at: datetime) -> float | None:
+        alpaca_bar_age = self._latest_bar_age_minutes(item, observed_at)
+        if asset_type != "crypto":
+            return alpaca_bar_age
+        ws_age = self._coinbase_ws_age_minutes(item, observed_at)
+        if ws_age is None:
+            return alpaca_bar_age
+        if alpaca_bar_age is None:
+            return ws_age
+        return min(alpaca_bar_age, ws_age)
+
+    def _market_bars_freshness_flag(self, *, asset_type: str, item: dict, observed_at: datetime) -> str:
+        alpaca_bar_age = self._latest_bar_age_minutes(item, observed_at)
+        ws_age = self._coinbase_ws_age_minutes(item, observed_at) if asset_type == "crypto" else None
+        effective_age = self._effective_bar_age_minutes(asset_type=asset_type, item=item, observed_at=observed_at)
+        if effective_age is None:
+            return "missing"
+        if effective_age > self.settings.provider_max_bar_age_minutes:
+            return "stale"
+        if (
+            asset_type == "crypto"
+            and ws_age is not None
+            and ws_age <= self.settings.provider_max_bar_age_minutes
+            and (alpaca_bar_age is None or ws_age <= alpaca_bar_age)
+        ):
+            return "ws_override"
+        return "ok"
+
     def _gate_signal(
         self,
         *,
@@ -367,6 +414,7 @@ class ScannerService:
         coingecko_context: dict | None,
         options_snapshot: OptionsFlowSnapshot,
         news_warnings: list[str],
+        alpaca_served_stale_cache: bool | None = None,
         sec_snapshot: SECCatalystSnapshot | None = None,
         binance_snapshot: BinanceMicrostructureSnapshot | None = None,
         deribit_snapshot: DeribitPositioningSnapshot | None = None,
@@ -376,7 +424,15 @@ class ScannerService:
     ) -> tuple[str, list[str]]:
         warnings = list(news_warnings)
         critical_warnings: list[str] = []
-        latest_bar_age_minutes = self._latest_bar_age_minutes(item, observed_at)
+        if alpaca_served_stale_cache is None:
+            alpaca_served_stale_cache = self.alpaca.consume_last_stale_flag()
+        if alpaca_served_stale_cache:
+            warnings.append("alpaca_served_stale_cache")
+        latest_bar_age_minutes = self._effective_bar_age_minutes(
+            asset_type=asset_type,
+            item=item,
+            observed_at=observed_at,
+        )
         if latest_bar_age_minutes is None:
             critical_warnings.append("market_bars_missing")
         elif latest_bar_age_minutes > self.settings.provider_max_bar_age_minutes:
@@ -441,14 +497,11 @@ class ScannerService:
         breadth_snapshot: BreadthSnapshot | None = None,
         defillama_snapshot: DefiLlamaSnapshot | None = None,
     ) -> dict[str, str]:
-        bar_age = self._latest_bar_age_minutes(item, observed_at)
         flags: dict[str, str] = {
-            "market_bars": (
-                "missing"
-                if bar_age is None
-                else "stale"
-                if bar_age > self.settings.provider_max_bar_age_minutes
-                else "ok"
+            "market_bars": self._market_bars_freshness_flag(
+                asset_type=asset_type,
+                item=item,
+                observed_at=observed_at,
             ),
             "directional_news": "fallback" if news_source in {"cache", "insufficient"} else "ok",
             "options_flow": (
@@ -511,6 +564,7 @@ class ScannerService:
         fred_snapshot: FREDMacroSnapshot | None = None,
         breadth_snapshot: BreadthSnapshot | None = None,
         defillama_snapshot: DefiLlamaSnapshot | None = None,
+        alpaca_served_stale_cache: bool | None = None,
     ) -> ScanResult | None:
         async with self._analyze_semaphore:
             return await self._analyze_ticker_impl(
@@ -529,6 +583,7 @@ class ScannerService:
                 fred_snapshot=fred_snapshot,
                 breadth_snapshot=breadth_snapshot,
                 defillama_snapshot=defillama_snapshot,
+                alpaca_served_stale_cache=alpaca_served_stale_cache,
             )
 
     async def _analyze_ticker_impl(
@@ -549,6 +604,7 @@ class ScannerService:
         fred_snapshot: FREDMacroSnapshot | None = None,
         breadth_snapshot: BreadthSnapshot | None = None,
         defillama_snapshot: DefiLlamaSnapshot | None = None,
+        alpaca_served_stale_cache: bool | None = None,
     ) -> ScanResult | None:
         if not item or (asset_type == "stock" and ticker in {"SPY", "QQQ"}):
             return None
@@ -635,13 +691,18 @@ class ScannerService:
             sec_snapshot=sec_snapshot,
             options_snapshot=options_flow_snapshot,
             news_warnings=news_warnings,
+            alpaca_served_stale_cache=alpaca_served_stale_cache,
             binance_snapshot=binance_snapshot,
             deribit_snapshot=deribit_snapshot,
             fred_snapshot=fred_snapshot,
             breadth_snapshot=breadth_snapshot,
             defillama_snapshot=defillama_snapshot,
         )
-        bar_age_minutes = self._latest_bar_age_minutes(item, created_at)
+        bar_age_minutes = self._effective_bar_age_minutes(
+            asset_type=asset_type,
+            item=item,
+            observed_at=created_at,
+        )
         freshness_flags = self._freshness_flags(
             asset_type=asset_type,
             item=item,
@@ -990,6 +1051,7 @@ class ScannerService:
             fred_task if fred_task is not None else asyncio.sleep(0, result=None),
             defillama_task if defillama_task is not None else asyncio.sleep(0, result=None),
         )
+        alpaca_served_stale_cache = self.alpaca.consume_last_stale_flag()
         crypto_bars = self.market_data_service.apply_crypto_price_overrides(crypto_bars)
         market_status, spy_change_pct, qqq_change_pct = self._compute_market_status(stock_bars)
         fear_greed_value, fear_greed_label = fear_greed
@@ -1020,6 +1082,7 @@ class ScannerService:
                     created_at=created_at,
                     fred_snapshot=fred_snapshot,
                     breadth_snapshot=stock_breadth,
+                    alpaca_served_stale_cache=alpaca_served_stale_cache,
                 )
                 for ticker in stock_watchlist
             ],
@@ -1040,6 +1103,7 @@ class ScannerService:
                     fred_snapshot=fred_snapshot,
                     breadth_snapshot=crypto_breadth,
                     defillama_snapshot=defillama_snapshot,
+                    alpaca_served_stale_cache=alpaca_served_stale_cache,
                 )
                 for ticker in crypto_watchlist
             ],

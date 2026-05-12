@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from app.auth import require_read_access
 from app.config import get_settings
@@ -131,11 +131,25 @@ async def livez(
 @router.get("/readyz", response_model=HealthResponse)
 async def readyz(
     request: Request,
+    response: Response,
     scheduler_service: SchedulerService = Depends(get_scheduler_service),
     scan_repository: ScanRepository = Depends(get_scan_repository),
 ) -> HealthResponse:
     settings = get_settings()
     schema_status = get_schema_status()
+    if not schema_status.ok:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return HealthResponse(
+            ok=False,
+            env=settings.app_env,
+            app_version=settings.app_version,
+            ready=False,
+            live=True,
+            schema_ok=False,
+            missing_schema_items=schema_status.missing_items,
+            max_stale_minutes=settings.health_max_stale_minutes,
+            request_id=getattr(request.state, "request_id", None),
+        )
     scheduler_state = scheduler_service.state()
     last_scan_at = scan_repository.get_latest_run_timestamp()
     trust_snapshot = scan_repository.get_trust_readiness_snapshot()
@@ -205,10 +219,11 @@ async def startupz(
 @router.get("/health", response_model=HealthResponse)
 async def health(
     request: Request,
+    response: Response,
     scheduler_service: SchedulerService = Depends(get_scheduler_service),
     scan_repository: ScanRepository = Depends(get_scan_repository),
 ) -> HealthResponse:
-    return await readyz(request, scheduler_service, scan_repository)
+    return await readyz(request, response, scheduler_service, scan_repository)
 
 
 @router.get("/strategy/contract", response_model=StrategyContractResponse)

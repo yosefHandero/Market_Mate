@@ -20,6 +20,7 @@ from app.clients.fred import FREDClient
 from app.clients.options_flow import OptionsFlowClient
 from app.clients.sec import SECClient
 from app.http_client import request_json
+from app.provider_resilience import AsyncProviderGuard
 from app.schemas import OptionsFlowSnapshot
 
 
@@ -55,6 +56,37 @@ class HttpClientResilienceTests(unittest.TestCase):
 
 
 class ProviderCacheTests(unittest.TestCase):
+    def test_stale_cache_serve_is_observable_via_last_served_stale_for(self) -> None:
+        guard = AsyncProviderGuard("test")
+        key = ("bars", "AAPL")
+
+        async def run() -> tuple[dict, dict, bool]:
+            async def fetch_success() -> dict:
+                return {"AAPL": {"latest_price": 100.0}}
+
+            async def fetch_failure() -> dict:
+                raise RuntimeError("provider unavailable")
+
+            first = await guard.cached_call(
+                key=key,
+                fetcher=fetch_success,
+                ttl_seconds=0,
+                stale_ttl_seconds=30,
+            )
+            self.assertFalse(guard.last_served_stale_for(key))
+
+            second = await guard.cached_call(
+                key=key,
+                fetcher=fetch_failure,
+                ttl_seconds=0,
+                stale_ttl_seconds=30,
+            )
+            return first, second, guard.last_served_stale_for(key)
+
+        first_payload, second_payload, served_stale = asyncio.run(run())
+        self.assertEqual(second_payload, first_payload)
+        self.assertTrue(served_stale)
+
     def test_sec_client_caches_company_mapping_and_filings(self) -> None:
         client = SECClient()
         mapping_payload = {"0": {"ticker": "AAPL", "cik_str": 320193}}

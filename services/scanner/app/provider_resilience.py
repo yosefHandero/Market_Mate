@@ -18,9 +18,13 @@ class AsyncProviderGuard:
         self.pace_seconds = max(float(pace_seconds), 0.0)
         self._cache: dict[Any, _CacheEntry] = {}
         self._inflight: dict[Any, asyncio.Task[Any]] = {}
+        self._last_served_stale: dict[Any, bool] = {}
         self._cache_lock = asyncio.Lock()
         self._pace_lock = asyncio.Lock()
         self._next_allowed_at = 0.0
+
+    def last_served_stale_for(self, key: Any) -> bool:
+        return bool(self._last_served_stale.get(key))
 
     async def throttle(self) -> None:
         if self.pace_seconds <= 0:
@@ -56,6 +60,7 @@ class AsyncProviderGuard:
         async with self._cache_lock:
             cached = self._get_cached_unlocked(key)
             if cached is not None:
+                self._record_stale_served_unlocked(key, False)
                 return cached
             inflight = self._inflight.get(key)
             if inflight is None:
@@ -89,6 +94,7 @@ class AsyncProviderGuard:
             value = await fetcher()
         except Exception:
             if stale_entry is not None and stale_entry.stale_until > asyncio.get_running_loop().time():
+                await self._record_stale_served(key, True)
                 return stale_entry.value
             raise
 
@@ -99,11 +105,15 @@ class AsyncProviderGuard:
                 ttl_seconds=max(float(ttl_seconds), 0.0),
                 stale_ttl_seconds=max(float(stale_ttl_seconds), 0.0),
             )
+        await self._record_stale_served(key, False)
         return value
 
     async def _get_cached(self, key: Any) -> Any | None:
         async with self._cache_lock:
-            return self._get_cached_unlocked(key)
+            cached = self._get_cached_unlocked(key)
+            if cached is not None:
+                self._record_stale_served_unlocked(key, False)
+            return cached
 
     def _get_cached_unlocked(self, key: Any) -> Any | None:
         entry = self._cache.get(key)
@@ -142,3 +152,13 @@ class AsyncProviderGuard:
                 expires_at=now + ttl_seconds,
                 stale_until=now + max(ttl_seconds, stale_ttl_seconds),
             )
+
+    async def _record_stale_served(self, key: Any, served_stale: bool) -> None:
+        async with self._cache_lock:
+            self._record_stale_served_unlocked(key, served_stale)
+
+    def _record_stale_served_unlocked(self, key: Any, served_stale: bool) -> None:
+        if served_stale:
+            self._last_served_stale[key] = True
+        else:
+            self._last_served_stale.pop(key, None)

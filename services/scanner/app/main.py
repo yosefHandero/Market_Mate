@@ -12,7 +12,7 @@ from app.api.admin import router as admin_router
 from app.api.public import protected_router as protected_public_router
 from app.api.public import router as public_router
 from app.config import get_settings
-from app.db import apply_required_schema_patches
+from app.db import get_schema_status
 from app.dependencies import (
     automation_service,
     coinbase_market_data_service,
@@ -41,7 +41,15 @@ async def lifespan(_: FastAPI):
             coinbase_market_data_service.run_forever(),
             name="coinbase-advanced-trade-ws",
         )
-    schema_patches = apply_required_schema_patches()
+    schema_status = get_schema_status()
+    logger.info(
+        "startup schema status",
+        extra={
+            "event": "startup_schema_status",
+            "ok": schema_status.ok,
+            "missing_items": schema_status.missing_items,
+        },
+    )
     repaired_rows = scan_repository.sync_signal_outcome_returns()
     relinked_audits = scan_repository.backfill_execution_audit_signal_links()
     recovered_automation_intents = await automation_service.recover_due_intents()
@@ -49,7 +57,8 @@ async def lifespan(_: FastAPI):
         "startup completed",
         extra={
             "event": "startup",
-            "schema_patches_applied": schema_patches,
+            "schema_ok": schema_status.ok,
+            "missing_schema_items": schema_status.missing_items,
             "repaired_signal_outcome_returns": repaired_rows,
             "relinked_execution_audits": relinked_audits,
             "recovered_automation_intents": recovered_automation_intents,

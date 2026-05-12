@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import sys
 import types
@@ -16,6 +16,30 @@ from app.services.scanner import ScannerService
 
 
 class ScannerServiceHardeningTests(unittest.TestCase):
+    def _freshness_kwargs(self, *, asset_type: str) -> dict:
+        return {
+            "asset_type": asset_type,
+            "news_source": "marketaux+finnhub",
+            "options_snapshot": SimpleNamespace(summary="Not applicable for crypto."),
+            "fear_greed_value": 55 if asset_type == "crypto" else None,
+            "coingecko_context": {"market_cap_change_pct_24h": 1.2} if asset_type == "crypto" else None,
+        }
+
+    def _provider_health_kwargs(self, *, asset_type: str) -> dict:
+        return {
+            "asset_type": asset_type,
+            "data_quality": "ok",
+            "fear_greed_value": 55 if asset_type == "crypto" else None,
+            "coingecko_context": {"market_cap_change_pct_24h": 1.2} if asset_type == "crypto" else None,
+            "options_snapshot": SimpleNamespace(summary="Not applicable for crypto."),
+            "news_warnings": [],
+        }
+
+    def _use_provider_max_bar_age(self, service: ScannerService, minutes: int) -> None:
+        original_max_age = service.settings.provider_max_bar_age_minutes
+        service.settings.provider_max_bar_age_minutes = minutes
+        self.addCleanup(setattr, service.settings, "provider_max_bar_age_minutes", original_max_age)
+
     def test_gate_signal_uses_shared_evidence_evaluator(self) -> None:
         service = ScannerService()
         service.repo.calibrate_signal = MagicMock(return_value=(72.0, "60-69", "signal"))
@@ -148,6 +172,130 @@ class ScannerServiceHardeningTests(unittest.TestCase):
 
         self.assertEqual(provider_status, "ok")
         self.assertEqual(warnings, [])
+
+    def test_alpaca_stale_cache_marks_provider_degraded_not_critical(self) -> None:
+        service = ScannerService()
+        observed_at = datetime.now(timezone.utc)
+        service.alpaca.consume_last_stale_flag = MagicMock(return_value=True)
+
+        provider_status, warnings = service._provider_health(
+            item={"bars": [{"t": observed_at.isoformat()}]},
+            observed_at=observed_at,
+            **self._provider_health_kwargs(asset_type="crypto"),
+        )
+
+        self.assertEqual(provider_status, "degraded")
+        self.assertNotEqual(provider_status, "critical")
+        self.assertIn("alpaca_served_stale_cache", warnings)
+        service.alpaca.consume_last_stale_flag.assert_called_once()
+
+    def test_crypto_ws_override_makes_bars_fresh_when_alpaca_is_stale(self) -> None:
+        service = ScannerService()
+        self._use_provider_max_bar_age(service, 15)
+        observed_at = datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc)
+        item = {
+            "bars": [{"t": (observed_at - timedelta(minutes=90)).isoformat()}],
+            "coinbase_price_received_at": (observed_at - timedelta(minutes=2)).isoformat(),
+        }
+
+        effective_age = service._effective_bar_age_minutes(
+            asset_type="crypto",
+            item=item,
+            observed_at=observed_at,
+        )
+        flags = service._freshness_flags(
+            item=item,
+            observed_at=observed_at,
+            **self._freshness_kwargs(asset_type="crypto"),
+        )
+        provider_status, warnings = service._provider_health(
+            item=item,
+            observed_at=observed_at,
+            **self._provider_health_kwargs(asset_type="crypto"),
+        )
+
+        self.assertEqual(effective_age, 2.0)
+        self.assertEqual(flags["market_bars"], "ws_override")
+        self.assertNotEqual(provider_status, "critical")
+        self.assertNotIn("market_bars_stale", warnings)
+        self.assertNotIn("market_bars_missing", warnings)
+
+    def test_crypto_ws_stale_still_triggers_stale_flag_when_both_sources_stale(self) -> None:
+        service = ScannerService()
+        self._use_provider_max_bar_age(service, 15)
+        observed_at = datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc)
+        item = {
+            "bars": [{"t": (observed_at - timedelta(minutes=90)).isoformat()}],
+            "coinbase_price_received_at": (observed_at - timedelta(minutes=45)).isoformat(),
+        }
+
+        flags = service._freshness_flags(
+            item=item,
+            observed_at=observed_at,
+            **self._freshness_kwargs(asset_type="crypto"),
+        )
+        provider_status, warnings = service._provider_health(
+            item=item,
+            observed_at=observed_at,
+            **self._provider_health_kwargs(asset_type="crypto"),
+        )
+
+        self.assertEqual(flags["market_bars"], "stale")
+        self.assertEqual(provider_status, "critical")
+        self.assertIn("market_bars_stale", warnings)
+
+    def test_crypto_missing_ws_keeps_existing_stale_behavior(self) -> None:
+        service = ScannerService()
+        self._use_provider_max_bar_age(service, 15)
+        observed_at = datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc)
+        item = {
+            "bars": [{"t": (observed_at - timedelta(minutes=90)).isoformat()}],
+        }
+
+        flags = service._freshness_flags(
+            item=item,
+            observed_at=observed_at,
+            **self._freshness_kwargs(asset_type="crypto"),
+        )
+        provider_status, warnings = service._provider_health(
+            item=item,
+            observed_at=observed_at,
+            **self._provider_health_kwargs(asset_type="crypto"),
+        )
+
+        self.assertEqual(flags["market_bars"], "stale")
+        self.assertEqual(provider_status, "critical")
+        self.assertIn("market_bars_stale", warnings)
+
+    def test_stock_path_ignores_coinbase_ws_override(self) -> None:
+        service = ScannerService()
+        self._use_provider_max_bar_age(service, 15)
+        observed_at = datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc)
+        item = {
+            "bars": [{"t": (observed_at - timedelta(minutes=90)).isoformat()}],
+            "coinbase_price_received_at": (observed_at - timedelta(minutes=2)).isoformat(),
+        }
+
+        effective_age = service._effective_bar_age_minutes(
+            asset_type="stock",
+            item=item,
+            observed_at=observed_at,
+        )
+        flags = service._freshness_flags(
+            item=item,
+            observed_at=observed_at,
+            **self._freshness_kwargs(asset_type="stock"),
+        )
+        provider_status, warnings = service._provider_health(
+            item=item,
+            observed_at=observed_at,
+            **self._provider_health_kwargs(asset_type="stock"),
+        )
+
+        self.assertEqual(effective_age, 90.0)
+        self.assertEqual(flags["market_bars"], "stale")
+        self.assertEqual(provider_status, "critical")
+        self.assertIn("market_bars_stale", warnings)
 
     def test_run_scan_overlays_coinbase_crypto_prices_when_available(self) -> None:
         market_data_service = MagicMock()

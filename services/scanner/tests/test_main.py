@@ -12,14 +12,92 @@ if "yahooquery" not in sys.modules:
     sys.modules["yahooquery"] = yahooquery_stub
 
 import app.main as main_module
+import app.api.public as public_module
+import app.db as db_module
 import app.services.execution as execution_module
-from app.db import apply_required_schema_patches
+import app.services.readiness as readiness_module
+from app.db import SchemaStatus
 from app.dependencies import execution_service as global_execution_service
 
 
 class MainRouteTests(unittest.TestCase):
+    def _sample_trust_snapshot(self):
+        return types.SimpleNamespace(
+            window=types.SimpleNamespace(
+                start=datetime(2026, 3, 1, tzinfo=timezone.utc),
+                end=datetime(2026, 3, 31, tzinfo=timezone.utc),
+                days=30,
+            ),
+            summary=types.SimpleNamespace(
+                total_signals=2,
+                evaluated_count=2,
+                pending_count=0,
+                by_signal_and_gate=[
+                    types.SimpleNamespace(key="BUY:passed", evaluated_count=1),
+                    types.SimpleNamespace(key="SELL:passed", evaluated_count=1),
+                ],
+            ),
+            threshold=types.SimpleNamespace(
+                recommendation=types.SimpleNamespace(
+                    evidence_status="ready",
+                    source="test",
+                    warnings=[],
+                ),
+            ),
+            pending_due_15m_count=0,
+            pending_due_1h_count=0,
+            pending_due_1d_count=0,
+        )
+
     def setUp(self) -> None:
-        apply_required_schema_patches()
+        schema_status = SchemaStatus(ok=True, applied_changes=[], missing_items=[])
+        self.public_schema_status_mock = Mock(return_value=schema_status)
+        self.readiness_schema_status_mock = Mock(return_value=schema_status)
+        self.startup_schema_status_mock = Mock(return_value=schema_status)
+        fresh_scan = datetime.now(timezone.utc) - timedelta(minutes=5)
+        coinbase_settings = main_module.coinbase_market_data_service.settings
+        original_coinbase_ws_enabled = coinbase_settings.coinbase_ws_enabled
+        coinbase_settings.coinbase_ws_enabled = False
+        self.addCleanup(
+            setattr,
+            coinbase_settings,
+            "coinbase_ws_enabled",
+            original_coinbase_ws_enabled,
+        )
+        patchers = [
+            patch.object(public_module, "get_schema_status", self.public_schema_status_mock),
+            patch.object(readiness_module, "get_schema_status", self.readiness_schema_status_mock),
+            patch.object(readiness_module, "check_database_connection", Mock(return_value=True)),
+            patch.object(main_module, "get_schema_status", self.startup_schema_status_mock),
+            patch.object(
+                main_module.scan_repository,
+                "get_latest_run_timestamp",
+                Mock(return_value=fresh_scan),
+            ),
+            patch.object(
+                main_module.scan_repository,
+                "get_trust_readiness_snapshot",
+                Mock(return_value=self._sample_trust_snapshot()),
+            ),
+            patch.object(
+                main_module.scan_repository,
+                "sync_signal_outcome_returns",
+                Mock(return_value=0),
+            ),
+            patch.object(
+                main_module.scan_repository,
+                "backfill_execution_audit_signal_links",
+                Mock(return_value=0),
+            ),
+            patch.object(
+                main_module.automation_service,
+                "recover_due_intents",
+                AsyncMock(return_value=0),
+            ),
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.client = TestClient(main_module.app)
         # Default config uses fail-closed read access; most route tests expect open reads.
         main_module.settings.public_read_access_enabled = True
@@ -96,6 +174,25 @@ class MainRouteTests(unittest.TestCase):
         self.assertNotIn("database_path", body)
         self.assertIn("request_id", body)
 
+    def test_lifespan_does_not_apply_schema_patches(self) -> None:
+        forbidden_patch = Mock(side_effect=AssertionError("startup must not auto-repair schema"))
+
+        with patch.object(
+            main_module,
+            "apply_required_schema_patches",
+            forbidden_patch,
+            create=True,
+        ), patch.object(
+            db_module,
+            "apply_required_schema_patches",
+            forbidden_patch,
+        ):
+            with TestClient(main_module.create_app()):
+                pass
+
+        forbidden_patch.assert_not_called()
+        self.startup_schema_status_mock.assert_called()
+
     def test_readyz_reports_stale_scan_as_not_ready(self) -> None:
         with patch.object(
             main_module.scan_repository,
@@ -122,6 +219,32 @@ class MainRouteTests(unittest.TestCase):
         self.assertFalse(body["ready"])
         self.assertFalse(body["scan_fresh"])
         self.assertIsNone(body["last_scan_at"])
+
+    def test_readyz_returns_503_when_schema_missing_items(self) -> None:
+        missing_status = SchemaStatus(
+            ok=False,
+            applied_changes=[],
+            missing_items=["scan_runs.strategy_variant"],
+        )
+        self.public_schema_status_mock.return_value = missing_status
+        self.readiness_schema_status_mock.return_value = missing_status
+
+        with patch.object(
+            main_module.scan_repository,
+            "get_latest_run_timestamp",
+            Mock(side_effect=AssertionError("schema-missing readyz should short-circuit")),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_trust_readiness_snapshot",
+            Mock(side_effect=AssertionError("schema-missing readyz should short-circuit")),
+        ):
+            response = self.client.get("/readyz")
+
+        self.assertEqual(response.status_code, 503)
+        body = response.json()
+        self.assertFalse(body["ready"])
+        self.assertFalse(body["schema_ok"])
+        self.assertEqual(["scan_runs.strategy_variant"], body["missing_schema_items"])
 
     def test_readyz_reports_trust_window_metadata_when_scan_is_fresh(self) -> None:
         fresh_scan = datetime.now(timezone.utc) - timedelta(minutes=5)

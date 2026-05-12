@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from sqlalchemy import create_engine, inspect, text
@@ -8,6 +9,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from app.config import get_settings
 
 settings = get_settings()
+SCANNER_SCHEMA_REPAIR_ALLOW_ENV = "SCANNER_SCHEMA_REPAIR_ALLOW"
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine = create_engine(
     settings.database_url,
@@ -266,7 +268,19 @@ def check_database_connection() -> bool:
 
 
 def apply_required_schema_patches() -> list[str]:
-    """Add missing columns declared in REQUIRED_TABLE_COLUMNS (SQLite-friendly ALTER ADD)."""
+    """
+    Deprecated manual repair path for missing schema pieces.
+
+    Runtime startup must not call this function. Alembic is the source of
+    truth; normal runtime paths should use get_schema_status(), which is
+    read-only. Set SCANNER_SCHEMA_REPAIR_ALLOW=1 only for an explicit manual
+    repair flow.
+    """
+    if os.environ.get(SCANNER_SCHEMA_REPAIR_ALLOW_ENV) != "1":
+        raise RuntimeError(
+            "apply_required_schema_patches is deprecated and disabled. "
+            f"Set {SCANNER_SCHEMA_REPAIR_ALLOW_ENV}=1 only for an explicit manual repair."
+        )
     applied: list[str] = []
     with engine.begin() as connection:
         for table_name, column_defs in REQUIRED_TABLE_COLUMNS.items():
