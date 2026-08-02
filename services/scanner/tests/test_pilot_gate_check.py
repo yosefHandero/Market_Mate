@@ -87,7 +87,7 @@ class EvaluateAssetTests(unittest.TestCase):
             snapshots,
             bench,
             holdout_ref,
-            holdout_matches=True,
+            holdout_current_engine=True,
             forward_days=7,
             total_resolved_selected=150,
         )
@@ -113,7 +113,7 @@ class EvaluateAssetTests(unittest.TestCase):
             snapshots,
             bench,
             {"upside_hit_rate_pct": 20.0, "resolved_count": 80},
-            holdout_matches=True,
+            holdout_current_engine=True,
             forward_days=7,
             total_resolved_selected=80,
         )
@@ -128,7 +128,7 @@ class EvaluateAssetTests(unittest.TestCase):
             [],
             bench,
             None,
-            holdout_matches=False,
+            holdout_current_engine=False,
             forward_days=7,
             total_resolved_selected=0,
         )

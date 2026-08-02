@@ -315,16 +315,21 @@ class Benchmark:
 # --- walk-forward holdout reference ------------------------------------------
 
 def wf_holdout_reference(
-    con: sqlite3.Connection, asset_type: str, campaign_fingerprint: str | None
+    con: sqlite3.Connection, asset_type: str
 ) -> tuple[dict | None, bool]:
-    """Return (holdout metric row, fingerprint_matches) for the latest WF run.
+    """Return (holdout metric row, is_current_engine) for the latest WF run.
 
-    fingerprint_matches is False when the stored run predates the current engine
-    (NULL fingerprint) or was computed under a different config than the campaign.
+    The WF engine's own manifest fingerprint lives in a different namespace than
+    the evidence-campaign fingerprint (the engine hashes proof-specific settings,
+    the campaign hashes scan/strategy settings), so they are never equal by design.
+    The meaningful gate is therefore that the latest run was produced by the
+    *current* engine - i.e. it carries a manifest (config_fingerprint, engine_version
+    and validation_start all present). Pre-engine runs left those NULL and cannot
+    serve as a holdout reference.
     """
     row = con.execute(
-        "select config_fingerprint, metrics_json from walk_forward_runs "
-        "order by created_at desc limit 1"
+        "select config_fingerprint, engine_version, validation_start, metrics_json "
+        "from walk_forward_runs order by created_at desc limit 1"
     ).fetchone()
     if row is None or not row["metrics_json"]:
         return None, False
@@ -340,9 +345,10 @@ def wf_holdout_reference(
         ),
         None,
     )
-    run_fp = row["config_fingerprint"]
-    matches = bool(run_fp) and bool(campaign_fingerprint) and run_fp == campaign_fingerprint
-    return holdout, matches
+    is_current_engine = bool(
+        row["config_fingerprint"] and row["engine_version"] and row["validation_start"]
+    )
+    return holdout, is_current_engine
 
 
 # --- per-asset evaluation ----------------------------------------------------
@@ -352,7 +358,7 @@ def evaluate_asset(
     snapshots: list[Snapshot],
     benchmark: Benchmark,
     holdout_ref: dict | None,
-    holdout_matches: bool,
+    holdout_current_engine: bool,
     forward_days: int,
     total_resolved_selected: int,
 ) -> AssetReport:
@@ -551,12 +557,12 @@ def evaluate_asset(
             INSUFFICIENT,
             "no walk-forward holdout row for this asset",
         )
-    elif not holdout_matches:
+    elif not holdout_current_engine:
         report.add(
             "live_inside_wf_holdout_ci",
             INSUFFICIENT,
-            "latest walk-forward run fingerprint does not match the campaign; "
-            "run POST /proof/walkforward/run under the current config first",
+            "latest walk-forward run predates the current engine (missing manifest); "
+            "run scripts/run_walkforward_proof.py (or POST /proof/walkforward/run) first",
         )
     elif not resolved:
         report.add("live_inside_wf_holdout_ci", INSUFFICIENT, "no live resolved samples")
@@ -730,16 +736,14 @@ def main() -> int:
         snapshots = load_snapshots(con, campaign["campaign_id"], asset_type)
         dates, closes = load_benchmark_series(con, BENCHMARK_SYMBOL[asset_type])
         benchmark = Benchmark(dates, closes)
-        holdout_ref, holdout_matches = wf_holdout_reference(
-            con, asset_type, campaign["config_fingerprint"]
-        )
+        holdout_ref, holdout_current_engine = wf_holdout_reference(con, asset_type)
         asset_reports.append(
             evaluate_asset(
                 asset_type,
                 snapshots,
                 benchmark,
                 holdout_ref,
-                holdout_matches,
+                holdout_current_engine,
                 args.forward_days,
                 int(total_resolved_selected),
             )
