@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
+
+logger = logging.getLogger(__name__)
+
+RATE_LIMIT_COOLDOWN_THRESHOLD = 3
+RATE_LIMIT_COOLDOWN_SECONDS = 60.0
 
 
 @dataclass
@@ -22,6 +28,7 @@ class AsyncProviderGuard:
         self._cache_lock = asyncio.Lock()
         self._pace_lock = asyncio.Lock()
         self._next_allowed_at = 0.0
+        self._consecutive_rate_limits = 0
 
     def last_served_stale_for(self, key: Any) -> bool:
         return bool(self._last_served_stale.get(key))
@@ -37,8 +44,28 @@ class AsyncProviderGuard:
                 await asyncio.sleep(wait_seconds)
             self._next_allowed_at = max(self._next_allowed_at, loop.time()) + self.pace_seconds
 
-    async def register_backoff(self, delay_seconds: float | None) -> None:
+    async def register_backoff(
+        self,
+        delay_seconds: float | None,
+        *,
+        rate_limited: bool = False,
+    ) -> None:
         delay = max(float(delay_seconds or 0.0), self.pace_seconds)
+        if rate_limited:
+            self._consecutive_rate_limits += 1
+            if self._consecutive_rate_limits >= RATE_LIMIT_COOLDOWN_THRESHOLD:
+                delay = max(delay, RATE_LIMIT_COOLDOWN_SECONDS)
+                logger.warning(
+                    "provider rate-limit cooldown engaged",
+                    extra={
+                        "event": "provider_rate_limit_cooldown",
+                        "provider": self.provider,
+                        "consecutive_rate_limits": self._consecutive_rate_limits,
+                        "cooldown_seconds": RATE_LIMIT_COOLDOWN_SECONDS,
+                    },
+                )
+        else:
+            self._consecutive_rate_limits = 0
         if delay <= 0:
             return
         loop = asyncio.get_running_loop()
@@ -95,6 +122,13 @@ class AsyncProviderGuard:
         except Exception:
             if stale_entry is not None and stale_entry.stale_until > asyncio.get_running_loop().time():
                 await self._record_stale_served(key, True)
+                logger.warning(
+                    "provider fallback stale cache served",
+                    extra={
+                        "event": "provider_fallback_stale_served",
+                        "provider": self.provider,
+                    },
+                )
                 return stale_entry.value
             raise
 
@@ -106,6 +140,7 @@ class AsyncProviderGuard:
                 stale_ttl_seconds=max(float(stale_ttl_seconds), 0.0),
             )
         await self._record_stale_served(key, False)
+        self._consecutive_rate_limits = 0
         return value
 
     async def _get_cached(self, key: Any) -> Any | None:

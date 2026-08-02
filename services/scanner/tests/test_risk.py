@@ -31,6 +31,8 @@ class _FakeRepo:
             data_quality="ok",
             provider_status="ok",
             provider_warnings=[],
+            pattern_name=None,
+            real_money_trust_blocked=None,
         )
 
     def get_latest_signal_context(self, symbol: str):
@@ -89,6 +91,24 @@ class _FakeRepo:
             score_band_win_rate=75.0,
             score_band_avg_return=0.35,
             checks=[GateCheck(name="sample_size", passed=True, detail="25 vs 20 1h outcomes")],
+        )
+
+    def evaluate_weekly_pattern_gate(self, *, pattern_name, asset_type, observed_at=None, signal=None):
+        return SimpleNamespace(
+            passed=True,
+            reason="Weekly pattern calibration is available; real-money trust remains blocked.",
+            horizon="1w",
+            evidence_basis="historical_only",
+            trust_window_start=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            trust_window_end=datetime(2026, 3, 15, tzinfo=timezone.utc),
+            signal_count=40,
+            signal_win_rate=60.0,
+            signal_avg_return=0.5,
+            score_band_count=0,
+            score_band_win_rate=None,
+            score_band_avg_return=None,
+            checks=[GateCheck(name="real_money_trust_blocked", passed=False, detail="blocked")],
+            real_money_trust_blocked=True,
         )
 
     def get_portfolio_guardrail_snapshot(self):
@@ -183,6 +203,90 @@ class RiskServiceTests(unittest.TestCase):
         fake_repo.evaluate_signal_gate = mismatch_gate
         service.repo = fake_repo
         service.settings.trade_gate_enabled = True
+
+        eligibility = service.evaluate_trade(
+            ticker="AAPL",
+            side="buy",
+            qty=1,
+            latest_price=190.0,
+        )
+
+        self.assertFalse(eligibility.allowed)
+        self.assertIn("does not match", eligibility.reason)
+
+    def test_provider_critical_blocks_trade_even_when_gate_passed(self) -> None:
+        service = RiskService()
+        fake_repo = _FakeRepo()
+        fake_repo.latest_context.provider_status = "critical"
+        fake_repo.latest_context.layer_details = {"execution": {"review_flags": []}}
+        service.repo = fake_repo
+        service.settings.trade_gate_enabled = True
+
+        eligibility = service.evaluate_trade(
+            ticker="AAPL",
+            side="buy",
+            qty=1,
+            latest_price=190.0,
+        )
+
+        self.assertFalse(eligibility.allowed)
+        self.assertEqual(eligibility.execution_eligibility, "blocked")
+        self.assertIn("Provider or evidence state blocks execution", eligibility.reason)
+
+    def test_weekly_pattern_preview_uses_weekly_gate_and_matches_scan(self) -> None:
+        service = RiskService()
+        fake_repo = _FakeRepo()
+        fake_repo.latest_context.pattern_name = "uptrend_ma_stack"
+
+        def fail_if_called(**kwargs):
+            raise AssertionError("evaluate_signal_gate must not run for the 1w pattern path")
+
+        fake_repo.evaluate_signal_gate = fail_if_called
+        service.repo = fake_repo
+        service.settings.trade_gate_enabled = True
+        service.settings.trade_gate_horizon = "1w"
+
+        eligibility = service.evaluate_trade(
+            ticker="AAPL",
+            side="buy",
+            qty=1,
+            latest_price=190.0,
+        )
+
+        self.assertTrue(eligibility.allowed)
+        self.assertTrue(eligibility.gate_consistent_with_signal)
+        # The executed gate verdict and the displayed trust verdict come from the same
+        # weekly evaluator: paper gate may pass on calibration while real-money trust stays blocked.
+        self.assertTrue(eligibility.real_money_trust_blocked)
+        self.assertEqual(eligibility.evidence_basis, "historical_only")
+
+    def test_weekly_pattern_real_mismatch_blocks_fail_closed(self) -> None:
+        service = RiskService()
+        fake_repo = _FakeRepo()
+        fake_repo.latest_context.pattern_name = "uptrend_ma_stack"
+
+        def blocked_weekly_gate(*, pattern_name, asset_type, observed_at=None, signal=None):
+            return SimpleNamespace(
+                passed=False,
+                reason="Weekly evidence no longer clears calibration.",
+                horizon="1w",
+                evidence_basis="insufficient",
+                trust_window_start=datetime(2026, 3, 1, tzinfo=timezone.utc),
+                trust_window_end=datetime(2026, 3, 15, tzinfo=timezone.utc),
+                signal_count=0,
+                signal_win_rate=None,
+                signal_avg_return=None,
+                score_band_count=0,
+                score_band_win_rate=None,
+                score_band_avg_return=None,
+                checks=[],
+                real_money_trust_blocked=True,
+            )
+
+        fake_repo.evaluate_weekly_pattern_gate = blocked_weekly_gate
+        service.repo = fake_repo
+        service.settings.trade_gate_enabled = True
+        service.settings.trade_gate_horizon = "1w"
 
         eligibility = service.evaluate_trade(
             ticker="AAPL",

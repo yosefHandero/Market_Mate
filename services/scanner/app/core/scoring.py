@@ -4,7 +4,29 @@ from dataclasses import dataclass
 
 from app.schemas import DecisionSignal, MarketStatus
 
-SCORING_VERSION = "v4.1-integrated"
+SCORING_VERSION = "v4.2-budget-normalized"
+
+# Theoretical per-side point ceilings (matches clamp() caps in compute_directional_scores).
+_BASE_SIDE_BUDGET = 18.0 + 16.0 + 32.0 + 9.0 + 5.0 + 5.0 + 3.0 + 12.0 + 3.0
+_STOCK_OPTIONS_BUDGET = 4.0
+_STOCK_CATALYST_BUDGET = 3.0
+
+
+def side_score_budget_max(*, asset_type: str, side: str) -> float:
+    """Max achievable raw points for one side, used to normalize crypto vs stock fairly."""
+    budget = _BASE_SIDE_BUDGET
+    if asset_type == "stock":
+        budget += _STOCK_OPTIONS_BUDGET
+        if side == "buy":
+            budget += _STOCK_CATALYST_BUDGET
+    return budget
+
+
+def normalize_side_score(raw: float, *, asset_type: str, side: str) -> float:
+    budget = side_score_budget_max(asset_type=asset_type, side=side)
+    if budget <= 0:
+        return 0.0
+    return round(clamp((raw / budget) * 100.0, 0, 100), 2)
 
 TREND_SMA_WINDOW = 20
 TREND_SCALING_FACTOR = 2.5
@@ -42,6 +64,10 @@ class DirectionalScoreResult:
 
 def compute_directional_scores(
     *,
+    asset_type: str = "stock",
+    buy_threshold: float = 52.0,
+    sell_threshold: float = 52.0,
+    signal_margin: float = 6.0,
     relative_volume: float,
     price_change_pct: float,
     breakout_flag: bool,
@@ -132,6 +158,7 @@ def compute_directional_scores(
         + regime_buy
         + options_buy
         + bullish_trend
+        + clamp(context_bias * 10, 0, 3)
     )
     sell_raw = (
         bearish_momentum
@@ -143,16 +170,17 @@ def compute_directional_scores(
         + regime_sell
         + options_sell
         + bearish_trend
+        + clamp(-context_bias * 10, 0, 3)
     )
 
-    buy_score = round(clamp(buy_raw, 0, 100), 2)
-    sell_score = round(clamp(sell_raw, 0, 100), 2)
+    buy_score = normalize_side_score(buy_raw, asset_type=asset_type, side="buy")
+    sell_score = normalize_side_score(sell_raw, asset_type=asset_type, side="sell")
     margin = round(abs(buy_score - sell_score), 2)
 
-    if buy_score >= 52 and (buy_score - sell_score) >= 6:
+    if buy_score >= buy_threshold and (buy_score - sell_score) >= signal_margin:
         decision_signal: DecisionSignal = "BUY"
         selected_score = buy_score
-    elif sell_score >= 52 and (sell_score - buy_score) >= 6:
+    elif sell_score >= sell_threshold and (sell_score - buy_score) >= signal_margin:
         decision_signal = "SELL"
         selected_score = sell_score
     else:
@@ -209,7 +237,7 @@ def compute_directional_scores(
         "structure": round(bullish_structure, 2),
         "volume": round(volume_confirmation, 2),
         "alignment": round(bullish_alignment, 2),
-        "signals": round(sentiment_buy + catalyst_buy + regime_buy + options_buy, 2),
+        "signals": round(sentiment_buy + catalyst_buy + regime_buy + options_buy + clamp(context_bias * 10, 0, 3), 2),
         "trend": round(bullish_trend, 2),
     }
     sell_contributions = {
@@ -217,7 +245,7 @@ def compute_directional_scores(
         "structure": round(bearish_structure, 2),
         "volume": round(volume_confirmation, 2),
         "alignment": round(bearish_alignment, 2),
-        "signals": round(sentiment_sell + regime_sell + options_sell, 2),
+        "signals": round(sentiment_sell + regime_sell + options_sell + clamp(-context_bias * 10, 0, 3), 2),
         "trend": round(bearish_trend, 2),
     }
     if decision_signal == "BUY":

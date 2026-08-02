@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\yosef\\pipx\\.cache\\f15d84bad8909a7\\Scripts\\graphify.exe hook-check"
+          }
+        ]
+      }
+    ]
+  }
+}

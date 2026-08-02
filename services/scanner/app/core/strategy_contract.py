@@ -12,7 +12,7 @@ DataGradeLabel = Literal["decision", "research", "degraded"]
 
 STRATEGY_ID = "scanner-directional"
 STRATEGY_VERSION = "v4.1-integrated"
-PRIMARY_HOLDING_HORIZON = "1h"
+PRIMARY_HOLDING_HORIZON = "1w"
 ENTRY_ASSUMPTION = (
     "Assume the position is entered on the next available trade after the scan snapshot. "
     "Validation remains direction-based and does not claim perfect fills."
@@ -229,6 +229,26 @@ def determine_execution_eligibility(
     if evidence_quality == "low" or provider_status == "degraded":
         return "review"
     return "eligible"
+
+
+RecommendedActionLabel = Literal["ignore", "review", "preview", "dry_run", "blocked"]
+
+
+def determine_recommended_action(
+    *,
+    signal: DecisionSignal,
+    execution_eligibility: ExecutionEligibilityLabel,
+    evidence_quality: EvidenceQualityLabel,
+) -> RecommendedActionLabel:
+    if signal == "HOLD":
+        return "ignore"
+    if execution_eligibility == "eligible" and evidence_quality in {"high", "moderate"}:
+        return "dry_run"
+    if execution_eligibility == "eligible" and evidence_quality in {"low", "degraded"}:
+        return "preview"
+    if execution_eligibility == "review":
+        return "review"
+    return "blocked"
 
 
 def determine_data_grade(

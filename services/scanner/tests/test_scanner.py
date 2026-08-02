@@ -11,6 +11,7 @@ if "yahooquery" not in sys.modules:
     yahooquery_stub.Ticker = object
     sys.modules["yahooquery"] = yahooquery_stub
 
+from app.http_client import ProviderRequestError
 from app.schemas import GateCheck, ScanResult
 from app.services.scanner import ScannerService
 
@@ -76,6 +77,8 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         self.addCleanup(setattr, service.settings, "crypto_watchlist", original_crypto_watchlist)
 
         service._refresh_due_signal_outcomes = AsyncMock(return_value=0)
+        service._refresh_due_prediction_snapshots = AsyncMock(return_value=0)
+        service.daily_bar_service.get_daily_bars = AsyncMock(return_value=([], "cache"))
         service.alpaca.get_latest_bars = AsyncMock(return_value={"AAPL": {}})
         service.fear_greed.get_index = AsyncMock(return_value=(50, "neutral"))
         service._compute_market_status = MagicMock(return_value=("neutral", 0.0, 0.0))
@@ -178,16 +181,76 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         observed_at = datetime.now(timezone.utc)
         service.alpaca.consume_last_stale_flag = MagicMock(return_value=True)
 
+        stale_observed = observed_at - timedelta(minutes=90)
         provider_status, warnings = service._provider_health(
-            item={"bars": [{"t": observed_at.isoformat()}]},
+            item={"bars": [{"t": stale_observed.isoformat()}]},
             observed_at=observed_at,
-            **self._provider_health_kwargs(asset_type="crypto"),
+            alpaca_served_stale_cache=True,
+            **self._provider_health_kwargs(asset_type="stock"),
         )
 
-        self.assertEqual(provider_status, "degraded")
-        self.assertNotEqual(provider_status, "critical")
+        self.assertEqual(provider_status, "critical")
         self.assertIn("alpaca_served_stale_cache", warnings)
-        service.alpaca.consume_last_stale_flag.assert_called_once()
+        self.assertIn("market_bars_stale", warnings)
+
+    def test_derive_price_provenance_ws_override(self) -> None:
+        service = ScannerService()
+        price_source, fallback_used = service._derive_price_provenance(
+            asset_type="crypto",
+            freshness_flags={"market_bars": "ws_override"},
+            alpaca_served_stale_cache=False,
+        )
+        self.assertEqual(price_source, "coinbase_ws")
+        self.assertTrue(fallback_used)
+
+    def test_derive_price_provenance_stale_cache(self) -> None:
+        service = ScannerService()
+        price_source, fallback_used = service._derive_price_provenance(
+            asset_type="stock",
+            freshness_flags={"market_bars": "ok"},
+            alpaca_served_stale_cache=True,
+        )
+        self.assertEqual(price_source, "stale_cache")
+        self.assertTrue(fallback_used)
+
+    def test_derive_price_provenance_alpaca_live(self) -> None:
+        service = ScannerService()
+        price_source, fallback_used = service._derive_price_provenance(
+            asset_type="stock",
+            freshness_flags={"market_bars": "ok"},
+            alpaca_served_stale_cache=False,
+        )
+        self.assertEqual(price_source, "alpaca")
+        self.assertFalse(fallback_used)
+
+    def test_derive_price_provenance_polygon_fallback(self) -> None:
+        service = ScannerService()
+        price_source, fallback_used = service._derive_price_provenance(
+            asset_type="stock",
+            freshness_flags={"market_bars": "ok"},
+            alpaca_served_stale_cache=False,
+            market_bars_source="polygon",
+        )
+        self.assertEqual(price_source, "polygon")
+        self.assertTrue(fallback_used)
+
+    def test_get_stock_bars_with_fallback_uses_polygon_when_alpaca_fails(self) -> None:
+        service = ScannerService()
+        service.settings.polygon_api_key = "test-polygon-key"
+        polygon_bars = {
+            "AAPL": {
+                "latest_price": 190.0,
+                "bars": [{"t": datetime.now(timezone.utc).isoformat(), "c": 190.0}],
+            }
+        }
+        service.alpaca.get_latest_bars = AsyncMock(side_effect=RuntimeError("alpaca down"))
+        service.polygon.get_latest_bars = AsyncMock(return_value=polygon_bars)
+
+        bars, source = asyncio.run(service._get_stock_bars_with_fallback(["AAPL"]))
+
+        self.assertEqual(source, "polygon")
+        self.assertEqual(bars["AAPL"]["latest_price"], 190.0)
+        service.polygon.get_latest_bars.assert_awaited_once()
 
     def test_crypto_ws_override_makes_bars_fresh_when_alpaca_is_stale(self) -> None:
         service = ScannerService()
@@ -325,6 +388,8 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         self.addCleanup(setattr, service.settings, "crypto_watchlist", original_crypto_watchlist)
 
         service._refresh_due_signal_outcomes = AsyncMock(return_value=0)
+        service._refresh_due_prediction_snapshots = AsyncMock(return_value=0)
+        service.daily_bar_service.get_daily_bars = AsyncMock(return_value=([], "cache"))
         service.alpaca.get_latest_crypto_bars = AsyncMock(
             return_value={
                 "BTC/USD": {
@@ -399,6 +464,31 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         market_data_service.apply_crypto_price_overrides.assert_called_once()
         self.assertEqual(run.results[0].price, 68000.0)
         service.repo.save_run.assert_called_once()
+
+    def test_run_scan_fail_closed_when_alpaca_credentials_missing(self) -> None:
+        service = ScannerService()
+        service.settings.alpaca_api_key = ""
+        service.settings.alpaca_api_secret = ""
+        with self.assertRaises(RuntimeError):
+            asyncio.run(service.run_scan())
+
+    def test_run_scan_fail_closed_when_alpaca_returns_401(self) -> None:
+        service = ScannerService()
+        service.settings.watchlist = "AAPL"
+        service.settings.crypto_watchlist = ""
+        service.settings.polygon_api_key = ""
+        service.alpaca.get_latest_bars = AsyncMock(
+            side_effect=ProviderRequestError(
+                "alpaca returned HTTP 401",
+                provider="alpaca",
+                url="https://data.alpaca.markets/v2/stocks/bars",
+                retryable=False,
+                status_code=401,
+            )
+        )
+        service.fear_greed.get_index = AsyncMock(return_value=(50, "Neutral"))
+        with self.assertRaises(ProviderRequestError):
+            asyncio.run(service.run_scan())
 
 
 if __name__ == "__main__":

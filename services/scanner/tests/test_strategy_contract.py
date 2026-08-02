@@ -13,7 +13,7 @@ class StrategyContractTests(unittest.TestCase):
 
         self.assertEqual(contract.strategy_id, "scanner-directional")
         self.assertEqual(contract.strategy_version, "v4.1-integrated")
-        self.assertEqual(contract.primary_holding_horizon, "1h")
+        self.assertEqual(contract.primary_holding_horizon, "1w")
         self.assertIn("HOLD means abstain", contract.hold_definition.operational_meaning)
         self.assertIn("binance", contract.supportive_provider_inputs)
 

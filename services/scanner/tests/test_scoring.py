@@ -30,8 +30,8 @@ def _bar_only_kwargs(**overrides):
 
 
 class ScoringVersionTests(unittest.TestCase):
-    def test_scoring_version_is_v41_integrated(self) -> None:
-        self.assertEqual(SCORING_VERSION, "v4.1-integrated")
+    def test_scoring_version_is_v42_budget_normalized(self) -> None:
+        self.assertEqual(SCORING_VERSION, "v4.2-budget-normalized")
 
 
 class ProviderSignalIntegrationTests(unittest.TestCase):
@@ -65,6 +65,35 @@ class ProviderSignalIntegrationTests(unittest.TestCase):
             options_bearish_score=10.0,
         ))
         self.assertEqual(result.sell_contributions["signals"], 12.0)
+
+    def test_context_bias_contributes_to_directional_scores(self) -> None:
+        bullish = compute_directional_scores(**_bar_only_kwargs(context_bias=0.2))
+        bearish = compute_directional_scores(**_bar_only_kwargs(context_bias=-0.2))
+        self.assertGreater(bullish.buy_contributions["signals"], 0.0)
+        self.assertGreater(bearish.sell_contributions["signals"], 0.0)
+
+
+class CryptoStockFairnessTests(unittest.TestCase):
+    def test_equivalent_bar_setup_yields_same_normalized_scores(self) -> None:
+        kwargs = _bar_only_kwargs(
+            price_change_pct=2.0,
+            breakout_flag=True,
+            above_vwap=True,
+            close_to_high_pct=0.1,
+            relative_strength_pct=1.8,
+            relative_volume=1.35,
+            sentiment_score=0.4,
+            market_status="bullish",
+        )
+        stock = compute_directional_scores(**kwargs, asset_type="stock")
+        crypto = compute_directional_scores(**kwargs, asset_type="crypto")
+        # Crypto excludes catalyst/options from its budget; same bar strength normalizes higher.
+        self.assertGreaterEqual(crypto.buy_score, stock.buy_score)
+        self.assertGreaterEqual(crypto.sell_score, stock.sell_score)
+        if stock.decision_signal == "BUY":
+            self.assertEqual(crypto.decision_signal, "BUY")
+        if stock.decision_signal == "SELL":
+            self.assertEqual(crypto.decision_signal, "SELL")
 
 
 class BorderlineFlipTests(unittest.TestCase):
@@ -104,13 +133,13 @@ class BorderlineFlipTests(unittest.TestCase):
     def test_borderline_buy_suppressed_to_hold_by_opposing_signals(self) -> None:
         """Bar-based BUY with moderate margin. Opposing providers boost sell enough to collapse margin."""
         baseline = compute_directional_scores(**_bar_only_kwargs(
-            price_change_pct=4.0,
+            price_change_pct=5.0,
             breakout_flag=True,
             breakdown_flag=True,
             above_vwap=False,
             close_to_high_pct=0.8,
             close_to_low_pct=1.0,
-            relative_strength_pct=2.0,
+            relative_strength_pct=2.5,
             relative_volume=2.2,
         ))
         self.assertEqual(baseline.decision_signal, "BUY",
@@ -118,13 +147,13 @@ class BorderlineFlipTests(unittest.TestCase):
                          f"(buy={baseline.buy_score}, sell={baseline.sell_score})")
 
         suppressed = compute_directional_scores(**_bar_only_kwargs(
-            price_change_pct=4.0,
+            price_change_pct=5.0,
             breakout_flag=True,
             breakdown_flag=True,
             above_vwap=False,
             close_to_high_pct=0.8,
             close_to_low_pct=1.0,
-            relative_strength_pct=2.0,
+            relative_strength_pct=2.5,
             relative_volume=2.2,
             sentiment_score=-0.9,
             market_status="bearish",

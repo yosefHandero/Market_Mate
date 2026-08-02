@@ -12,7 +12,7 @@ export default function GlobalError({
       <section className="card">
         <h1>Something went wrong</h1>
         <p className="negative" style={{ marginBottom: 12 }}>
-          {error.message || 'Unexpected dashboard error.'}
+          {error.message || 'Unexpected app error.'}
         </p>
         <button className="button" onClick={reset}>
           Try again

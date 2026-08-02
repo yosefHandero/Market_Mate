@@ -2,6 +2,62 @@ export type MarketStatus = 'bullish' | 'neutral' | 'bearish';
 export type AssetType = 'stock' | 'crypto';
 export type DecisionSignal = 'BUY' | 'SELL' | 'HOLD';
 export type RecommendedAction = 'ignore' | 'review' | 'preview' | 'dry_run' | 'blocked';
+export type EvidenceGrade = 'Strong' | 'Mixed' | 'Weak';
+
+export interface PricePrediction {
+  range_low: number;
+  range_high: number;
+  horizon: '15m' | '1h' | '1d' | '1w';
+  horizon_label: string;
+  invalidation: string;
+  methodology: string;
+  disclaimer: string;
+}
+
+export type WeeklyEvidenceBasis =
+  | 'historical_only'
+  | 'live_forward_proven'
+  | 'mixed'
+  | 'insufficient';
+
+export interface WeeklyPatternPrediction {
+  horizon: '1w';
+  horizon_label: string;
+  pattern_name: string;
+  directional_bias: 'bullish' | 'bearish' | 'neutral';
+  range_low: number;
+  range_high: number;
+  upside_probability_pct?: number | null;
+  historical_hit_rate_pct: number | null;
+  avg_forward_1w_return_pct: number | null;
+  sample_size: number;
+  data_quality: 'ok' | 'low' | 'degraded';
+  daily_bars_stale?: boolean;
+  daily_bars_source?: string;
+  forward_days?: number;
+  hold_return_tolerance_pct?: number;
+  evidence_basis: WeeklyEvidenceBasis;
+  real_money_trust_blocked: boolean;
+  pattern_gate_checks: GateCheck[];
+  methodology: string;
+  disclaimer: string;
+}
+
+export interface ExitWindow {
+  expected_growth_window_label: string;
+  expected_growth_days: number;
+  estimated_exit_price: number | null;
+  projected_range_low: number | null;
+  projected_range_high: number | null;
+  invalidation_level: number | null;
+  invalidation_note: string;
+  stop_growing_signal: string;
+  stop_growing_conditions: string[];
+  risk_warning: string;
+  confidence_change_note: string;
+  methodology: string;
+  disclaimer: string;
+}
 
 export interface GateCheck {
   name: string;
@@ -25,6 +81,15 @@ export interface ScanResult {
   evidence_quality: string;
   evidence_quality_score: number;
   evidence_quality_reasons: string[];
+  evidence_grade?: EvidenceGrade;
+  top_reasons?: string[];
+  price_prediction?: PricePrediction | null;
+  weekly_prediction?: WeeklyPatternPrediction | null;
+  exit_window?: ExitWindow | null;
+  upside_probability_pct?: number | null;
+  confidence_score?: number;
+  evidence_provenance?: WeeklyEvidenceBasis;
+  is_buy_candidate?: boolean;
   data_grade: 'decision' | 'research' | 'degraded';
   execution_eligibility: string;
   decision_signal: DecisionSignal;
@@ -61,8 +126,16 @@ export interface ScanResult {
   fear_greed_label: string | null;
   provider_status: string;
   provider_warnings: string[];
+  price_source?: 'alpaca' | 'coinbase_ws' | 'polygon' | 'stale_cache';
+  fallback_used?: boolean;
   bar_age_minutes: number | null;
   freshness_flags: Record<string, string>;
+  readiness_score?: number;
+  readiness_band?: 'high' | 'watch' | 'low' | 'none';
+  readiness_hard_stop?: boolean;
+  readiness_reason?: string | null;
+  selection_rank?: number | null;
+  is_top_pick?: boolean;
   created_at: string;
 }
 
@@ -76,70 +149,8 @@ export interface ScanRun {
   fear_greed_value: number | null;
   fear_greed_label: string | null;
   results: ScanResult[];
-}
-export type JournalDecision = 'took' | 'skipped' | 'watching';
-
-export interface JournalEntry {
-  id: number;
-  ticker: string;
-  run_id: string | null;
-  decision: JournalDecision;
-  entry_price: number | null;
-  exit_price: number | null;
-  pnl_pct: number | null;
-  notes: string;
-  created_at: string;
-  signal_label: string | null;
-  score: number | null;
-  news_source: string | null;
-  override_reason: string | null;
-  action_state: 'watching' | 'reviewed' | 'took' | 'skipped' | null;
-}
-
-export interface JournalEntryCreateRequest {
-  ticker: string;
-  run_id: string | null;
-  decision: JournalDecision;
-  entry_price: number | null;
-  exit_price: number | null;
-  pnl_pct: number | null;
-  notes: string;
-  signal_label: string | null;
-  score: number | null;
-  news_source: string | null;
-  override_reason?: string | null;
-  action_state?: 'watching' | 'reviewed' | 'took' | 'skipped' | null;
-}
-export interface JournalEntryUpdateRequest {
-  decision?: JournalDecision;
-  entry_price?: number | null;
-  exit_price?: number | null;
-  pnl_pct?: number | null;
-  notes?: string | null;
-  override_reason?: string | null;
-  action_state?: 'watching' | 'reviewed' | 'took' | 'skipped' | null;
-}
-export interface JournalAnalyticsBucket {
-  key: string;
-  total: number;
-  open_count: number;
-  closed_count: number;
-  win_rate: number | null;
-  avg_pnl_pct: number | null;
-}
-
-export interface JournalAnalytics {
-  total_entries: number;
-  took_count: number;
-  skipped_count: number;
-  watching_count: number;
-  open_trades: number;
-  closed_trades: number;
-  win_rate: number | null;
-  avg_pnl_pct: number | null;
-  by_signal_label: JournalAnalyticsBucket[];
-  by_news_source: JournalAnalyticsBucket[];
-  by_ticker: JournalAnalyticsBucket[];
+  top_stocks?: ScanResult[];
+  top_crypto?: ScanResult[];
 }
 
 export interface DecisionRow {
@@ -161,132 +172,26 @@ export interface DecisionRow {
   signal_age_minutes: number | null;
   freshness_flags: Record<string, string> | null;
   recommended_action: RecommendedAction | null;
+  readiness_score?: number | null;
+  readiness_band?: 'high' | 'watch' | 'low' | 'none' | null;
+  readiness_hard_stop?: boolean | null;
+  readiness_reason?: string | null;
+  selection_rank?: number | null;
+  is_top_pick?: boolean | null;
+  rank?: number | null;
   score_contributions: Record<string, number>;
+  evidence_grade?: EvidenceGrade | null;
+  top_reasons?: string[];
+  price_prediction?: PricePrediction | null;
+  weekly_prediction?: WeeklyPatternPrediction | null;
+  exit_window?: ExitWindow | null;
+  upside_probability_pct?: number | null;
+  confidence_score?: number | null;
+  evidence_provenance?: WeeklyEvidenceBasis | null;
+  is_buy_candidate?: boolean | null;
   strategy_version: string | null;
   short_metric_summary: string;
   last_updated: string;
-}
-
-export interface ValidationBucket {
-  key: string;
-  total_signals: number;
-  evaluated_count: number;
-  pending_count: number;
-  win_count: number;
-  loss_count: number;
-  false_positive_count: number;
-  win_rate: number | null;
-  avg_return: number | null;
-  median_return: number | null;
-  avg_win_return: number | null;
-  avg_loss_return: number | null;
-  expectancy: number | null;
-  avg_return_after_friction: number | null;
-  expectancy_after_friction: number | null;
-  false_positive_rate: number | null;
-  min_sample_met: boolean;
-  is_underpowered: boolean;
-}
-
-export interface ValidationSummary {
-  generated_at_field?: string;
-  start?: string | null;
-  end?: string | null;
-  primary_horizon: '15m' | '1h' | '1d';
-  win_threshold_pct: number;
-  false_positive_threshold_pct: number;
-  total_signals: number;
-  evaluated_count: number;
-  pending_count: number;
-  overall: ValidationBucket;
-  in_sample: ValidationBucket | null;
-  out_of_sample: ValidationBucket | null;
-  degradation_warnings: string[];
-  regime_advisories: string[];
-  by_signal: ValidationBucket[];
-  by_confidence_bucket: ValidationBucket[];
-  by_score_band: ValidationBucket[];
-  by_age_bucket: ValidationBucket[];
-  by_signal_label: ValidationBucket[];
-  by_market_status: ValidationBucket[];
-  by_news_source: ValidationBucket[];
-  by_volatility_regime: ValidationBucket[];
-  by_data_quality: ValidationBucket[];
-  by_data_grade: ValidationBucket[];
-  by_options_flow_bias: ValidationBucket[];
-  by_signal_and_gate: ValidationBucket[];
-  by_gate_status: ValidationBucket[];
-  by_asset_type: ValidationBucket[];
-}
-
-export interface ThresholdSweepRow {
-  min_evaluated_count: number;
-  min_win_rate: number;
-  min_avg_return: number;
-  score_band_required: boolean;
-  kept_signals: number;
-  blocked_signals: number;
-  kept_rate: number;
-  win_rate: number | null;
-  avg_return: number | null;
-  expectancy: number | null;
-  avg_return_after_friction: number | null;
-  expectancy_after_friction: number | null;
-  false_positive_rate: number | null;
-}
-
-export interface ThresholdSweepResponse {
-  generated_at_field?: string;
-  start?: string | null;
-  end?: string | null;
-  primary_horizon: '15m' | '1h' | '1d';
-  win_threshold_pct: number;
-  false_positive_threshold_pct: number;
-  baseline: ValidationBucket;
-  by_signal_and_gate: ValidationBucket[];
-  recommendation: ThresholdRecommendation;
-  candidates: ThresholdSweepRow[];
-}
-
-export interface ThresholdRecommendation {
-  min_evaluated_count: number;
-  min_win_rate: number;
-  min_avg_return: number;
-  score_band_required: boolean;
-  source: 'candidate' | 'configured_fallback';
-  evidence_status: 'ready' | 'provisional';
-  rationale: string;
-  warnings: string[];
-}
-
-export interface CohortValidationSummary {
-  cohort: string;
-  total_signals: number;
-  evaluated_count: number;
-  pending_count: number;
-  win_rate: number | null;
-  avg_return: number | null;
-  expectancy: number | null;
-  avg_return_after_friction: number | null;
-  expectancy_after_friction: number | null;
-  false_positive_rate: number | null;
-  min_sample_met: boolean;
-  is_underpowered: boolean;
-}
-
-export interface ExecutionAlignmentResponse {
-  generated_at_field?: string;
-  start?: string | null;
-  end?: string | null;
-  primary_horizon: '15m' | '1h' | '1d';
-  win_threshold_pct: number;
-  false_positive_threshold_pct: number;
-  all_signals: CohortValidationSummary;
-  taken_trades: CohortValidationSummary;
-  journal_took?: CohortValidationSummary | null;
-  skipped_or_watched: CohortValidationSummary;
-  blocked_previews: CohortValidationSummary;
-  automation_dry_run?: CohortValidationSummary | null;
 }
 
 export interface HealthResponse {
@@ -298,6 +203,8 @@ export interface HealthResponse {
   schema_ok: boolean;
   missing_schema_items: string[];
   scheduler_running: boolean;
+  worker_alive?: boolean;
+  last_worker_heartbeat_at?: string | null;
   last_scan_at: string | null;
   last_scan_age_minutes: number | null;
   max_stale_minutes: number | null;
@@ -323,6 +230,45 @@ export interface HealthResponse {
   pending_due_15m_count: number | null;
   pending_due_1h_count: number | null;
   pending_due_1d_count: number | null;
+  request_id: string | null;
+}
+
+export interface SystemReadinessAutomation {
+  scheduler_enabled: boolean;
+  scheduler_running: boolean;
+  worker_alive: boolean;
+  automation_enabled: boolean;
+  automation_phase: 'disabled' | 'shadow' | 'limited' | 'broad';
+  automation_ready: boolean;
+  dry_run_only: boolean;
+  kill_switch_enabled: boolean;
+  breaker_state: 'closed' | 'open' | 'half_open' | 'unknown';
+}
+
+export interface SystemReadinessProviderSummary {
+  worst_status: string;
+  total_count: number;
+  critical_count: number;
+  degraded_count: number;
+}
+
+export interface SystemReadinessFreshnessSummary {
+  last_scan_at: string | null;
+  last_scan_age_minutes: number | null;
+  max_stale_minutes: number | null;
+  scan_fresh: boolean | null;
+  total_count: number;
+  stale_count: number;
+  severe_stale_count: number;
+}
+
+export interface SystemReadinessResponse {
+  status: 'PASS' | 'FAIL';
+  reasons: string[];
+  safety_blockers: string[];
+  automation: SystemReadinessAutomation;
+  provider: SystemReadinessProviderSummary;
+  freshness: SystemReadinessFreshnessSummary;
   request_id: string | null;
 }
 
@@ -583,6 +529,253 @@ export interface PaperLedgerSummary {
   win_rate_pct: number | null;
   gross_pnl_usd: number;
   max_drawdown_usd: number;
+  total_unrealized_pnl?: number | null;
+}
+
+export interface ProofLoopMetrics {
+  recent_dry_runs: number;
+  recent_previewed: number;
+  recent_blocked: number;
+  total_audits: number;
+}
+
+export interface PredictionAccuracyMetrics {
+  evaluated_count: number;
+  pending_count: number;
+  in_range_count: number;
+  in_range_rate_pct: number | null;
+  below_range_count: number;
+  above_range_count: number;
+  missed_count: number;
+  note: string | null;
+}
+
+export interface WeeklyEvidenceProgress {
+  live_forward_samples: number;
+  out_of_sample_samples: number;
+  historical_samples: number;
+  backfilled_replay_samples: number;
+  min_live_forward_samples: number;
+  min_out_of_sample_samples: number;
+  min_historical_samples: number;
+  min_backfilled_replay_samples: number;
+  trust_sample_gate_met: boolean;
+  calibration_sample_gate_met: boolean;
+}
+
+export interface ConfidenceTierBucket {
+  score_band: string;
+  asset_type: string;
+  signal: string;
+  sample_source: string;
+  evaluated_count: number;
+  win_rate_pct: number | null;
+  avg_return_pct: number | null;
+  avg_return_after_friction_base_pct: number | null;
+  avg_return_after_friction_stressed_pct: number | null;
+}
+
+export interface ConfidenceRanking {
+  buckets: ConfidenceTierBucket[];
+  monotonic_by_group: boolean | null;
+  note: string | null;
+}
+
+export interface ConfidenceCalibrationBucket {
+  probability_band: string;
+  asset_type: string;
+  evaluated_count: number;
+  avg_predicted_pct: number | null;
+  realized_up_rate_pct: number | null;
+  reliability_gap_pct: number | null;
+}
+
+export interface ConfidenceCalibration {
+  buckets: ConfidenceCalibrationBucket[];
+  mean_abs_reliability_gap_pct: number | null;
+  note: string | null;
+}
+
+export interface ConfidencePerformance {
+  ranking: ConfidenceRanking;
+  calibration: ConfidenceCalibration;
+}
+
+export interface ExitWindowAssetMetrics {
+  asset_type: string;
+  evaluated_count: number;
+  pending_count: number;
+  helped_count: number;
+  helped_rate_pct: number | null;
+  avg_protected_return_pct: number | null;
+  avg_hold_return_pct: number | null;
+  avg_protected_after_friction_stressed_pct: number | null;
+  avg_hold_after_friction_stressed_pct: number | null;
+}
+
+export interface ExitWindowAccuracyMetrics {
+  evaluated_count: number;
+  pending_count: number;
+  helped_count: number;
+  helped_rate_pct: number | null;
+  by_asset_type: ExitWindowAssetMetrics[];
+  note: string | null;
+}
+
+export interface WalkForwardAssetMetrics {
+  asset_type: string;
+  track: string;
+  prediction_count: number;
+  resolved_count: number;
+  pending_count: number;
+  upside_hit_rate_pct: number | null;
+  avg_return_pct: number | null;
+  avg_return_after_friction_pct: number | null;
+  avg_return_after_friction_stressed_pct: number | null;
+  calibration_mean_abs_gap_pct: number | null;
+  exit_window_helped_rate_pct: number | null;
+  avg_protected_return_pct: number | null;
+  avg_hold_return_pct: number | null;
+  worst_return_pct: number | null;
+  p05_return_pct: number | null;
+  worst_decile_mean_pct: number | null;
+  max_drawdown_pct: number | null;
+}
+
+export interface WalkForwardCalibrationBucket {
+  probability_band: string;
+  asset_type: string;
+  track: string;
+  evaluated_count: number;
+  avg_predicted_pct: number | null;
+  realized_up_rate_pct: number | null;
+  reliability_gap_pct: number | null;
+}
+
+export interface WalkForwardCoverageRow {
+  symbol: string;
+  asset_type: string;
+  bar_count: number;
+  first_date: string | null;
+  last_date: string | null;
+  years_available: number;
+  source: string;
+  sufficient: boolean;
+  note: string;
+}
+
+// One shared evidence contract: every displayed performance number belongs to
+// exactly one of these six canonical tracks. Mirrors app/core/evidence_contract.py.
+export type EvidenceTrackKey =
+  | 'walk_forward_research'
+  | 'walk_forward_holdout'
+  | 'historical_replay'
+  | 'paper_execution'
+  | 'live_forward'
+  | 'real_money_pilot';
+
+export interface EvidenceTrackDescriptor {
+  key: EvidenceTrackKey;
+  label: string;
+  description: string;
+  is_forward: boolean;
+  counts_toward_real_money: boolean;
+}
+
+export interface WalkForwardAssetVerdict {
+  asset_type: 'stock' | 'crypto';
+  ready: boolean;
+  real_money_trust_blocked: boolean;
+  summary: string;
+  checks: GateCheck[];
+}
+
+export interface WalkForwardPilotVerdict {
+  ready: boolean;
+  real_money_trust_blocked: boolean;
+  summary: string;
+  checks: GateCheck[];
+  by_asset?: WalkForwardAssetVerdict[];
+}
+
+export interface WalkForwardRunSummary {
+  run_id: string;
+  created_at: string;
+  window_start: string | null;
+  window_end: string | null;
+  holdout_start: string | null;
+  validation_start?: string | null;
+  target_years: number;
+  step_days: number;
+  forward_days: number;
+  top_n_per_asset: number;
+  symbol_count: number;
+  prediction_count: number;
+  resolved_count: number;
+  pending_count: number;
+  evidence_track: string;
+  by_asset_track: WalkForwardAssetMetrics[];
+  calibration_buckets: WalkForwardCalibrationBucket[];
+  coverage: WalkForwardCoverageRow[];
+  pilot_verdict: WalkForwardPilotVerdict;
+  config_fingerprint?: string | null;
+  code_commit?: string | null;
+  engine_version?: string | null;
+  universe?: string[];
+  universe_source?: string | null;
+  data_quality_ok?: boolean | null;
+  data_quality_issues?: string[];
+  survivorship_caveat?: string;
+  overlap_status?: string | null;
+  note: string | null;
+}
+
+export interface LiveForwardAssetProgress {
+  asset_type: 'stock' | 'crypto';
+  selected: number;
+  accepted_outside_top_n: number;
+  rejected: number;
+  resolved: number;
+  pending: number;
+  resolved_late: number;
+}
+
+export interface LiveForwardProgress {
+  campaign_id?: string | null;
+  campaign_started_at?: string | null;
+  config_fingerprint?: string | null;
+  strategy_version?: string | null;
+  code_commit?: string | null;
+  selected_count: number;
+  accepted_outside_top_n_count: number;
+  rejected_count: number;
+  resolved_count: number;
+  pending_count: number;
+  resolved_late_count: number;
+  by_asset: LiveForwardAssetProgress[];
+  last_scan_at?: string | null;
+  last_scan_age_minutes?: number | null;
+  scan_gap_exceeded: boolean;
+  max_expected_scan_gap_minutes?: number | null;
+  missed_windows_14d?: number;
+  note?: string | null;
+}
+
+export interface ProofSummary {
+  generated_at: string;
+  ledger: PaperLedgerSummary;
+  loop_metrics: ProofLoopMetrics;
+  prediction_accuracy?: PredictionAccuracyMetrics | null;
+  confidence_performance?: ConfidencePerformance | null;
+  exit_window_accuracy?: ExitWindowAccuracyMetrics | null;
+  weekly_evidence?: WeeklyEvidenceProgress | null;
+  walk_forward?: WalkForwardRunSummary | null;
+  live_forward?: LiveForwardProgress | null;
+  evidence_contract?: EvidenceTrackDescriptor[];
+  last_scan_at: string | null;
+  scan_fresh: boolean | null;
+  mark_prices_source: string;
+  note: string | null;
 }
 
 export interface ReconciliationIssue {
@@ -598,43 +791,4 @@ export interface ReconciliationReportResponse {
   ok: boolean;
   total_issues: number;
   issues: ReconciliationIssue[];
-}
-
-export type ConfidenceGrade = 'A' | 'B' | 'C' | 'D';
-
-export interface ProjectionWeek {
-  week: number;
-  median: number;
-  optimistic_p75: number;
-  pessimistic_p25: number;
-}
-
-export interface ProjectionResponse {
-  base_amount: number;
-  ticker: string;
-  signal: DecisionSignal;
-  score_band: string;
-  sample_count: number;
-  low_sample_size: boolean;
-  regime: MarketStatus | null;
-  regime_adjusted: boolean;
-  projections: ProjectionWeek[];
-  confidence_grade: ConfidenceGrade;
-  disclaimer: string;
-}
-
-export type ActionItemType =
-  | 'paper_loop_disabled'
-  | 'kill_switch_active'
-  | 'breaker_open'
-  | 'review_signal'
-  | 'watching_entry'
-  | 'scheduler_stopped';
-
-export interface ActionItem {
-  id: string;
-  type: ActionItemType;
-  title: string;
-  subtitle: string;
-  metadata: Record<string, unknown>;
 }

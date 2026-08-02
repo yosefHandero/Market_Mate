@@ -28,6 +28,8 @@ class RiskService:
             return bucket.evaluated_15m_count, bucket.win_rate_15m, bucket.avg_return_15m
         if horizon == "1d":
             return bucket.evaluated_1d_count, bucket.win_rate_1d, bucket.avg_return_1d
+        if horizon == "1w":
+            return bucket.evaluated_1w_count, bucket.win_rate_1w, bucket.avg_return_1w
         return bucket.evaluated_1h_count, bucket.win_rate_1h, bucket.avg_return_1h
 
     def _portfolio_checks(self, *, ticker: str, asset_type: str, notional_estimate: float) -> tuple[list[GateCheck], str | None]:
@@ -189,13 +191,22 @@ class RiskService:
 
         confidence_bucket = self.repo.confidence_bucket_for(latest_context.calibrated_confidence)
         raw_score_bucket = self.repo.confidence_bucket_for(latest_context.raw_score)
-        evidence_gate = self.repo.evaluate_signal_gate(
-            asset_type=asset_type,
-            signal=latest_context.signal,
-            score_band=latest_context.score_band,
-            horizon=horizon,
-            observed_at=latest_context.signal_generated_at,
-        )
+        weekly_pattern_name = getattr(latest_context, "pattern_name", None)
+        if horizon == "1w" and weekly_pattern_name:
+            evidence_gate = self.repo.evaluate_weekly_pattern_gate(
+                pattern_name=weekly_pattern_name,
+                asset_type=asset_type,
+                observed_at=latest_context.signal_generated_at,
+                signal=latest_context.signal,
+            )
+        else:
+            evidence_gate = self.repo.evaluate_signal_gate(
+                asset_type=asset_type,
+                signal=latest_context.signal,
+                score_band=latest_context.score_band,
+                horizon=horizon,
+                observed_at=latest_context.signal_generated_at,
+            )
 
         signal_generated_at = latest_context.signal_generated_at
         if signal_generated_at.tzinfo is None:
@@ -227,6 +238,8 @@ class RiskService:
         )
         execution_eligibility = strategy_metadata.execution_eligibility
         evidence_quality_reasons = list(strategy_metadata.evidence_quality_reasons)
+        provider_status = (getattr(latest_context, "provider_status", "ok") or "ok").strip().lower()
+        provider_blocked = provider_status in {"critical", "error"} or execution_eligibility == "blocked"
         if review_flags and execution_eligibility == "eligible":
             execution_eligibility = "review"
             evidence_quality_reasons.append(
@@ -263,6 +276,7 @@ class RiskService:
             horizon=horizon,
             gate_evaluation_mode=latest_context.gate_evaluation_mode,
             evidence_basis=evidence_gate.evidence_basis,
+            real_money_trust_blocked=getattr(evidence_gate, "real_money_trust_blocked", None),
             trust_window_start=evidence_gate.trust_window_start,
             trust_window_end=evidence_gate.trust_window_end,
             latest_scan_age_minutes=latest_scan_age_minutes,
@@ -384,7 +398,36 @@ class RiskService:
             return eligibility
 
         eligibility.allowed = True
-        eligibility.reason = latest_context.gate_reason or evidence_gate.reason
+        if provider_blocked:
+            eligibility.execution_eligibility = "blocked"
+            eligibility.allowed = False
+            eligibility.reason = (
+                "Provider or evidence state blocks execution; manual order path will not reopen eligibility."
+            )
+            return eligibility
         if eligibility.execution_eligibility not in {"review", "not_applicable"}:
             eligibility.execution_eligibility = "eligible"
+        # Real-money eligibility is a STRICTER verdict than paper dry-run `allowed`.
+        # It must match the displayed weekly trust verdict (agent.md 5): real-money is
+        # only eligible when the trade is allowed for paper, execution eligibility is
+        # explicitly "eligible", and real-money trust is not blocked. `real_money_trust_blocked`
+        # is None for non-weekly gates, which fails closed here (real_money_eligible=False).
+        eligibility.real_money_eligible = (
+            eligibility.allowed
+            and eligibility.execution_eligibility == "eligible"
+            and eligibility.real_money_trust_blocked is False
+        )
+        gate_checks.append(
+            GateCheck(
+                name="real_money_trust",
+                passed=eligibility.real_money_eligible,
+                detail=(
+                    "Paper dry-run only; real-money trust is blocked until live paper-forward "
+                    "and out-of-sample evidence clears thresholds."
+                    if not eligibility.real_money_eligible
+                    else "Live-forward and out-of-sample evidence supports real-money trust review."
+                ),
+            )
+        )
+        eligibility.reason = latest_context.gate_reason or evidence_gate.reason
         return eligibility

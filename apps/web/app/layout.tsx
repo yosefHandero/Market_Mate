@@ -5,7 +5,7 @@ import type { ReactNode } from 'react';
 
 export const metadata: Metadata = {
   title: 'Market Mate Scanner',
-  description: 'Decision-support and validation dashboard for evidence-backed market scanning.',
+  description: 'Paper-only BUY candidate decisions and proof evidence from fresh scan data.',
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
@@ -17,10 +17,12 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <Link href="/" className="brand">
               Market Mate Scanner
             </Link>
+            <span className="badge amber paper-mode-badge" data-testid="paper-mode-badge">
+              PAPER MODE - DRY RUN ONLY
+            </span>
             <nav className="nav-links">
-              <Link href="/">Actions</Link>
-              <Link href="/history">History</Link>
-              <Link href="/validation">Validation</Link>
+              <Link href="/">Decision</Link>
+              <Link href="/proof">Proof</Link>
             </nav>
           </div>
         </header>

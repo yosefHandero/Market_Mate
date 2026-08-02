@@ -12,7 +12,7 @@ from yahooquery import Ticker
 from app.config import get_settings
 from app.http_client import parse_json_response
 from app.provider_resilience import AsyncProviderGuard
-from app.schemas import OptionsFlowSnapshot
+from app.schemas import OptionsFlowSnapshot, OptionsFlowSource
 
 
 @dataclass
@@ -43,7 +43,7 @@ class OptionsFlowClient:
         errors: list[str] = []
 
         try:
-            if self.settings.marketdata_api_token:
+            if self.settings.marketdata_options_enabled and self.settings.marketdata_api_token:
                 return self._get_marketdata_snapshot_sync(ticker)
         except Exception as exc:
             errors.append(f"MarketData.app failed: {exc}")
@@ -57,7 +57,10 @@ class OptionsFlowClient:
             return self._get_yfinance_snapshot_sync(ticker)
         except Exception as exc:
             errors.append(f"yfinance failed: {exc}")
-            return OptionsFlowSnapshot(summary="Options flow unavailable: " + "; ".join(errors))
+            return OptionsFlowSnapshot(
+                summary="Options flow unavailable: " + "; ".join(errors),
+                source="unavailable",
+            )
 
     def _get_marketdata_snapshot_sync(self, ticker: str) -> OptionsFlowSnapshot:
         headers = {
@@ -78,7 +81,10 @@ class OptionsFlowClient:
         open_interest = payload.get("openInterest") or []
 
         if not expirations or not sides:
-            return OptionsFlowSnapshot(summary="No listed options for this symbol.")
+            return OptionsFlowSnapshot(
+                summary="No listed options for this symbol.",
+                source="marketdata",
+            )
 
         first_expiry = min(expirations)
         expiry = datetime.fromtimestamp(first_expiry, tz=timezone.utc).date().isoformat()
@@ -98,36 +104,45 @@ class OptionsFlowClient:
             elif side == "put":
                 puts.append(row)
 
-        return self._build_snapshot(expiry=expiry, calls=calls, puts=puts)
+        return self._build_snapshot(expiry=expiry, calls=calls, puts=puts, source="marketdata")
 
     def _get_yahooquery_snapshot_sync(self, ticker: str) -> OptionsFlowSnapshot:
         chain = Ticker(ticker).option_chain
         if chain is None or getattr(chain, "empty", True):
-            return OptionsFlowSnapshot(summary="No listed options for this symbol.")
+            return OptionsFlowSnapshot(
+                summary="No listed options for this symbol.",
+                source="yahooquery",
+            )
 
         normalized = chain.reset_index().fillna(0)
         expiries = normalized["expiration"]
         if expiries.empty:
-            return OptionsFlowSnapshot(summary="No listed options for this symbol.")
+            return OptionsFlowSnapshot(
+                summary="No listed options for this symbol.",
+                source="yahooquery",
+            )
 
         first_expiry = expiries.min()
         expiry = first_expiry.date().isoformat() if hasattr(first_expiry, "date") else str(first_expiry)
         nearest_rows = normalized[normalized["expiration"] == first_expiry]
         calls = nearest_rows[nearest_rows["optionType"].isin(["call", "calls"])].to_dict("records")
         puts = nearest_rows[nearest_rows["optionType"].isin(["put", "puts"])].to_dict("records")
-        return self._build_snapshot(expiry=expiry, calls=calls, puts=puts)
+        return self._build_snapshot(expiry=expiry, calls=calls, puts=puts, source="yahooquery")
 
     def _get_yfinance_snapshot_sync(self, ticker: str) -> OptionsFlowSnapshot:
         yf_ticker = yf.Ticker(ticker)
         expiries = list(yf_ticker.options or [])
         if not expiries:
-            return OptionsFlowSnapshot(summary="No listed options for this symbol.")
+            return OptionsFlowSnapshot(
+                summary="No listed options for this symbol.",
+                source="yfinance",
+            )
 
         expiry = expiries[0]
         chain = yf_ticker.option_chain(expiry)
         calls = chain.calls.fillna(0).to_dict("records")
         puts = chain.puts.fillna(0).to_dict("records")
-        return self._build_snapshot(expiry=expiry, calls=calls, puts=puts)
+        return self._build_snapshot(expiry=expiry, calls=calls, puts=puts, source="yfinance")
 
     def _build_snapshot(
         self,
@@ -135,6 +150,7 @@ class OptionsFlowClient:
         expiry: str,
         calls: list[dict],
         puts: list[dict],
+        source: OptionsFlowSource = "unavailable",
     ) -> OptionsFlowSnapshot:
         call_volume = sum(self._coerce_int(row.get("volume", 0)) for row in calls)
         put_volume = sum(self._coerce_int(row.get("volume", 0)) for row in puts)
@@ -198,6 +214,7 @@ class OptionsFlowClient:
             bullish_score=bullish_score,
             bearish_score=bearish_score,
             summary=summary + ".",
+            source=source,
         )
 
     def _coerce_number(self, value: object) -> float:

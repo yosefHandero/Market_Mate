@@ -20,6 +20,24 @@ from app.services.repository import ScanRepository
 class RepositoryCalibrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = ScanRepository()
+        mutable_setting_names = (
+            "outcome_baseline_min_evaluated_per_horizon",
+            "outcome_baseline_min_mean_return_pct",
+            "outcome_report_min_evaluated_per_horizon",
+            "track_hold_outcomes",
+            "validation_false_positive_threshold_pct",
+            "validation_primary_horizon",
+            "validation_win_threshold_pct",
+        )
+        original_values = {
+            name: getattr(self.repo.settings, name)
+            for name in mutable_setting_names
+        }
+        self.addCleanup(self._restore_settings, original_values)
+
+    def _restore_settings(self, original_values: dict[str, object]) -> None:
+        for name, value in original_values.items():
+            setattr(self.repo.settings, name, value)
 
     def _build_session_local(self):
         temp_dir = tempfile.TemporaryDirectory()
@@ -284,6 +302,43 @@ class RepositoryCalibrationTests(unittest.TestCase):
         self.assertEqual(evaluation.evidence_basis, "recent_window:14d:generated_at")
         self.assertEqual(evaluation.trust_window_start, datetime(2026, 3, 6, 12, 0))
         self.assertEqual(evaluation.trust_window_end, datetime(2026, 3, 20, 12, 0))
+
+    def test_crypto_buy_gate_requires_higher_sample_bar(self) -> None:
+        # A 25-outcome BUY bucket clears the stock gate but must fail for crypto BUY,
+        # which requires the stricter crypto sample bar (default 30). Stricter only.
+        summary = SignalOutcomeSummary(
+            total_signals=25,
+            pending_15m_count=0,
+            pending_1h_count=0,
+            pending_1d_count=0,
+            overall=self._bucket("overall", count=25, win_rate=66.0, avg_return=0.3),
+            by_signal=[self._bucket("BUY", count=25, win_rate=66.0, avg_return=0.3)],
+            by_confidence_bucket=[],
+            by_signal_confidence_bucket=[],
+            by_signal_score_bucket=[self._bucket("BUY:60-69", count=25, win_rate=70.0, avg_return=0.35)],
+        )
+
+        with patch.object(self.repo, "get_signal_outcome_summary", return_value=summary):
+            stock_eval = self.repo.evaluate_signal_gate(
+                asset_type="stock",
+                signal="BUY",
+                score_band="60-69",
+                horizon="1h",
+                observed_at=datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+            )
+            crypto_eval = self.repo.evaluate_signal_gate(
+                asset_type="crypto",
+                signal="BUY",
+                score_band="60-69",
+                horizon="1h",
+                observed_at=datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+            )
+
+        self.assertTrue(stock_eval.passed)
+        self.assertFalse(crypto_eval.passed)
+        sample_check = next(c for c in crypto_eval.checks if c.name == "sample_size")
+        self.assertFalse(sample_check.passed)
+        self.assertIn("30", sample_check.detail)
 
     def test_calibrate_signal_uses_recent_window_for_primary_and_fallback(self) -> None:
         sparse_asset_summary = SignalOutcomeSummary(
@@ -764,6 +819,19 @@ class RepositoryCalibrationTests(unittest.TestCase):
                         self.assertEqual(row.return_after_1d, 3.0)
             finally:
                 engine.dispose()
+
+    def test_tracks_outcome_signal_includes_hold_when_enabled(self) -> None:
+        self.repo.settings.track_hold_outcomes = True
+        self.assertTrue(self.repo._tracks_outcome_signal("HOLD"))
+        self.assertTrue(self.repo._tracks_outcome_signal("BUY"))
+        self.repo.settings.track_hold_outcomes = False
+        self.assertFalse(self.repo._tracks_outcome_signal("HOLD"))
+
+    def test_signal_return_for_hold_uses_raw_market_move(self) -> None:
+        hold_return = self.repo._signal_return(signal="HOLD", entry_price=100.0, future_price=105.0)
+        sell_return = self.repo._signal_return(signal="SELL", entry_price=100.0, future_price=105.0)
+        self.assertEqual(hold_return, 5.0)
+        self.assertEqual(sell_return, -5.0)
 
     def test_reconcile_allows_manual_audit_backed_paper_position_without_intent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1652,6 +1720,132 @@ class RepositoryCalibrationTests(unittest.TestCase):
 
         self.assertEqual(decision_row.signal_age_minutes, 30.0)
         self.assertGreaterEqual(decision_row.signal_age_minutes, 0)
+
+
+class TopPickPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repo = ScanRepository()
+
+    def test_map_run_exposes_top_stocks_and_crypto_from_persisted_flags(self) -> None:
+        from app.models.scan import ScanResultORM, ScanRunORM
+
+        created_at = datetime(2026, 6, 28, 12, 0, tzinfo=timezone.utc)
+        run = ScanRunORM(
+            run_id="run-top-picks",
+            created_at=created_at,
+            market_status="bullish",
+            scan_count=2,
+            watchlist_size=2,
+            alerts_sent=0,
+        )
+        stock = ScanResultORM(
+            run_id=run.run_id,
+            created_at=created_at,
+            ticker="NVDA",
+            asset_type="stock",
+            score=90.0,
+            explanation="strong",
+            price=100.0,
+            price_change_pct=1.0,
+            relative_volume=1.0,
+            sentiment_score=0.1,
+            filing_flag=False,
+            breakout_flag=True,
+            market_status="bullish",
+            sector_strength_score=0.5,
+            options_flow_score=0.0,
+            options_flow_summary="No options signal.",
+            options_flow_bullish=False,
+            options_call_put_ratio=0.0,
+            alert_sent=False,
+            news_checked=False,
+            news_source="none",
+            signal_label="weak",
+            data_grade="decision",
+            gate_passed=True,
+            decision_signal="BUY",
+            provider_status="ok",
+            readiness_score=92.0,
+            readiness_band="high",
+            readiness_hard_stop=False,
+            readiness_reason="Actionable",
+            selection_rank=1,
+            is_top_pick=True,
+        )
+        crypto = ScanResultORM(
+            run_id=run.run_id,
+            created_at=created_at,
+            ticker="BTC/USD",
+            asset_type="crypto",
+            score=84.0,
+            explanation="strong",
+            price=100000.0,
+            price_change_pct=1.0,
+            relative_volume=1.0,
+            sentiment_score=0.1,
+            filing_flag=False,
+            breakout_flag=True,
+            market_status="bullish",
+            sector_strength_score=0.5,
+            options_flow_score=0.0,
+            options_flow_summary="No options signal.",
+            options_flow_bullish=False,
+            options_call_put_ratio=0.0,
+            alert_sent=False,
+            news_checked=False,
+            news_source="none",
+            signal_label="weak",
+            data_grade="decision",
+            gate_passed=True,
+            decision_signal="BUY",
+            provider_status="ok",
+            readiness_score=88.0,
+            readiness_band="high",
+            readiness_hard_stop=False,
+            readiness_reason="Actionable",
+            selection_rank=1,
+            is_top_pick=True,
+        )
+
+        mapped = self.repo._map_run(run, [stock, crypto])
+        self.assertEqual([row.ticker for row in mapped.top_stocks], ["NVDA"])
+        self.assertEqual([row.ticker for row in mapped.top_crypto], ["BTC/USD"])
+        self.assertTrue(mapped.results[0].is_top_pick)
+        self.assertEqual(mapped.results[0].selection_rank, 1)
+
+
+class WeeklyPatternResolutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repo = ScanRepository()
+
+    def test_prefers_current_scan_weekly_prediction_over_outcome(self) -> None:
+        layer_details = {
+            "decision": {
+                "weekly_prediction": {
+                    "pattern_name": "uptrend_ma_stack",
+                    "real_money_trust_blocked": True,
+                }
+            }
+        }
+        outcome_row = SimpleNamespace(pattern_name="stale_resolved_pattern")
+        pattern_name, trust_blocked = self.repo._resolve_current_weekly_pattern(
+            session=None,
+            symbol="AAPL",
+            layer_details=layer_details,
+            outcome_row=outcome_row,
+        )
+        self.assertEqual(pattern_name, "uptrend_ma_stack")
+        self.assertTrue(trust_blocked)
+
+    def test_falls_back_to_outcome_pattern_when_no_current_prediction(self) -> None:
+        pattern_name, trust_blocked = self.repo._resolve_current_weekly_pattern(
+            session=None,
+            symbol="AAPL",
+            layer_details={"decision": {}},
+            outcome_row=SimpleNamespace(pattern_name="range_neutral"),
+        )
+        self.assertEqual(pattern_name, "range_neutral")
+        self.assertIsNone(trust_blocked)
 
 
 if __name__ == "__main__":

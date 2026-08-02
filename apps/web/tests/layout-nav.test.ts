@@ -5,58 +5,56 @@ import { render, screen } from '@testing-library/react';
 import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import HomePage from '@/app/page';
-import RootLayout from '@/app/layout';
+import RootLayout, { metadata } from '@/app/layout';
 
 vi.mock('@/lib/api', () => ({
-  getAutomationStatus: vi.fn(async () => ({ data: { scheduler_running: false }, error: null })),
+  getAutomationStatus: vi.fn(async () => ({ data: { dry_run_only: true }, error: null })),
   getLatestDecisions: vi.fn(async () => ({ data: [], error: null })),
   getLatestScan: vi.fn(async () => ({
     data: {
       created_at: '2026-05-02T12:00:00.000Z',
-      market_status: 'open',
+      market_status: 'bullish',
       scan_count: 0,
       watchlist_size: 0,
+      results: [],
     },
     error: null,
   })),
-  getPaperLedger: vi.fn(async () => ({ data: [], error: null })),
-  getPaperLedgerSummary: vi.fn(async () => ({ data: null, error: null })),
-  getReadyz: vi.fn(async () => ({ data: { scheduler_running: false }, error: null })),
+  getReadyz: vi.fn(async () => ({
+    data: {
+      scheduler_enabled: true,
+      scheduler_running: false,
+      worker_alive: true,
+    },
+    error: null,
+  })),
+  getSystemReadiness: vi.fn(async () => ({ data: null, error: null })),
 }));
 
-vi.mock('@/components/operator-actions', () => ({
-  OperatorActions: () => null,
+vi.mock('@/components/dashboard-status-banner', () => ({
+  DashboardStatusBanner: () => React.createElement('div', { 'data-testid': 'status-banner' }),
 }));
 
-vi.mock('@/components/trading-workspace', () => ({
-  TradingWorkspace: () => null,
+vi.mock('@/components/decision-grid', () => ({
+  DecisionGrid: () => React.createElement('div', { 'data-testid': 'decision-grid' }),
 }));
 
 describe('RootLayout navigation', () => {
-  it('links Actions, History, and Validation from the top nav only', () => {
+  it('links Decision and Proof from the top nav with paper mode badge', () => {
     render(
-      React.createElement(
-        RootLayout,
-        null,
-        React.createElement('span', null, 'child'),
-      ),
+      React.createElement(RootLayout, null, React.createElement('span', null, 'child')),
     );
-    expect(screen.getByRole('link', { name: 'Actions' }).getAttribute('href')).toBe('/');
-    expect(screen.getByRole('link', { name: 'History' }).getAttribute('href')).toBe('/history');
-    expect(screen.getByRole('link', { name: 'Validation' }).getAttribute('href')).toBe(
-      '/validation',
-    );
-    expect(screen.queryByRole('link', { name: 'Journal' })).toBeNull();
-    expect(screen.queryByRole('link', { name: 'Review' })).toBeNull();
+    expect(screen.getByRole('link', { name: 'Decision' }).getAttribute('href')).toBe('/');
+    expect(screen.getByRole('link', { name: 'Proof' }).getAttribute('href')).toBe('/proof');
+    expect(screen.getByTestId('paper-mode-badge')).toHaveTextContent(/PAPER MODE/i);
+    expect(metadata.description).toContain('BUY candidate');
+    expect(metadata.description).not.toMatch(/SELL|HOLD/);
   });
 
-  it('does not render the dashboard Open Pages section', async () => {
+  it('renders decision page with status banner and decision grid', async () => {
     render(await HomePage());
-
-    expect(screen.queryByRole('heading', { name: 'Open Pages' })).toBeNull();
-    expect(screen.queryByRole('link', { name: 'Scan history' })).toBeNull();
-    expect(screen.queryByRole('link', { name: 'Review queue' })).toBeNull();
-    expect(screen.queryByRole('link', { name: 'Journal' })).toBeNull();
-    expect(screen.queryByRole('link', { name: 'Validation' })).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Buy Candidates' })).toBeInTheDocument();
+    expect(screen.getByTestId('status-banner')).toBeInTheDocument();
+    expect(screen.getByTestId('decision-grid')).toBeInTheDocument();
   });
 });

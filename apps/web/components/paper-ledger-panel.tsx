@@ -152,6 +152,7 @@ export function PaperLedgerPanel({
   highlightAuditId,
   refreshing,
   onRefresh,
+  defaultCollapsed = false,
 }: {
   positions: PaperPositionSummary[];
   summary: PaperLedgerSummary | null;
@@ -160,9 +161,11 @@ export function PaperLedgerPanel({
   highlightAuditId?: number | null;
   refreshing: boolean;
   onRefresh: () => void;
+  defaultCollapsed?: boolean;
 }) {
   const openPositions = positions.filter((position) => position.status === 'open');
   const closedPositions = positions.filter((position) => position.status === 'closed');
+  const [expanded, setExpanded] = useState(!defaultCollapsed);
   const [reconciling, setReconciling] = useState(false);
   const [reconcileStatus, setReconcileStatus] = useState<string | null>(null);
   const estimatedUnrealized = openPositions.reduce((sum, position) => {
@@ -184,15 +187,40 @@ export function PaperLedgerPanel({
   };
 
   return (
-    <section id="paper-ledger" className="card">
+    <section
+      id="paper-ledger"
+      className={`card paper-ledger-panel ${expanded ? 'is-expanded' : 'is-collapsed'}`}
+    >
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
         <div>
           <h2 style={{ marginBottom: 8 }}>Paper Ledger</h2>
           <p className="muted" style={{ margin: 0 }}>
-            Dry-run positions and outcomes from the scanner execution audit trail.
+            Audit trail and performance review (lower priority).
           </p>
+          <div className="paper-ledger-summary-row small" style={{ marginTop: 10 }}>
+            <span>
+              <span className="muted">Open:</span>{' '}
+              {formatCount(summary?.open_positions, openPositions.length)}
+            </span>
+            <span>
+              <span className="muted">Realized P/L:</span>{' '}
+              {formatCurrency(summary?.total_realized_pnl ?? null)}
+            </span>
+            <span>
+              <span className="muted">Total trades:</span>{' '}
+              {formatCount(summary?.total_count, positions.length)}
+            </span>
+          </div>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'start', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            className="button button-secondary"
+            onClick={() => setExpanded((value) => !value)}
+            style={{ width: 'auto', padding: '8px 14px' }}
+          >
+            {expanded ? 'Collapse ledger' : 'Expand ledger'}
+          </button>
           <button
             type="button"
             className="button"
@@ -225,6 +253,8 @@ export function PaperLedgerPanel({
         </p>
       ) : null}
 
+      {expanded ? (
+        <>
       <div className="detail-panel small" style={{ marginTop: 16 }}>
         <div>
           <span className="muted">Total trades:</span>{' '}
@@ -281,6 +311,8 @@ export function PaperLedgerPanel({
           highlightAuditId={highlightAuditId}
         />
       </div>
+        </>
+      ) : null}
     </section>
   );
 }

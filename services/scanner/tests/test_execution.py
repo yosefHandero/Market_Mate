@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -15,7 +16,7 @@ import app.services.repository as repository_module
 from app.db import Base
 from app.errors import AppError
 from app.models.scan import ExecutionAuditORM, PaperPositionORM
-from app.schemas import OrderPlaceRequest, TradeEligibility
+from app.schemas import OrderPlaceRequest, OrderPreviewRequest, TradeEligibility
 from app.services.execution import ExecutionService
 
 
@@ -281,7 +282,6 @@ class ExecutionServiceTests(unittest.TestCase):
                 service.settings.paper_loop_kill_switch = True
                 service.settings.require_readyz_for_execution = False
                 service.alpaca.get_latest_price = AsyncMock(return_value=190.0)
-                service.alpaca.submit_order = AsyncMock()
 
                 with patch.object(execution_module, "SessionLocal", SessionLocal):
                     with self.assertRaises(AppError) as ctx:
@@ -303,7 +303,6 @@ class ExecutionServiceTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.status_code, 409)
                 self.assertEqual(ctx.exception.code, "kill_switch_enabled")
                 service.alpaca.get_latest_price.assert_not_awaited()
-                service.alpaca.submit_order.assert_not_awaited()
                 self.assertEqual(audit_count, 0)
                 self.assertEqual(position_count, 0)
             finally:
@@ -334,7 +333,6 @@ class ExecutionServiceTests(unittest.TestCase):
                 service.settings.paper_loop_kill_switch = True
                 service.settings.require_readyz_for_execution = False
                 service.alpaca.get_latest_price = AsyncMock(return_value=190.0)
-                service.alpaca.submit_order = AsyncMock()
 
                 with patch.object(execution_module, "SessionLocal", SessionLocal):
                     with self.assertRaises(AppError):
@@ -365,7 +363,6 @@ class ExecutionServiceTests(unittest.TestCase):
                         audit_count = session.query(ExecutionAuditORM).count()
 
                 service.alpaca.get_latest_price.assert_not_awaited()
-                service.alpaca.submit_order.assert_not_awaited()
                 self.assertEqual(audit_count, 0)
             finally:
                 engine.dispose()
@@ -495,26 +492,69 @@ class ExecutionServiceTests(unittest.TestCase):
             finally:
                 engine.dispose()
 
+    def test_place_request_rejects_non_dry_run_at_schema_boundary(self) -> None:
+        # Paper-only build: dry_run=false can no longer even be constructed.
+        with self.assertRaises(ValidationError):
+            OrderPlaceRequest(
+                ticker="AAPL",
+                side="buy",
+                qty=1,
+                mode="dry_run",
+                dry_run=False,
+            )
+
+    def test_place_request_rejects_live_mode_at_schema_boundary(self) -> None:
+        with self.assertRaises(ValidationError):
+            OrderPlaceRequest(
+                ticker="AAPL",
+                side="buy",
+                qty=1,
+                mode="live",
+                dry_run=True,
+            )
+
+    def test_preview_request_rejects_unknown_mode_at_schema_boundary(self) -> None:
+        with self.assertRaises(ValidationError):
+            OrderPreviewRequest(
+                ticker="AAPL",
+                side="buy",
+                qty=1,
+                mode="production",
+            )
+
     def test_place_rejects_non_dry_run_at_service_layer(self) -> None:
+        # Defense-in-depth: even if a validated request object is mutated after
+        # construction (bypassing pydantic), the service still refuses it.
         service = ExecutionService()
         service.alpaca.get_latest_price = AsyncMock()
-        service.alpaca.submit_order = AsyncMock()
+        service.alpaca._request_json = AsyncMock()
+
+        request = OrderPlaceRequest(ticker="AAPL", side="buy", qty=1, mode="dry_run")
+        object.__setattr__(request, "dry_run", False)
 
         with self.assertRaises(AppError) as ctx:
-            asyncio.run(
-                service.place(
-                    OrderPlaceRequest(
-                        ticker="AAPL",
-                        side="buy",
-                        qty=1,
-                    )
-                )
-            )
+            asyncio.run(service.place(request))
 
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertEqual(ctx.exception.code, "dry_run_required")
         service.alpaca.get_latest_price.assert_not_awaited()
-        service.alpaca.submit_order.assert_not_awaited()
+        service.alpaca._request_json.assert_not_awaited()
+
+    def test_preview_rejects_unknown_mode_at_service_layer(self) -> None:
+        service = ExecutionService()
+        service.alpaca.get_latest_price = AsyncMock()
+        service.alpaca._request_json = AsyncMock()
+
+        request = OrderPreviewRequest(ticker="AAPL", side="buy", qty=1, mode="dry_run")
+        object.__setattr__(request, "mode", "production")
+
+        with self.assertRaises(AppError) as ctx:
+            asyncio.run(service.preview(request))
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.code, "dry_run_required")
+        service.alpaca.get_latest_price.assert_not_awaited()
+        service.alpaca._request_json.assert_not_awaited()
 
     def test_place_reuses_existing_idempotent_audit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -669,6 +709,7 @@ class ExecutionServiceTests(unittest.TestCase):
                 service = ExecutionService()
                 service.settings.require_readyz_for_execution = False
                 service.alpaca.get_latest_price = AsyncMock(return_value=190.0)
+                service.alpaca._request_json = AsyncMock()
                 service.risk.evaluate_trade = lambda **_: TradeEligibility(
                     ticker="AAPL",
                     asset_type="stock",
@@ -727,6 +768,7 @@ class ExecutionServiceTests(unittest.TestCase):
                 self.assertEqual(position.intent_key, "manual-1")
                 self.assertEqual(position.execution_audit_id, response.execution_audit_id)
                 self.assertEqual(position.strategy_version, "v4.0-layered")
+                service.alpaca._request_json.assert_not_awaited()
             finally:
                 engine.dispose()
 
@@ -1011,6 +1053,25 @@ class ExecutionServiceTests(unittest.TestCase):
                 self.assertEqual(positions, [])
             finally:
                 engine.dispose()
+
+    def test_production_code_has_no_alpaca_order_submission_endpoint(self) -> None:
+        app_root = Path(__file__).resolve().parents[1] / "app"
+        # Split literals so this guard test never trips over its own source text.
+        forbidden_tokens = (
+            "submit" + "_order",
+            "/v2/" + "orders",
+            "/v2/" + "positions",
+            "/v2/" + "account",
+            "paper-api." + "alpaca.markets",
+        )
+        offenders: list[str] = []
+        for path in app_root.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            for token in forbidden_tokens:
+                if token in text:
+                    offenders.append(f"{path.relative_to(app_root.parent)}::{token}")
+
+        self.assertEqual([], offenders)
 
 
 if __name__ == "__main__":

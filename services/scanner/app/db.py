@@ -3,20 +3,84 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_settings
 
 settings = get_settings()
 SCANNER_SCHEMA_REPAIR_ALLOW_ENV = "SCANNER_SCHEMA_REPAIR_ALLOW"
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(
-    settings.database_url,
-    future=True,
-    connect_args=connect_args,
-    pool_pre_ping=True,
-)
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
+def _is_sqlite_url(database_url: str) -> bool:
+    return database_url.startswith("sqlite")
+
+
+def _is_memory_sqlite_url(database_url: str) -> bool:
+    normalized_url = database_url.split("?", 1)[0]
+    return normalized_url in {"sqlite://", "sqlite:///:memory:"} or normalized_url.endswith(":memory:")
+
+
+def _sqlite_connect_args(
+    database_url: str,
+    *,
+    busy_timeout_ms: int = SQLITE_BUSY_TIMEOUT_MS,
+) -> dict[str, object]:
+    if not _is_sqlite_url(database_url):
+        return {}
+    return {
+        "check_same_thread": False,
+        "timeout": max(busy_timeout_ms, 0) / 1000,
+    }
+
+
+def _configure_sqlite_connection(
+    dbapi_connection,
+    *,
+    busy_timeout_ms: int = SQLITE_BUSY_TIMEOUT_MS,
+    enable_wal: bool = True,
+) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute(f"PRAGMA busy_timeout = {max(int(busy_timeout_ms), 0)}")
+        if enable_wal:
+            cursor.execute("PRAGMA journal_mode = WAL")
+            cursor.fetchone()
+            cursor.execute("PRAGMA synchronous = NORMAL")
+    finally:
+        cursor.close()
+
+
+def create_scanner_engine(
+    database_url: str,
+    *,
+    busy_timeout_ms: int = SQLITE_BUSY_TIMEOUT_MS,
+):
+    created_engine = create_engine(
+        database_url,
+        future=True,
+        connect_args=_sqlite_connect_args(
+            database_url,
+            busy_timeout_ms=busy_timeout_ms,
+        ),
+        pool_pre_ping=True,
+    )
+    if _is_sqlite_url(database_url):
+        enable_wal = not _is_memory_sqlite_url(database_url)
+
+        @event.listens_for(created_engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+            _configure_sqlite_connection(
+                dbapi_connection,
+                busy_timeout_ms=busy_timeout_ms,
+                enable_wal=enable_wal,
+            )
+
+    return created_engine
+
+
+engine = create_scanner_engine(settings.database_url)
 SessionLocal = sessionmaker(
     bind=engine,
     autoflush=False,
@@ -28,7 +92,16 @@ Base = declarative_base()
 
 # Register ORM tables on Base.metadata (create_all / schema patches).
 from app.models.journal import JournalEntryORM  # noqa: E402, F401
-from app.models.scan import AutomationIntentORM, ExecutionAuditORM, PaperLoopBreakerORM, PaperPositionORM  # noqa: E402, F401
+from app.models.scan import (  # noqa: E402, F401
+    AutomationIntentORM,
+    DailyBarHistoryORM,
+    ExecutionAuditORM,
+    PaperLoopBreakerORM,
+    PaperPositionORM,
+    PredictionSnapshotORM,
+    WalkForwardPredictionORM,
+    WalkForwardRunORM,
+)
 from app.models.system import MaintenanceStateORM, SchedulerStateORM  # noqa: E402, F401
 
 REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
@@ -74,9 +147,16 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "provider_warnings_json": "TEXT",
         "data_grade": "VARCHAR(16) DEFAULT 'research'",
         "bar_age_minutes": "FLOAT",
+        "bar_as_of": "DATETIME",
         "freshness_flags_json": "TEXT",
         "layer_details_json": "TEXT",
         "comparison_json": "TEXT",
+        "readiness_score": "FLOAT DEFAULT 0",
+        "readiness_band": "VARCHAR(16) DEFAULT 'none'",
+        "readiness_hard_stop": "BOOLEAN DEFAULT 0",
+        "readiness_reason": "TEXT",
+        "selection_rank": "INTEGER",
+        "is_top_pick": "BOOLEAN DEFAULT 0",
     },
     "signal_outcomes": {
         "asset_type": "VARCHAR(16) DEFAULT 'stock'",
@@ -168,6 +248,7 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "last_run_started_at": "DATETIME",
         "last_run_finished_at": "DATETIME",
         "last_error": "TEXT",
+        "worker_heartbeat_at": "DATETIME",
         "created_at": "DATETIME",
         "updated_at": "DATETIME",
     },

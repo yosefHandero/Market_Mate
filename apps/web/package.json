@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint",
+    "dev": "node scripts/run-next.mjs dev",
+    "build": "node scripts/run-next.mjs build",
+    "start": "node scripts/run-next.mjs start",
+    "lint": "node scripts/run-next.mjs lint",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run lint && npm run test"
+    "check": "npm run lint && npm run typecheck && npm run test"
   },
   "dependencies": {
     "framer-motion": "^12.38.0",

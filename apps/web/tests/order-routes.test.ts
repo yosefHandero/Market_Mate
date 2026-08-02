@@ -128,16 +128,11 @@ describe('order proxy routes', () => {
     });
   });
 
-  it('overrides client dry_run false before proxying order placement', async () => {
+  it('rejects client dry_run false before proxying order placement', async () => {
     process.env.SCANNER_ADMIN_API_TOKEN = 'admin-token';
     process.env.NEXT_PUBLIC_SCANNER_API_BASE = 'http://scanner.test';
 
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ ok: true, dry_run: true }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
 
     const { POST } = await import('@/app/api/orders/place/route');
@@ -152,17 +147,32 @@ describe('order proxy routes', () => {
       }),
     );
 
-    expect(response.status).toBe(200);
-    const [, init] = fetchMock.mock.calls[0];
-    expect(JSON.parse(String(init?.body))).toEqual({
-      ticker: 'AAPL',
-      side: 'buy',
-      qty: 1,
-      order_type: 'market',
-      mode: 'dry_run',
-      preview_audit_id: 12,
-      dry_run: true,
-    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ detail: 'dry_run cannot be false.' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects live order modes before proxying order placement', async () => {
+    process.env.SCANNER_ADMIN_API_TOKEN = 'admin-token';
+    process.env.NEXT_PUBLIC_SCANNER_API_BASE = 'http://scanner.test';
+
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { POST } = await import('@/app/api/orders/place/route');
+    const response = await POST(
+      createJsonRequest('http://localhost/api/orders/place', {
+        ticker: 'AAPL',
+        side: 'buy',
+        qty: 1,
+        mode: 'live',
+        dry_run: true,
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ detail: 'mode must be "dry_run".' });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('normalizes dry-run order placement before proxying to the scanner admin API', async () => {

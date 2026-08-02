@@ -4,17 +4,17 @@ from app.services.automation import AutomationService
 from app.services.automation_repository import AutomationRepository
 from app.services.coinbase_market_data import CoinbaseMarketDataService
 from app.services.execution import ExecutionService
-from app.services.journal_repository import JournalRepository
 from app.services.promotion import PromotionService
 from app.services.replay import ReplayService
 from app.services.repository import ScanRepository
 from app.services.risk import RiskService
 from app.services.scheduler import SchedulerService
 from app.services.scanner import ScannerService
+from app.services.walk_forward_proof import WalkForwardProofService
+from app.services.walk_forward_repository import WalkForwardRepository
 
 coinbase_market_data_service = CoinbaseMarketDataService()
 scanner_service = ScannerService(market_data_service=coinbase_market_data_service)
-journal_repository = JournalRepository()
 scan_repository = ScanRepository()
 risk_service = RiskService(scan_repository=scan_repository)
 execution_service = ExecutionService(scan_repository=scan_repository)
@@ -27,6 +27,11 @@ scanner_service.automation_service = automation_service
 replay_service = ReplayService()
 scheduler_service = SchedulerService(scanner_service=scanner_service)
 promotion_service = PromotionService(scan_repository=scan_repository)
+walk_forward_repository = WalkForwardRepository()
+walk_forward_proof_service = WalkForwardProofService(
+    repository=walk_forward_repository,
+    scan_repository=scan_repository,
+)
 
 
 def get_scanner_service() -> ScannerService:
@@ -39,10 +44,6 @@ def get_coinbase_market_data_service() -> CoinbaseMarketDataService:
 
 def get_execution_service() -> ExecutionService:
     return execution_service
-
-
-def get_journal_repository() -> JournalRepository:
-    return journal_repository
 
 
 def get_risk_service() -> RiskService:
@@ -67,3 +68,11 @@ def get_automation_service() -> AutomationService:
 
 def get_promotion_service() -> PromotionService:
     return promotion_service
+
+
+def get_walk_forward_repository() -> WalkForwardRepository:
+    return walk_forward_repository
+
+
+def get_walk_forward_proof_service() -> WalkForwardProofService:
+    return walk_forward_proof_service

@@ -9,6 +9,8 @@ class SchedulerServiceLoopTests(unittest.TestCase):
     def test_run_forever_runs_due_scan_and_releases_lease(self) -> None:
         scanner_service = Mock()
         scanner_service.refresh_due_signal_outcomes = AsyncMock(return_value=2)
+        scanner_service.refresh_due_prediction_snapshots = AsyncMock(return_value=0)
+        scanner_service.close_open_positions_past_horizon = AsyncMock(return_value=0)
         scanner_service.run_scan = AsyncMock(return_value=None)
 
         repository = Mock()
@@ -28,6 +30,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
         repository.acquire_lease.assert_called_once_with(instance_id)
         repository.heartbeat.assert_called_once_with(instance_id)
         scanner_service.refresh_due_signal_outcomes.assert_awaited_once()
+        scanner_service.close_open_positions_past_horizon.assert_awaited_once()
         repository.mark_run_started.assert_called_once_with(instance_id)
         scanner_service.run_scan.assert_awaited_once()
         repository.mark_run_finished.assert_called_once_with(instance_id)
@@ -36,6 +39,8 @@ class SchedulerServiceLoopTests(unittest.TestCase):
     def test_run_forever_records_scan_errors_before_releasing_lease(self) -> None:
         scanner_service = Mock()
         scanner_service.refresh_due_signal_outcomes = AsyncMock(return_value=0)
+        scanner_service.refresh_due_prediction_snapshots = AsyncMock(return_value=0)
+        scanner_service.close_open_positions_past_horizon = AsyncMock(return_value=0)
         scanner_service.run_scan = AsyncMock(side_effect=RuntimeError("scan failed"))
 
         repository = Mock()
@@ -59,6 +64,8 @@ class SchedulerServiceLoopTests(unittest.TestCase):
     def test_run_forever_does_not_double_trigger_after_crashed_run(self) -> None:
         scanner_service = Mock()
         scanner_service.refresh_due_signal_outcomes = AsyncMock(return_value=0)
+        scanner_service.refresh_due_prediction_snapshots = AsyncMock(return_value=0)
+        scanner_service.close_open_positions_past_horizon = AsyncMock(return_value=0)
         scanner_service.run_scan = AsyncMock(return_value=None)
 
         repository = Mock()
@@ -88,6 +95,8 @@ class SchedulerServiceLoopTests(unittest.TestCase):
     def test_run_forever_missed_startup_uses_existing_claim_flow(self) -> None:
         scanner_service = Mock()
         scanner_service.refresh_due_signal_outcomes = AsyncMock(return_value=0)
+        scanner_service.refresh_due_prediction_snapshots = AsyncMock(return_value=0)
+        scanner_service.close_open_positions_past_horizon = AsyncMock(return_value=0)
         scanner_service.run_scan = AsyncMock(return_value=None)
 
         repository = Mock()
@@ -110,6 +119,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
                 call.reset_missed_run_on_startup(
                     interval_seconds=service.settings.scan_interval_seconds
                 ),
+                call.recover_stale_run(),
                 call.acquire_lease(instance_id),
                 call.heartbeat(instance_id),
                 call.due_for_run(),

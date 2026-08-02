@@ -62,6 +62,12 @@ function baseScan(overrides: Partial<ScanResult> = {}): ScanResult {
     provider_warnings: [],
     bar_age_minutes: 5,
     freshness_flags: {},
+    readiness_score: 88,
+    readiness_band: 'high',
+    readiness_hard_stop: false,
+    readiness_reason: 'Actionable: gates passed and data is fresh.',
+    selection_rank: 1,
+    is_top_pick: true,
     created_at: '2026-04-22T18:00:00.000Z',
     ...overrides,
   };
@@ -86,6 +92,12 @@ const sampleDecision = (overrides: Partial<DecisionRow> = {}): DecisionRow => ({
   signal_age_minutes: 5,
   freshness_flags: null,
   recommended_action: 'preview',
+  readiness_score: 88,
+  readiness_band: 'high',
+  readiness_hard_stop: false,
+  readiness_reason: 'Actionable: gates passed and data is fresh.',
+  selection_rank: 1,
+  is_top_pick: true,
   score_contributions: {},
   strategy_version: 'v4.0-layered',
   short_metric_summary: '--',
@@ -93,7 +105,7 @@ const sampleDecision = (overrides: Partial<DecisionRow> = {}): DecisionRow => ({
   ...overrides,
 });
 
-describe('readiness helpers', () => {
+describe('readiness presenter', () => {
   it('formats readiness as a percentage', () => {
     expect(formatReadiness(82.4)).toBe('82%');
     expect(formatReadiness(100)).toBe('100%');
@@ -109,144 +121,36 @@ describe('readiness helpers', () => {
     expect(readinessTone(24)).toBe('none');
   });
 
-  it('produces high readiness for eligible fresh provider-ok preview row', () => {
-    const r = computeTradeReadiness(baseScan(), sampleDecision());
-    expect(r.score).toBeGreaterThanOrEqual(80);
-    expect(r.tone).toBe('high');
-    expect(r.reason).toContain('Actionable');
+  it('renders backend readiness for an actionable row', () => {
+    const readiness = computeTradeReadiness(baseScan(), sampleDecision());
+    expect(readiness.score).toBe(88);
+    expect(readiness.tone).toBe('high');
+    expect(readiness.reason).toContain('Actionable');
   });
 
-  it('falls back from calibrated confidence to score, raw score, and decision confidence', () => {
-    const scoreFallback = computeTradeReadiness(
-      baseScan({ calibrated_confidence: 0, score: 68 }),
-      sampleDecision(),
-    );
-    expect(scoreFallback.baseScore).toBe(68);
-    expect(scoreFallback.score).toBeGreaterThanOrEqual(60);
-    expect(
-      computeTradeReadiness(
-        baseScan({ calibrated_confidence: 0, score: 61, raw_score: 74 }),
-        sampleDecision({ confidence: 82 }),
-      ).baseScore,
-    ).toBe(61);
-    expect(
-      computeTradeReadiness(
-        baseScan({ calibrated_confidence: 0, score: 0, raw_score: 74 }),
-        sampleDecision({ confidence: 82 }),
-      ).baseScore,
-    ).toBe(74);
-    expect(
-      computeTradeReadiness(
-        baseScan({ calibrated_confidence: 0, score: 0, raw_score: 0 }),
-        sampleDecision({ confidence: 82 }),
-      ).baseScore,
-    ).toBe(82);
-  });
-
-  it('caps readiness for review action inside the watch range', () => {
-    const r = computeTradeReadiness(
-      baseScan({ recommended_action: 'review' }),
+  it('uses backend review reason and band', () => {
+    const readiness = computeTradeReadiness(
+      baseScan({
+        readiness_score: 55,
+        readiness_band: 'watch',
+        readiness_reason: 'Watch only: review pending.',
+        recommended_action: 'review',
+      }),
       sampleDecision({ recommended_action: 'review' }),
     );
-    expect(r.score).toBeLessThanOrEqual(65);
-    expect(r.score).toBeGreaterThanOrEqual(40);
-    expect(r.tone).toBe('watch');
+    expect(readiness.score).toBe(55);
+    expect(readiness.tone).toBe('watch');
     expect(
       explainTradeReadiness(
-        baseScan({ recommended_action: 'review' }),
+        baseScan({
+          recommended_action: 'review',
+          readiness_score: 55,
+          readiness_band: 'watch',
+          readiness_reason: 'Watch only: review pending.',
+        }),
         sampleDecision({ recommended_action: 'review' }),
       ),
     ).toContain('Watch only');
-  });
-
-  it('produces low readiness for blocked row with gate reason', () => {
-    const scan = baseScan({
-      recommended_action: 'blocked',
-      gate_passed: false,
-      gate_reason: 'Blocked by sample_size: need 20.',
-      gate_checks: [
-        {
-          name: 'sample_size',
-          passed: false,
-          detail: 'stock BUY bucket has 4 1h outcomes; need 20.',
-        },
-      ],
-    });
-    const r = computeTradeReadiness(scan, sampleDecision({ recommended_action: 'blocked' }));
-    expect(r.score).toBeGreaterThanOrEqual(15);
-    expect(r.score).toBeLessThanOrEqual(35);
-    expect(r.tone).toBe('low');
-    expect(r.reason).toContain('sample size');
-    expect(r.projection).toBe('blocked_until_sample_size');
-  });
-
-  it('produces low readiness for HOLD ignore row', () => {
-    const scan = baseScan({
-      decision_signal: 'HOLD',
-      recommended_action: 'ignore',
-      calibrated_confidence: 90,
-    });
-    const r = computeTradeReadiness(
-      scan,
-      sampleDecision({ signal: 'HOLD', recommended_action: 'ignore' }),
-    );
-    expect(r.score).toBeGreaterThanOrEqual(10);
-    expect(r.score).toBeLessThanOrEqual(30);
-    expect(r.reason).toContain('HOLD');
-  });
-
-  it('penalizes provider degraded without automatically zeroing readiness', () => {
-    const healthy = computeTradeReadiness(baseScan(), sampleDecision());
-    const r = computeTradeReadiness(
-      baseScan({ provider_status: 'degraded' }),
-      sampleDecision({ provider_status: 'degraded' }),
-    );
-    expect(r.score).toBeGreaterThan(0);
-    expect(r.score).toBeLessThan(healthy.score);
-    expect(r.projection).toBe('decaying');
-  });
-
-  it('produces low readiness for provider critical', () => {
-    const scan = baseScan({ provider_status: 'critical', recommended_action: 'preview' });
-    const r = computeTradeReadiness(scan, sampleDecision());
-    expect(r.score).toBeLessThan(40);
-    expect(r.reason).toContain('provider');
-  });
-
-  it('penalizes stale bars', () => {
-    const scan = baseScan({ bar_age_minutes: 200, recommended_action: 'preview' });
-    const r = computeTradeReadiness(scan, sampleDecision());
-    expect(r.score).toBeLessThanOrEqual(30);
-    expect(r.reason.toLowerCase()).toMatch(/stale|bars/);
-  });
-
-  it('hard-stops provider critical when bars are stale over six hours', () => {
-    const r = computeTradeReadiness(
-      baseScan({ provider_status: 'critical', bar_age_minutes: 361 }),
-      sampleDecision({ provider_status: 'critical', bar_age_minutes: 361 }),
-    );
-    expect(r.score).toBe(0);
-    expect(r.hardStop).toBe(true);
-  });
-
-  it('hard-stops a missing or invalid price', () => {
-    expect(computeTradeReadiness(baseScan({ price: 0 }), sampleDecision()).score).toBe(0);
-    expect(computeTradeReadiness(baseScan({ price: Number.NaN }), sampleDecision()).score).toBe(0);
-  });
-
-  it('returns required factors and a projection', () => {
-    const r = computeTradeReadiness(baseScan(), sampleDecision());
-    expect(r.factors.map((factor) => factor.key)).toEqual([
-      'signal_confidence',
-      'actionability',
-      'gate_status',
-      'provider_health',
-      'freshness',
-      'risk_setup',
-    ]);
-    expect(r.band).toBe(r.tone);
-    expect(r.reasons.length).toBeGreaterThan(0);
-    expect(r.projection).toBe('stable');
   });
 
   it('hard-stops kill switch in reason when automation is passed', () => {
@@ -291,14 +195,14 @@ describe('readiness helpers', () => {
       candidates_reached_execution_call: 0,
       filter_rate_pct: null,
     };
-    const r = computeTradeReadiness(baseScan(), sampleDecision(), { automation });
-    expect(r.reason).toContain('kill switch');
-    expect(r.score).toBe(0);
-    expect(r.hardStop).toBe(true);
-    expect(r.projection).toBe('kill_switch_or_breaker');
+    const readiness = computeTradeReadiness(baseScan(), sampleDecision(), { automation });
+    expect(readiness.reason).toContain('kill switch');
+    expect(readiness.score).toBe(0);
+    expect(readiness.hardStop).toBe(true);
+    expect(readiness.projection).toBe('kill_switch_or_breaker');
   });
 
-  it('hard-stops an open breaker', () => {
+  it('hard-stops an open breaker even when backend score is high', () => {
     const automation: AutomationStatusResponse = {
       enabled: false,
       phase: 'disabled',
@@ -340,8 +244,8 @@ describe('readiness helpers', () => {
       candidates_reached_execution_call: 0,
       filter_rate_pct: null,
     };
-    const r = computeTradeReadiness(baseScan(), sampleDecision(), { automation });
-    expect(r.score).toBe(0);
-    expect(r.reason).toContain('breaker');
+    const readiness = computeTradeReadiness(baseScan(), sampleDecision(), { automation });
+    expect(readiness.score).toBe(0);
+    expect(readiness.reason).toContain('breaker');
   });
 });

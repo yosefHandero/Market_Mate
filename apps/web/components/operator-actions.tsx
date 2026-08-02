@@ -26,12 +26,19 @@ interface OperatorActionsProps {
   lastSchedulerError?: string | null;
   readyzPollAttempts?: number;
   readyzPollIntervalMs?: number;
+  onRefresh?: () => void;
+  feedbackClearMs?: number;
 }
 
 const READYZ_POLL_ATTEMPTS = 5;
 const READYZ_POLL_INTERVAL_MS = 1000;
-const WORKER_NOT_RUNNING_MESSAGE =
-  'Scheduler enabled, but worker is not running. Start it with: python -m app.worker from services/scanner/.';
+export const WORKER_COMMAND = 'python -m app.worker';
+export const WORKER_CWD_HINT = 'services/scanner/';
+export const WORKER_SCRIPT_BASH = 'scripts/start-worker.sh';
+export const WORKER_NOT_RUNNING_MESSAGE =
+  'Scheduler is on, but the local worker is not running. Auto-scans will not run until the worker starts.';
+const WORKER_IMPACT_MESSAGE =
+  'Without the worker, scans go stale, readiness scores drop, and ranks may not update until you run a manual scan.';
 
 function schedulerSnapshotFromProps({
   schedulerEnabled,
@@ -41,7 +48,7 @@ function schedulerSnapshotFromProps({
   lastSchedulerError,
 }: OperatorActionsProps): SchedulerSnapshot {
   return {
-    enabled: schedulerEnabled ?? schedulerRunning,
+    enabled: schedulerEnabled === true,
     running: schedulerRunning,
     nextScanDueAt: nextScanDueAt ?? null,
     lastRunStartedAt: lastSchedulerRunStartedAt ?? null,
@@ -49,11 +56,18 @@ function schedulerSnapshotFromProps({
   };
 }
 
+function workerRunningFromHealth(health: Partial<HealthResponse>): boolean {
+  if (health.worker_alive != null) {
+    return health.worker_alive === true;
+  }
+  return health.scheduler_running === true;
+}
+
 function schedulerSnapshotFromReadyz(health: Partial<HealthResponse>): SchedulerSnapshot {
-  const running = health.scheduler_running === true;
+  const running = workerRunningFromHealth(health);
 
   return {
-    enabled: health.scheduler_enabled === true || running,
+    enabled: health.scheduler_enabled === true,
     running,
     nextScanDueAt: health.next_scan_due_at ?? null,
     lastRunStartedAt: health.last_scheduler_run_started_at ?? null,
@@ -62,8 +76,7 @@ function schedulerSnapshotFromReadyz(health: Partial<HealthResponse>): Scheduler
 }
 
 function getReadyzUrl() {
-  const scannerBase = process.env.NEXT_PUBLIC_SCANNER_API_BASE || 'http://localhost:8005';
-  return `${scannerBase.replace(/\/$/, '')}/readyz`;
+  return '/api/scan/readyz';
 }
 
 function delay(ms: number) {
@@ -95,16 +108,35 @@ function truncateSchedulerError(value: string | null): string {
 }
 
 export function OperatorActions(props: OperatorActionsProps) {
-  const {
+  const router = useRouter();
+  return (
+    <OperatorActionsPanel
+      {...props}
+      onRefresh={props.onRefresh ?? (() => router.refresh())}
+    />
+  );
+}
+
+export function OperatorActionsPanel({
+  schedulerEnabled,
+  schedulerRunning,
+  nextScanDueAt,
+  lastSchedulerRunStartedAt,
+  lastSchedulerError,
+  readyzPollAttempts = READYZ_POLL_ATTEMPTS,
+  readyzPollIntervalMs = READYZ_POLL_INTERVAL_MS,
+  onRefresh,
+  feedbackClearMs = 3000,
+}: OperatorActionsProps & { onRefresh: () => void }) {
+  const props = {
     schedulerEnabled,
     schedulerRunning,
     nextScanDueAt,
     lastSchedulerRunStartedAt,
     lastSchedulerError,
-    readyzPollAttempts = READYZ_POLL_ATTEMPTS,
-    readyzPollIntervalMs = READYZ_POLL_INTERVAL_MS,
-  } = props;
-  const router = useRouter();
+    readyzPollAttempts,
+    readyzPollIntervalMs,
+  };
   const [scanBusy, setScanBusy] = useState(false);
   const [schedulerBusy, setSchedulerBusy] = useState(false);
   const [schedulerSnapshot, setSchedulerSnapshot] = useState<SchedulerSnapshot>(() =>
@@ -141,8 +173,8 @@ export function OperatorActions(props: OperatorActionsProps) {
     feedbackTimerRef.current = setTimeout(() => {
       setFeedback(null);
       feedbackTimerRef.current = null;
-    }, 3000);
-  }, []);
+    }, feedbackClearMs);
+  }, [feedbackClearMs]);
 
   useEffect(
     () => () => {
@@ -176,13 +208,15 @@ export function OperatorActions(props: OperatorActionsProps) {
   }, [showFeedback]);
 
   const fetchReadyzSnapshot = useCallback(async (): Promise<SchedulerSnapshot | null> => {
+    const readyzUrl = getReadyzUrl();
     try {
-      const res = await fetch(getReadyzUrl(), { cache: 'no-store' });
+      const res = await fetch(readyzUrl, { cache: 'no-store' });
       if (!res.ok) {
         return null;
       }
 
-      return schedulerSnapshotFromReadyz((await res.json()) as Partial<HealthResponse>);
+      const snapshot = schedulerSnapshotFromReadyz((await res.json()) as Partial<HealthResponse>);
+      return snapshot;
     } catch {
       return null;
     }
@@ -231,12 +265,18 @@ export function OperatorActions(props: OperatorActionsProps) {
       if (action === 'start') {
         const result = await pollSchedulerRunning();
         if (!result.snapshot) {
-          setSchedulerSnapshot((current) => ({ ...current, enabled: true, running: false }));
+          showFeedback(
+            'Scheduler start submitted, but readiness check is unavailable. Refresh to confirm state.',
+            'negative',
+          );
+        } else {
+          showFeedback(
+            result.running
+              ? 'Scheduler and worker are running.'
+              : WORKER_NOT_RUNNING_MESSAGE,
+            result.running ? 'positive' : 'negative',
+          );
         }
-        showFeedback(
-          result.running ? 'Scheduler enabled and worker is running' : WORKER_NOT_RUNNING_MESSAGE,
-          result.running ? 'positive' : 'negative',
-        );
       } else {
         setSchedulerSnapshot((current) => ({
           ...current,
@@ -247,13 +287,13 @@ export function OperatorActions(props: OperatorActionsProps) {
         showFeedback('Scheduler disabled', 'positive');
       }
 
-      router.refresh();
+      onRefresh();
     } catch {
       showFeedback('Network error updating scheduler', 'negative');
     } finally {
       setSchedulerBusy(false);
     }
-  }, [pollSchedulerRunning, router, schedulerSnapshot.enabled, showFeedback]);
+  }, [onRefresh, pollSchedulerRunning, schedulerSnapshot.enabled, showFeedback]);
 
   if (unavailable) {
     return (
@@ -263,32 +303,60 @@ export function OperatorActions(props: OperatorActionsProps) {
     );
   }
 
-  const schedulerStatusClass = schedulerSnapshot.running
-    ? 'positive'
-    : schedulerSnapshot.enabled
-      ? 'neutral'
-      : 'muted';
-  const schedulerStatusLabel = schedulerSnapshot.enabled
-    ? schedulerSnapshot.running
-      ? 'Scheduler enabled, worker running'
-      : 'Scheduler enabled, worker not running'
-    : 'Scheduler disabled';
   const schedulerError = truncateSchedulerError(schedulerSnapshot.lastError);
+  const showWorkerBanner = schedulerSnapshot.enabled && !schedulerSnapshot.running;
+  const showWorkerRunningNoScheduler = !schedulerSnapshot.enabled && schedulerSnapshot.running;
+
+  const copyToClipboard = async (text: string, successMessage: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      showFeedback(successMessage, 'positive');
+    } catch {
+      window.prompt('Copy:', text);
+    }
+  };
+
+  const copyWorkerCommand = () =>
+    void copyToClipboard(
+      `cd ${WORKER_CWD_HINT} && ${WORKER_COMMAND}`,
+      'Worker command copied (run from repo root: cd services/scanner).',
+    );
+
+  const copyWorkerScript = () =>
+    void copyToClipboard(WORKER_SCRIPT_BASH, 'Start-worker script path copied.');
 
   return (
-    <div
-      style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}
-    >
-      <span className={`small ${schedulerStatusClass}`}>{schedulerStatusLabel}</span>
-      <button
-        className="button"
-        disabled={scanBusy}
-        onClick={handleScan}
-        style={{ width: 'auto', padding: '8px 16px' }}
-      >
-        {scanBusy ? 'Running...' : 'Run scan now'}
-      </button>
-      <div style={{ display: 'grid', gap: 4 }}>
+    <section className="scheduler-operator-panel" aria-label="Local operator controls">
+      {showWorkerBanner ? (
+        <div
+          className="scheduler-operator-banner scheduler-operator-banner-warning"
+          role="status"
+          data-testid="worker-not-running-banner"
+        >
+          <p className="small" style={{ margin: 0 }}>
+            {WORKER_NOT_RUNNING_MESSAGE}
+          </p>
+        </div>
+      ) : null}
+
+      {showWorkerRunningNoScheduler ? (
+        <div className="scheduler-operator-banner scheduler-operator-banner-warning" role="status">
+          <p className="small" style={{ margin: 0 }}>
+            Worker is running, but the scheduler is disabled. Auto-scans will not start until the
+            scheduler is enabled.
+          </p>
+        </div>
+      ) : null}
+
+      <div className="scheduler-operator-actions scheduler-operator-actions-primary">
+        <button
+          className="button button-primary"
+          disabled={scanBusy}
+          onClick={handleScan}
+          style={{ width: 'auto', padding: '8px 16px' }}
+        >
+          {scanBusy ? 'Running...' : 'Run scan now'}
+        </button>
         <button
           className="button"
           disabled={schedulerBusy}
@@ -303,19 +371,90 @@ export function OperatorActions(props: OperatorActionsProps) {
               ? 'Stop scheduler'
               : 'Start scheduler'}
         </button>
-        <div className="small muted" style={{ display: 'grid', gap: 2, lineHeight: 1.35 }}>
-          <span className={schedulerStatusClass}>
-            Scheduler enabled: {schedulerSnapshot.enabled ? 'yes' : 'no'} | Worker running:{' '}
-            {schedulerSnapshot.running ? 'yes' : 'no'}
+      </div>
+
+      {feedback ? <span className={`small ${feedback.tone}`}>{feedback.message}</span> : null}
+
+      <details className="ui-disclosure scheduler-operator-details">
+        <summary className="ui-disclosure-summary muted small">Operator details</summary>
+        <p className="muted small" style={{ margin: '8px 0' }}>
+          Local operator controls only. The app enables the scheduler; the worker runs scans
+          separately.
+        </p>
+        <div className="scheduler-operator-pills">
+          <span
+            className={`badge ${schedulerSnapshot.enabled ? 'green' : ''}`}
+            title="Scheduler enabled in the scanner API"
+          >
+            Scheduler: {schedulerSnapshot.enabled ? 'Enabled' : 'Disabled'}
           </span>
-          <span>Next scan due: {formatTimestamp(schedulerSnapshot.nextScanDueAt)}</span>
-          <span>Last run started: {formatTimestamp(schedulerSnapshot.lastRunStartedAt)}</span>
-          <span title={schedulerSnapshot.lastError ?? undefined}>
-            Last scheduler error: {schedulerError}
+          <span
+            className={`badge ${schedulerSnapshot.running ? 'green' : 'amber'}`}
+            title="Worker process heartbeat"
+          >
+            Worker: {schedulerSnapshot.running ? 'Running' : 'Not running'}
+          </span>
+          <span className="badge" title="Next scheduled scan">
+            Next scan: {formatTimestamp(schedulerSnapshot.nextScanDueAt)}
+          </span>
+          <span className="badge" title="Last scheduler run started">
+            Last run: {formatTimestamp(schedulerSnapshot.lastRunStartedAt)}
           </span>
         </div>
-      </div>
-      {feedback ? <span className={`small ${feedback.tone}`}>{feedback.message}</span> : null}
-    </div>
+
+        {showWorkerBanner ? (
+          <>
+            <p className="muted small" style={{ margin: '8px 0 0' }}>
+              {WORKER_IMPACT_MESSAGE}
+            </p>
+            <p className="muted small" style={{ margin: '6px 0 0' }}>
+              Run from <code>{WORKER_CWD_HINT}</code> or use <code>{WORKER_SCRIPT_BASH}</code> from the
+              repo root.
+            </p>
+            <div className="scheduler-operator-actions" style={{ marginTop: 8 }} role="group">
+              <button
+                type="button"
+                className="button button-secondary"
+                style={{ width: 'auto', padding: '6px 12px' }}
+                onClick={copyWorkerCommand}
+              >
+                Copy worker command
+              </button>
+              <button
+                type="button"
+                className="button button-secondary"
+                style={{ width: 'auto', padding: '6px 12px' }}
+                onClick={copyWorkerScript}
+              >
+                Copy start-worker script
+              </button>
+            </div>
+          </>
+        ) : null}
+
+        {schedulerSnapshot.enabled && schedulerSnapshot.running ? (
+          <p className="small positive" style={{ margin: '8px 0 0' }}>
+            Scheduler and worker are running. Next scan due{' '}
+            {formatTimestamp(schedulerSnapshot.nextScanDueAt)}.
+          </p>
+        ) : null}
+
+        {!schedulerSnapshot.enabled && !schedulerSnapshot.running ? (
+          <p className="muted small" style={{ margin: '8px 0 0' }}>
+            Scheduler is disabled. Use Run scan now or Start scheduler for auto-scans.
+          </p>
+        ) : null}
+
+        {schedulerError !== 'none' ? (
+          <p
+            className="muted small"
+            style={{ margin: '8px 0 0' }}
+            title={schedulerSnapshot.lastError ?? undefined}
+          >
+            Last scheduler error: {schedulerError}
+          </p>
+        ) : null}
+      </details>
+    </section>
   );
 }

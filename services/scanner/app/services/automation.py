@@ -68,6 +68,8 @@ class AutomationService:
         await self.recover_due_intents()
         per_cycle_used = 0
         for result in run.results:
+            if not result.is_top_pick:
+                continue
             if result.decision_signal not in {"BUY", "SELL"}:
                 continue
             side = "buy" if result.decision_signal == "BUY" else "sell"
@@ -303,10 +305,24 @@ class AutomationService:
                 intent_id=intent_id,
                 status="circuit_open",
                 status_reason=f"Circuit breaker: {reason or 'blocked'}",
-                    incident_class="breaker_misbehavior",
+                incident_class="breaker_misbehavior",
                 next_retry_at=next_retry,
             )
             metrics.increment("automation.blocked.circuit_open")
+            metrics.increment("automation.execution.requests_avoided")
+            return False
+
+        paper_only_error = self._paper_only_payload_error(request_payload)
+        if paper_only_error:
+            self.repository.update_intent(
+                intent_id=intent_id,
+                status="failed_terminal",
+                status_reason=paper_only_error,
+                request_count_avoided_increment=1,
+                attempt_increment=1,
+                last_attempt_at=now,
+                request_payload=request_payload,
+            )
             metrics.increment("automation.execution.requests_avoided")
             return False
 
@@ -546,9 +562,18 @@ class AutomationService:
             "side": side,
             "qty": qty,
             "order_type": "market",
+            "mode": "dry_run",
             "dry_run": True,
             "idempotency_key": idempotency_key,
         }
+
+    @staticmethod
+    def _paper_only_payload_error(request_payload: dict) -> str | None:
+        if request_payload.get("mode") not in (None, "dry_run"):
+            return 'Automation placement is paper-only; mode must be omitted or "dry_run".'
+        if request_payload.get("dry_run") is not True:
+            return "Automation placement is paper-only; dry_run must be true."
+        return None
 
     def _intent_window_for(self, observed_at: datetime) -> tuple[datetime, datetime]:
         end = self._as_utc(observed_at)

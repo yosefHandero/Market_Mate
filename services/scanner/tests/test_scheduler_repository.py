@@ -117,6 +117,23 @@ class SchedulerRepositoryTests(unittest.TestCase):
             with patch.object(repo, "_utc_now", return_value=now):
                 self.assertTrue(repo.due_for_run())
 
+    def test_record_worker_heartbeat_marks_worker_alive(self) -> None:
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        with self._repository_context() as (repo, _SessionLocal):
+            self.assertTrue(repo.set_enabled(enabled=True))
+            with patch.object(repo, "_utc_now", return_value=now):
+                repo.record_worker_heartbeat("worker-1")
+                state = repo.get_state()
+
+        self.assertTrue(state.worker_alive)
+        self.assertIsNotNone(state.worker_heartbeat_at)
+
+    def test_acquire_lease_is_exclusive_between_instances(self) -> None:
+        with self._repository_context() as (repo, _SessionLocal):
+            self.assertTrue(repo.set_enabled(enabled=True))
+            self.assertTrue(repo.acquire_lease("worker-a"))
+            self.assertFalse(repo.acquire_lease("worker-b"))
+
     def test_scheduler_run_missed_on_startup_resets_next_run_at(self) -> None:
         now = datetime(2026, 1, 1, 12, 0, 0)
         interval_seconds = 300

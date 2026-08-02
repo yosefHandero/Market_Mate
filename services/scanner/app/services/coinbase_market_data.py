@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -234,7 +235,7 @@ class CoinbaseMarketDataService:
             ) as tmp_file:
                 tmp_path = Path(tmp_file.name)
                 json.dump(payload, tmp_file, indent=2, sort_keys=True)
-            tmp_path.replace(self.snapshot_file_path)
+            self._atomic_replace(tmp_path, self.snapshot_file_path)
         finally:
             if tmp_path is not None and tmp_path.exists():
                 try:
@@ -245,6 +246,28 @@ class CoinbaseMarketDataService:
                         extra={"event": "coinbase_ws_snapshot_temp_cleanup_failed"},
                         exc_info=True,
                     )
+
+    def _atomic_replace(self, source: Path, target: Path) -> None:
+        # On Windows os.replace can transiently fail with PermissionError
+        # (WinError 5) when the target is briefly locked by another reader or
+        # by antivirus. Retry a few times, and never let the failure propagate
+        # to the websocket loop, where it would trigger a needless reconnect.
+        last_error: OSError | None = None
+        for attempt in range(5):
+            try:
+                source.replace(target)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.05 * (attempt + 1))
+            except OSError as exc:
+                last_error = exc
+                break
+        logger.warning(
+            "unable to persist coinbase snapshot cache; skipping this update",
+            extra={"event": "coinbase_ws_snapshot_persist_failed"},
+            exc_info=last_error,
+        )
 
     def _coerce_payload(self, raw_message: str | bytes | dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(raw_message, dict):

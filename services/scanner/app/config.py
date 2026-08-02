@@ -36,7 +36,10 @@ class Settings(BaseSettings):
     app_version: str = "1.0.0"
     app_instance_id: str = Field(default_factory=lambda: f"scanner-{uuid4().hex[:12]}")
     database_url: str = "sqlite:///./market_mate.db"
-    cors_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    cors_allowed_origins: str = (
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:3001,http://127.0.0.1:3001"
+    )
     public_read_access_enabled: bool = False
     read_api_token: str = ""
     admin_api_token: str = ""
@@ -44,12 +47,21 @@ class Settings(BaseSettings):
     health_max_stale_minutes: int = 30
     signal_max_age_minutes: int = 120
     stale_signal_max_age_minutes: int = 10
+    signal_buy_threshold: float = 52.0
+    signal_sell_threshold: float = 52.0
+    signal_margin: float = 6.0
+    signal_crypto_buy_threshold: float = 52.0
+    signal_crypto_sell_threshold: float = 52.0
+    signal_crypto_margin: float = 6.0
     trust_recent_window_days: int = 14
     scan_concurrency_limit: int = 8
     provider_timeout_seconds: float = 20.0
     provider_retry_attempts: int = 2
     provider_retry_backoff_seconds: float = 0.5
-    provider_max_bar_age_minutes: int = 20
+    # Per-bar staleness threshold. Higher than health_max_stale_minutes because
+    # delayed/5-minute Alpaca bars routinely land ~31 min old without being unreliable.
+    # Scan-run freshness still uses health_max_stale_minutes (30).
+    provider_max_bar_age_minutes: int = 45
     alpaca_latest_data_cache_seconds: int = 5
     sec_company_tickers_cache_seconds: int = 21600
     sec_filings_cache_seconds: int = 900
@@ -64,6 +76,7 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = False
     scheduler_poll_seconds: int = 15
     scheduler_lease_seconds: int = 120
+    worker_heartbeat_stale_seconds: int = 90
     scheduler_run_missed_on_startup: bool = True
     cache_dir: str = "./var/cache"
     log_level: str = "INFO"
@@ -94,22 +107,30 @@ class Settings(BaseSettings):
 
     alpaca_api_key: str = ""
     alpaca_api_secret: str = ""
-    alpaca_base_url: str = "https://paper-api.alpaca.markets"
     alpaca_market_data_url: str = "https://data.alpaca.markets"
+    # Paper-only build: these two flags must always be false. They are retained
+    # solely so the process can refuse to start when either is set truthy (see
+    # forbid_live_execution). There is no broker order-submission code to enable.
     execution_enabled: bool = False
     allow_live_trading: bool = False
     execution_default_time_in_force: str = "day"
     trade_gate_enabled: bool = True
-    trade_gate_horizon: Literal["15m", "1h", "1d"] = "1h"
+    trade_gate_horizon: Literal["15m", "1h", "1d", "1w"] = "1w"
     trade_gate_min_evaluated_count: int = 20
     trade_gate_min_win_rate: float = 55.0
     trade_gate_min_avg_return: float = 0.15
+    # Crypto BUY is poorer and underpowered in the friction/out-of-sample evidence,
+    # so it must clear a higher sample bar before it is allowed past review-only.
+    # Stricter only; never loosens the global BUY gate.
+    trade_gate_crypto_buy_min_evaluated_count: int = 30
     calibration_min_signal_samples: int = 20
     calibration_min_score_band_samples: int = 10
     outcome_report_min_evaluated_per_horizon: int = 20
     outcome_baseline_min_evaluated_per_horizon: int = 20
     outcome_baseline_min_mean_return_pct: float = 0.0
-    validation_primary_horizon: Literal["15m", "1h", "1d"] = "1h"
+    outcome_evaluation_batch_limit: int = 2000
+    track_hold_outcomes: bool = True
+    validation_primary_horizon: Literal["15m", "1h", "1d", "1w"] = "1w"
     validation_win_threshold_pct: float = 0.0
     validation_false_positive_threshold_pct: float = 0.0
     validation_min_sample_size: int = 30
@@ -121,8 +142,96 @@ class Settings(BaseSettings):
     crypto_fee_bps: float = 10.0
     replay_default_interval_minutes: int = 60
     replay_default_warmup_bars: int = 30
+    weekly_primary_horizon_enabled: bool = True
+    weekly_daily_lookback_bars_default: int = 500
+    weekly_daily_lookback_bars_min: int = 250
+    weekly_daily_lookback_bars_preferred: int = 500
+    weekly_daily_lookback_bars_max: int = 1250
+    weekly_daily_bar_cache_ttl_seconds: int = 86400
+    weekly_trust_window_days: int = 730
+    weekly_pattern_gate_min_historical_samples: int = 30
+    weekly_pattern_gate_min_backfilled_samples: int = 20
+    weekly_pattern_gate_min_live_forward_samples: int = 20
+    weekly_pattern_gate_min_out_of_sample_samples: int = 10
+    weekly_pattern_gate_min_win_rate: float = 52.0
+    weekly_pattern_gate_min_avg_return: float = 0.10
+    # Fraction of the live watchlist whose real forward outcomes are tagged as an
+    # out-of-sample holdout (never used for calibration). This lets the required
+    # out-of-sample evidence track accrue automatically from genuine forward data,
+    # kept strictly separate from the in-sample live_paper_forward track. 0 disables.
+    weekly_out_of_sample_holdout_ratio: float = 0.25
+    weekly_forward_days: int = 7
+    weekly_forward_tolerance_days: int = 3
+    # Live-forward scan-gap diagnostic: if the last scan is older than this, the
+    # Proof page flags a possibly-missed scheduler window. Default 26h covers the
+    # daily overnight window plus generous slack for weekend/downtime.
+    live_forward_max_scan_gap_minutes: float = 1560.0
+    weekly_hold_return_tolerance_pct: float = 1.0
+    top_pick_limit: int = 5
+    upside_prob_shrinkage_k: float = 20.0
+    # Apply the research-window reliability map from the latest walk-forward proof
+    # run to the live upside probability (out-of-sample-safe; no live data used to
+    # calibrate). Disabled falls back to the raw shrunk hit-rate probability.
+    weekly_apply_calibration_map: bool = True
+    # Enforce the proof-grade BUY-candidate quality gate on the live weekly path so
+    # served candidates match the proven ones. Fails closed to fewer candidates.
+    weekly_apply_proof_candidate_filters: bool = True
+    weekly_daily_bar_max_age_days_stock: int = 5
+    weekly_daily_bar_max_age_days_crypto: int = 2
     wf_train_days: int = 30
     wf_holdout_days: int = 7
+    # Historical walk-forward proof engine (daily-bar weekly-pattern layer).
+    proof_target_years: int = 3
+    proof_min_years: int = 2
+    proof_max_years: int = 5
+    proof_holdout_months: int = 9
+    # Validation segment sits immediately before the final holdout. Thresholds and
+    # filters may be tuned on research+validation; the holdout stays read-only
+    # evidence. This makes the research/validation/holdout separation explicit.
+    proof_validation_months: int = 3
+    proof_lookback_context_months_min: int = 6
+    proof_lookback_context_months_max: int = 24
+    proof_pattern_min_days: int = 20
+    proof_pattern_max_days: int = 60
+    proof_step_days: int = 7
+    proof_top_n_per_asset: int = 5
+    proof_min_pattern_samples: int = 12
+    # Persistent historical bar store fetch cap, kept separate from the live-scan
+    # lookback trim so multi-year proof history can be pulled without changing
+    # live scan behaviour or data-quality gates.
+    proof_daily_lookback_bars_max: int = 1300
+    proof_fetch_chunk_days: int = 3650
+    # Pilot-ready verdict thresholds (report-only; never auto-enables execution).
+    proof_pilot_min_predictions_per_asset: int = 120
+    proof_pilot_min_upside_hit_rate_pct: float = 55.0
+    proof_pilot_max_calibration_gap_pct: float = 10.0
+    proof_pilot_min_after_friction_return_pct: float = 0.0
+    proof_pilot_max_drawdown_pct: float = 25.0
+    proof_pilot_min_exit_window_helped_rate_pct: float = 50.0
+    proof_pilot_min_confidence_discrimination_pct: float = 0.0
+    # Statistical-solidity thresholds for the paper-readiness confidence view. These
+    # do NOT gate real-money trust (which stays blocked); they certify the proof
+    # signal is real rather than noise before paper readiness is called complete.
+    proof_min_regime_samples: int = 8
+    proof_pilot_min_information_coefficient: float = 0.02
+    proof_pilot_min_ic_t_stat: float = 2.0
+    proof_pilot_require_edge_significant: bool = True
+    proof_pilot_require_cross_regime_edge: bool = True
+    # Prediction-quality uplift: benchmarks, filters, EV gate, exit-window sizing.
+    proof_benchmark_random_draws: int = 25
+    proof_benchmark_random_seed: int = 1729
+    proof_momentum_lookback_days: int = 63
+    proof_min_expected_value_pct: float = 0.0
+    proof_min_pattern_edge_pct: float = 2.0
+    proof_rsi_overbought: float = 80.0
+    proof_atr_lookback_days: int = 14
+    proof_atr_target_mult: float = 2.5
+    proof_atr_stop_mult: float = 1.5
+    proof_confidence_shrinkage_k: float = 20.0
+    proof_pilot_min_edge_vs_buy_hold_pct: float = 0.0
+    proof_volume_lookback_days: int = 20
+    proof_min_volume_median_ratio: float = 0.5
+    proof_require_buy_hold_baseline: bool = True
     trade_gate_allowed_signals: str = "BUY,SELL"
     trade_gate_max_notional: float = 1000.0
     trade_gate_max_qty: float = 5.0
@@ -134,14 +243,15 @@ class Settings(BaseSettings):
     portfolio_max_loss_streak: int = 3
     portfolio_max_drawdown_pct: float = 5.0
     require_readyz_for_execution: bool = True
-    live_trading_max_notional: float = 100.0
-    live_trading_max_qty: float = 1.0
     marketdata_api_token: str = Field(
         default="",
         validation_alias=AliasChoices("MARKETDATA_API_TOKEN", "MarketData_API_token"),
     )
+    marketdata_options_enabled: bool = False
     marketaux_api_token: str = ""
     finnhub_api_key: str = ""
+    polygon_api_key: str = ""
+    polygon_base_url: str = "https://api.polygon.io"
     coingecko_base_url: str = "https://api.coingecko.com/api/v3"
     coingecko_api_key: str = ""
     coinbase_ws_enabled: bool = True
@@ -173,7 +283,7 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     telegram_alerts_enabled: bool = True
     alert_score_threshold: float = 65.0
-    news_check_score_threshold: float = 60.0
+    news_trigger_abs_move_pct: float = 1.25
     news_cache_minutes: int = 45
 
     watchlist: str = (
@@ -197,6 +307,32 @@ class Settings(BaseSettings):
         "PEPE/USD,FIL/USD,GRT/USD,RENDER/USD,BONK/USD"
     )
     scan_interval_seconds: int = 300
+
+    @model_validator(mode="after")
+    def forbid_live_execution(self) -> "Settings":
+        # Structural paper-only guarantee: any process (API, worker, scripts,
+        # tests) that loads settings with a live-execution flag set fails fast
+        # here rather than relying on a single startup assertion. There is no
+        # broker order-submission code path that these flags could enable.
+        if self.execution_enabled or self.allow_live_trading:
+            raise ValueError(
+                "Paper-only build enforcement: EXECUTION_ENABLED and "
+                "ALLOW_LIVE_TRADING must be false. Live broker submission is "
+                "not implemented and cannot be enabled."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def enforce_non_overlapping_proof_steps(self) -> "Settings":
+        # Consecutive walk-forward predictions must not share forward windows.
+        # step_days < forward_days creates overlapping horizons that inflate
+        # sample counts and understate drawdown; refuse that configuration.
+        if int(self.proof_step_days) < int(self.weekly_forward_days):
+            raise ValueError(
+                "PROOF_STEP_DAYS must be >= WEEKLY_FORWARD_DAYS so walk-forward "
+                "prediction horizons do not overlap."
+            )
+        return self
 
     @model_validator(mode="after")
     def normalize_paths(self) -> "Settings":
@@ -243,6 +379,19 @@ class Settings(BaseSettings):
     @property
     def crypto_watchlist_items(self) -> list[str]:
         return [item.strip().upper() for item in self.crypto_watchlist.split(",") if item.strip()]
+
+    @property
+    def effective_top_pick_limit(self) -> int:
+        return max(3, min(5, int(self.top_pick_limit)))
+
+    @property
+    def proof_effective_top_n_per_asset(self) -> int:
+        return max(3, min(5, int(self.proof_top_n_per_asset)))
+
+    @property
+    def proof_effective_years(self) -> int:
+        target = int(self.proof_target_years)
+        return max(int(self.proof_min_years), min(int(self.proof_max_years), target))
 
     @property
     def trade_gate_allowed_signal_items(self) -> list[str]:

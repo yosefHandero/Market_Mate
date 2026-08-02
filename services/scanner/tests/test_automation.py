@@ -88,6 +88,13 @@ def _build_scan_run(*, run_id: str = "run-1", signal: str = "BUY") -> ScanRun:
                 provider_warnings=[],
                 layer_details={},
                 comparison=None,
+                is_top_pick=True,
+                selection_rank=1,
+                readiness_score=82.0,
+                readiness_band="high",
+                readiness_hard_stop=False,
+                readiness_reason="Actionable: gates passed and data is fresh.",
+                recommended_action="dry_run",
                 created_at=created_at,
             )
         ],
@@ -223,6 +230,28 @@ class AutomationServiceTests(unittest.TestCase):
             engine.dispose()
             temp_dir.cleanup()
 
+    def test_skips_candidates_that_are_not_official_top_picks(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            place_mock = AsyncMock()
+            service = self._build_service(place_mock=place_mock)
+            run = _build_scan_run()
+            run = run.model_copy(
+                update={
+                    "results": [
+                        run.results[0].model_copy(update={"is_top_pick": False, "selection_rank": None})
+                    ]
+                }
+            )
+
+            with patch.object(automation_repository_module, "SessionLocal", SessionLocal):
+                asyncio.run(service.process_completed_run(run))
+
+            place_mock.assert_not_awaited()
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
     def test_duplicate_run_reuses_same_intent_without_second_execution(self) -> None:
         temp_dir, engine, SessionLocal = self._build_session_local()
         try:
@@ -231,7 +260,7 @@ class AutomationServiceTests(unittest.TestCase):
                     ok=True,
                     submitted=False,
                     dry_run=True,
-                    message="Dry run only. Order was not sent to Alpaca.",
+                    message="Dry-run paper order recorded. No broker order request was made.",
                     idempotency_key="paperloop:test",
                     execution_audit_id=11,
                 )
@@ -419,6 +448,65 @@ class AutomationServiceTests(unittest.TestCase):
             engine.dispose()
             temp_dir.cleanup()
 
+    def test_recovery_rejects_mutated_live_payload_without_execution_call(self) -> None:
+        temp_dir, engine, SessionLocal = self._build_session_local()
+        try:
+            place_mock = AsyncMock()
+            service = self._build_service(place_mock=place_mock)
+            now = datetime.now(timezone.utc)
+
+            with patch.object(automation_repository_module, "SessionLocal", SessionLocal):
+                with SessionLocal() as session:
+                    session.add(
+                        AutomationIntentORM(
+                            created_at=now - timedelta(minutes=5),
+                            updated_at=now - timedelta(minutes=5),
+                            run_id="run-live-mutation",
+                            symbol="AAPL",
+                            asset_type="stock",
+                            side="buy",
+                            qty=0.5,
+                            strategy_version="v4.0-layered",
+                            confidence=82.0,
+                            horizon="1h",
+                            intent_key="paperloop:mutated-live",
+                            intent_hash="hash",
+                            status="failed_retryable",
+                            status_reason="network",
+                            idempotency_key="paperloop:mutated-live",
+                            request_payload_json=json.dumps(
+                                {
+                                    "ticker": "AAPL",
+                                    "side": "buy",
+                                    "qty": 0.5,
+                                    "order_type": "market",
+                                    "mode": "live",
+                                    "dry_run": False,
+                                    "idempotency_key": "paperloop:mutated-live",
+                                }
+                            ),
+                            next_retry_at=now - timedelta(minutes=1),
+                        )
+                    )
+                    session.commit()
+
+                asyncio.run(service.recover_due_intents())
+                with SessionLocal() as session:
+                    intent = (
+                        session.query(AutomationIntentORM)
+                        .filter(AutomationIntentORM.run_id == "run-live-mutation")
+                        .one()
+                    )
+
+            self.assertEqual(intent.status, "failed_terminal")
+            self.assertIn("paper-only", intent.status_reason)
+            self.assertEqual(intent.request_count_avoided, 1)
+            self.assertEqual(intent.request_count_used, 0)
+            place_mock.assert_not_awaited()
+        finally:
+            engine.dispose()
+            temp_dir.cleanup()
+
     def test_dry_run_completion_records_paper_ledger_row(self) -> None:
         temp_dir, engine, SessionLocal = self._build_session_local()
         try:
@@ -427,7 +515,7 @@ class AutomationServiceTests(unittest.TestCase):
                     ok=True,
                     submitted=False,
                     dry_run=True,
-                    message="Dry run only. Order was not sent to Alpaca.",
+                    message="Dry-run paper order recorded. No broker order request was made.",
                     idempotency_key="paperloop:test",
                     execution_audit_id=11,
                     raw={"latest_price": 200.0},

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 from uuid import uuid4
 
 from app.clients.alpaca import AlpacaClient
+from app.clients.polygon import PolygonClient
 from app.clients.binance import BinanceClient
 from app.clients.coingecko import CoinGeckoClient
 from app.clients.defillama import DefiLlamaClient
@@ -19,7 +20,16 @@ from app.clients.sec import SECClient
 from app.clients.marketaux import MarketauxClient
 from app.config import get_settings
 from app.core.confidence import compute_confidence_overlay
+from app.core.decision_presentation import (
+    build_decision_enrichment,
+    build_exit_window,
+    cap_confidence_by_data_quality,
+)
+from app.core.freshness_policy import unified_bar_freshness_max_age_minutes
 from app.core.legacy_signals import compute_legacy_signal
+from app.core.structural_prediction import evaluate_exit_window_outcome_with_disambiguation
+from app.core.ranking import display_sort_key, is_buy_candidate
+from app.core.selection import apply_top_pick_selection
 from app.core.scoring import TREND_SMA_WINDOW, market_status_from_change
 from app.core.signals import compute_signal_and_explanation
 from app.core.strategy_contract import build_strategy_evaluation_metadata
@@ -34,17 +44,26 @@ from app.provider_models import (
 from app.schemas import GateCheck, OptionsFlowSnapshot, ScanRun, ScanResult, VariantComparison
 from app.services.alerts import AlertService
 from app.services.coinbase_market_data import CoinbaseMarketDataService
-from app.services.repository import OutcomeEvaluationUpdate, PendingSignalOutcomeEvaluation, ScanRepository
+from app.services.repository import (
+    OutcomeEvaluationUpdate,
+    PendingPredictionEvaluation,
+    PendingSignalOutcomeEvaluation,
+    PredictionEvaluationUpdate,
+    ScanRepository,
+)
 from app.services.news_cache import NewsCacheService
+from app.services.weekly_prediction_service import WeeklyPredictionService
+from app.services.daily_bar_service import DailyBarService
 
 logger = logging.getLogger(__name__)
 
 
 class ScannerService:
     _OUTCOME_LOOKUP_CONFIG = {
-        "15m": {"timeframe": "1Min", "max_search_minutes": 8 * 60},
-        "1h": {"timeframe": "5Min", "max_search_minutes": 2 * 24 * 60},
-        "1d": {"timeframe": "1Hour", "max_search_minutes": 5 * 24 * 60},
+        "15m": {"timeframe": "1Min", "max_search_minutes": 24 * 60},
+        "1h": {"timeframe": "5Min", "max_search_minutes": 3 * 24 * 60},
+        "1d": {"timeframe": "1Hour", "max_search_minutes": 7 * 24 * 60},
+        "1w": {"timeframe": "1Day", "max_search_minutes": 14 * 24 * 60},
     }
 
     def __init__(
@@ -54,6 +73,7 @@ class ScannerService:
     ) -> None:
         self.settings = get_settings()
         self.alpaca = AlpacaClient()
+        self.polygon = PolygonClient()
         self.binance = BinanceClient()
         self.coingecko = CoinGeckoClient()
         self.defillama = DefiLlamaClient()
@@ -68,6 +88,11 @@ class ScannerService:
         self.alerts = AlertService()
         self.repo = ScanRepository()
         self.market_data_service = market_data_service or CoinbaseMarketDataService()
+        self.daily_bar_service = DailyBarService()
+        self.weekly_prediction_service = WeeklyPredictionService(
+            daily_bars=self.daily_bar_service,
+            repository=self.repo,
+        )
         self.automation_service = None
         self._analyze_semaphore = asyncio.Semaphore(max(self.settings.scan_concurrency_limit, 1))
 
@@ -178,6 +203,19 @@ class ScannerService:
             return None
         return round((self._as_utc_datetime(observed_at) - self._as_utc_datetime(parsed)).total_seconds() / 60, 2)
 
+    def _latest_bar_as_of(self, item: dict) -> datetime | None:
+        bars = item.get("bars") or []
+        if not bars:
+            return None
+        latest_timestamp = bars[-1].get("t")
+        if latest_timestamp is None:
+            return None
+        parsed = self.alpaca._parse_bar_timestamp(latest_timestamp)
+        return self._as_utc_datetime(parsed)
+
+    def _freshness_max_age_minutes(self) -> int:
+        return unified_bar_freshness_max_age_minutes(self.settings)
+
     def _effective_bar_age_minutes(self, *, asset_type: str, item: dict, observed_at: datetime) -> float | None:
         alpaca_bar_age = self._latest_bar_age_minutes(item, observed_at)
         if asset_type != "crypto":
@@ -189,18 +227,81 @@ class ScannerService:
             return ws_age
         return min(alpaca_bar_age, ws_age)
 
+    def _derive_price_provenance(
+        self,
+        *,
+        asset_type: str,
+        freshness_flags: dict[str, str],
+        alpaca_served_stale_cache: bool | None,
+        market_bars_source: str | None = None,
+    ) -> tuple[str, bool]:
+        if alpaca_served_stale_cache:
+            return "stale_cache", True
+        if asset_type == "stock" and market_bars_source == "polygon":
+            return "polygon", True
+        market_flag = freshness_flags.get("market_bars", "ok")
+        if asset_type == "crypto" and market_flag == "ws_override":
+            return "coinbase_ws", True
+        return "alpaca", False
+
+    async def _get_stock_bars_with_fallback(
+        self,
+        symbols: list[str],
+        *,
+        timeframe: str = "5Min",
+    ) -> tuple[dict[str, dict], str]:
+        if not symbols:
+            return {}, "alpaca"
+
+        alpaca_error: Exception | None = None
+        try:
+            bars = await self.alpaca.get_latest_bars(symbols, timeframe=timeframe)
+            if self.alpaca.consume_last_stale_flag():
+                return bars, "stale_cache"
+            return bars, "alpaca"
+        except Exception as exc:
+            alpaca_error = exc
+
+        if not self.settings.polygon_api_key:
+            if alpaca_error is not None:
+                raise alpaca_error
+            return {}, "alpaca"
+
+        try:
+            bars = await self.polygon.get_latest_bars(
+                symbols,
+                timeframe=timeframe,
+                bar_builder=self.alpaca._build_bars_by_symbol,
+            )
+            logger.warning(
+                "stock bars served from polygon fallback",
+                extra={
+                    "event": "provider_fallback_polygon_stock_bars",
+                    "symbol_count": len(symbols),
+                },
+            )
+            return bars, "polygon"
+        except Exception as polygon_error:
+            if alpaca_error is not None:
+                raise RuntimeError(
+                    f"Alpaca stock bars failed ({alpaca_error}); "
+                    f"Polygon fallback also failed ({polygon_error})"
+                ) from polygon_error
+            raise
+
     def _market_bars_freshness_flag(self, *, asset_type: str, item: dict, observed_at: datetime) -> str:
         alpaca_bar_age = self._latest_bar_age_minutes(item, observed_at)
         ws_age = self._coinbase_ws_age_minutes(item, observed_at) if asset_type == "crypto" else None
         effective_age = self._effective_bar_age_minutes(asset_type=asset_type, item=item, observed_at=observed_at)
+        max_age = self._freshness_max_age_minutes()
         if effective_age is None:
             return "missing"
-        if effective_age > self.settings.provider_max_bar_age_minutes:
+        if effective_age > max_age:
             return "stale"
         if (
             asset_type == "crypto"
             and ws_age is not None
-            and ws_age <= self.settings.provider_max_bar_age_minutes
+            and ws_age <= max_age
             and (alpaca_bar_age is None or ws_age <= alpaca_bar_age)
         ):
             return "ws_override"
@@ -212,9 +313,33 @@ class ScannerService:
         asset_type: str,
         signal,
         observed_at: datetime | None = None,
+        pattern_name: str | None = None,
     ) -> tuple[float, str, bool, str, list[GateCheck]]:
         if signal.decision_signal not in {"BUY", "SELL"}:
             return round(signal.score, 2), "raw", False, "Signal is HOLD, so trade gate is not applicable.", []
+
+        horizon = self.settings.trade_gate_horizon
+        if horizon == "1w" and pattern_name:
+            evaluation = self.repo.evaluate_weekly_pattern_gate(
+                pattern_name=pattern_name,
+                asset_type=asset_type,
+                observed_at=observed_at,
+                signal=signal.decision_signal,
+            )
+            calibrated_confidence, score_band, calibration_source = self.repo.calibrate_signal(
+                asset_type=asset_type,
+                signal=signal.decision_signal,
+                raw_score=signal.score,
+                horizon=horizon,
+                observed_at=observed_at,
+            )
+            return (
+                calibrated_confidence,
+                calibration_source,
+                evaluation.passed,
+                evaluation.reason,
+                evaluation.checks,
+            )
 
         calibrated_confidence, score_band, calibration_source = self.repo.calibrate_signal(
             asset_type=asset_type,
@@ -365,6 +490,221 @@ class ScannerService:
         completed = [item for item in resolved if item is not None]
         return self.repo.apply_signal_outcome_evaluations(completed)
 
+    def _bar_high(self, bar: dict) -> float:
+        return float(bar.get("h") or bar.get("high") or 0.0)
+
+    def _bar_low(self, bar: dict) -> float:
+        return float(bar.get("l") or bar.get("low") or 0.0)
+
+    def _bar_timestamp(self, bar: dict) -> datetime | None:
+        raw = bar.get("t") or bar.get("timestamp")
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            return raw
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    async def _fetch_path_bars(
+        self,
+        evaluation: PendingPredictionEvaluation,
+        *,
+        start: datetime,
+        end: datetime,
+        timeframe: str,
+    ) -> list[dict]:
+        try:
+            if evaluation.asset_type == "crypto":
+                return await self.alpaca.get_historical_crypto_bars(
+                    evaluation.ticker,
+                    start=start,
+                    end=end,
+                    timeframe=timeframe,
+                    limit=5000,
+                )
+            return await self.alpaca.get_historical_stock_bars(
+                evaluation.ticker,
+                start=start,
+                end=end,
+                timeframe=timeframe,
+                limit=5000,
+            )
+        except Exception:
+            return []
+
+    def _ambiguous_bar_indices(
+        self,
+        bars: list[dict],
+        *,
+        exit_price: float,
+        invalidation_level: float,
+    ) -> list[int]:
+        indices: list[int] = []
+        for index, bar in enumerate(bars):
+            if self._bar_high(bar) >= exit_price and self._bar_low(bar) <= invalidation_level:
+                indices.append(index)
+        return indices
+
+    async def _build_exit_window_fields(
+        self,
+        evaluation: PendingPredictionEvaluation,
+        *,
+        price: float | None,
+    ) -> dict[str, object]:
+        if not self.repo._has_exit_window_columns():
+            return {}
+        if evaluation.estimated_exit_price is None:
+            return {}
+        if price is None:
+            return {
+                "exit_window_status": "missed",
+                "exit_hit": False,
+                "invalidation_hit": False,
+                "protected_return_pct": None,
+                "hold_return_pct": None,
+                "exit_window_helped": None,
+            }
+        bars = await self._fetch_path_bars(
+            evaluation,
+            start=evaluation.generated_at,
+            end=evaluation.target_at,
+            timeframe="1Hour",
+        )
+        if not bars:
+            return {
+                "exit_window_status": "unresolved",
+                "exit_hit": False,
+                "invalidation_hit": False,
+                "protected_return_pct": None,
+                "hold_return_pct": None,
+                "exit_window_helped": None,
+            }
+        finer_by_index: dict[int, list[dict]] = {}
+        if evaluation.invalidation_level is not None:
+            for index in self._ambiguous_bar_indices(
+                bars,
+                exit_price=evaluation.estimated_exit_price,
+                invalidation_level=evaluation.invalidation_level,
+            )[:3]:
+                bar_start = self._bar_timestamp(bars[index])
+                if bar_start is None:
+                    continue
+                bar_end = bar_start + timedelta(hours=1)
+                finer = await self._fetch_path_bars(
+                    evaluation,
+                    start=bar_start,
+                    end=bar_end,
+                    timeframe="1Min",
+                )
+                if finer:
+                    finer_by_index[index] = finer
+        friction_pct = (
+            self.repo._friction_bps_for_asset_type(evaluation.asset_type) * 1.0
+        ) / 100.0
+        outcome = evaluate_exit_window_outcome_with_disambiguation(
+            entry_price=evaluation.entry_price,
+            estimated_exit_price=evaluation.estimated_exit_price,
+            invalidation_level=evaluation.invalidation_level,
+            price_at_horizon=price,
+            decision_signal=evaluation.decision_signal,
+            bars=bars,
+            finer_bars_by_index=finer_by_index or None,
+            friction_pct=friction_pct,
+        )
+        return {
+            "exit_window_status": outcome.exit_window_status,
+            "exit_hit": outcome.exit_hit,
+            "invalidation_hit": outcome.invalidation_hit,
+            "protected_return_pct": outcome.protected_return_pct,
+            "hold_return_pct": outcome.hold_return_pct,
+            "exit_window_helped": outcome.exit_window_helped,
+        }
+
+    async def _refresh_due_prediction_snapshots(self, observed_at: datetime) -> int:
+        pending = self.repo.list_due_prediction_evaluations(observed_at=observed_at)
+        if not pending:
+            return 0
+
+        async def resolve(
+            evaluation: PendingPredictionEvaluation,
+        ) -> PredictionEvaluationUpdate | None:
+            lookup = self._OUTCOME_LOOKUP_CONFIG[evaluation.horizon]
+            try:
+                if evaluation.asset_type == "crypto":
+                    price = await self.alpaca.get_crypto_price_on_or_after_timestamp(
+                        evaluation.ticker,
+                        evaluation.target_at,
+                        max_search_minutes=lookup["max_search_minutes"],
+                        timeframe=lookup["timeframe"],
+                    )
+                else:
+                    price = await self.alpaca.get_price_on_or_after_timestamp(
+                        evaluation.ticker,
+                        evaluation.target_at,
+                        max_search_minutes=lookup["max_search_minutes"],
+                        timeframe=lookup["timeframe"],
+                    )
+            except Exception:
+                price = None
+            comparable_observed_at = observed_at
+            comparable_expires_at = evaluation.expires_at
+            if observed_at.tzinfo is None and evaluation.expires_at.tzinfo is not None:
+                comparable_expires_at = evaluation.expires_at.replace(tzinfo=None)
+            elif observed_at.tzinfo is not None and evaluation.expires_at.tzinfo is None:
+                comparable_observed_at = observed_at.replace(tzinfo=None)
+            if price is None and comparable_observed_at < comparable_expires_at:
+                return None
+            exit_fields = await self._build_exit_window_fields(evaluation, price=price)
+            return PredictionEvaluationUpdate(
+                snapshot_id=evaluation.snapshot_id,
+                status="resolved" if price is not None else "missed",
+                price=price,
+                evaluated_at=observed_at,
+                exit_window_status=str(exit_fields.get("exit_window_status"))
+                if exit_fields.get("exit_window_status") is not None
+                else None,
+                exit_hit=exit_fields.get("exit_hit") if exit_fields else None,
+                invalidation_hit=exit_fields.get("invalidation_hit") if exit_fields else None,
+                protected_return_pct=exit_fields.get("protected_return_pct") if exit_fields else None,
+                hold_return_pct=exit_fields.get("hold_return_pct") if exit_fields else None,
+                exit_window_helped=exit_fields.get("exit_window_helped") if exit_fields else None,
+            )
+
+        resolved = await asyncio.gather(*(resolve(item) for item in pending))
+        completed = [item for item in resolved if item is not None]
+        return self.repo.apply_prediction_evaluations(completed)
+
+    async def close_open_positions_past_horizon(
+        self,
+        observed_at: datetime | None = None,
+    ) -> int:
+        observed_at = observed_at or datetime.now(timezone.utc)
+        due = self.repo.list_paper_positions_due_for_horizon_close(observed_at=observed_at)
+        if not due:
+            return 0
+        market_prices: dict[str, float] = {}
+        for item in due:
+            if item.ticker in market_prices:
+                continue
+            try:
+                if (item.asset_type or "stock") == "crypto":
+                    market_prices[item.ticker] = float(
+                        await self.alpaca.get_latest_crypto_price(item.ticker)
+                    )
+                else:
+                    market_prices[item.ticker] = float(await self.alpaca.get_latest_price(item.ticker))
+            except Exception:
+                logger.warning(
+                    "paper_horizon_close_price_unavailable",
+                    extra={"event": "paper_horizon_close_price_unavailable", "ticker": item.ticker},
+                )
+        return self.repo.close_open_positions_past_horizon(
+            observed_at=observed_at,
+            market_prices=market_prices,
+        )
+
     def _compute_market_status(self, bars: dict[str, dict]) -> tuple[str, float, float]:
         spy = bars.get("SPY")
         qqq = bars.get("QQQ")
@@ -426,8 +766,15 @@ class ScannerService:
         critical_warnings: list[str] = []
         if alpaca_served_stale_cache is None:
             alpaca_served_stale_cache = self.alpaca.consume_last_stale_flag()
+        max_age = self._freshness_max_age_minutes()
         if alpaca_served_stale_cache:
-            warnings.append("alpaca_served_stale_cache")
+            latest_for_stale = self._effective_bar_age_minutes(
+                asset_type=asset_type,
+                item=item,
+                observed_at=observed_at,
+            )
+            if latest_for_stale is None or latest_for_stale > max_age:
+                warnings.append("alpaca_served_stale_cache")
         latest_bar_age_minutes = self._effective_bar_age_minutes(
             asset_type=asset_type,
             item=item,
@@ -435,7 +782,7 @@ class ScannerService:
         )
         if latest_bar_age_minutes is None:
             critical_warnings.append("market_bars_missing")
-        elif latest_bar_age_minutes > self.settings.provider_max_bar_age_minutes:
+        elif latest_bar_age_minutes > max_age:
             critical_warnings.append("market_bars_stale")
         if data_quality == "low":
             critical_warnings.append("market_data_quality_low")
@@ -565,6 +912,9 @@ class ScannerService:
         breadth_snapshot: BreadthSnapshot | None = None,
         defillama_snapshot: DefiLlamaSnapshot | None = None,
         alpaca_served_stale_cache: bool | None = None,
+        market_bars_source: str | None = None,
+        daily_bars: list[dict] | None = None,
+        market_daily_bars: list[dict] | None = None,
     ) -> ScanResult | None:
         async with self._analyze_semaphore:
             return await self._analyze_ticker_impl(
@@ -584,6 +934,9 @@ class ScannerService:
                 breadth_snapshot=breadth_snapshot,
                 defillama_snapshot=defillama_snapshot,
                 alpaca_served_stale_cache=alpaca_served_stale_cache,
+                market_bars_source=market_bars_source,
+                daily_bars=daily_bars,
+                market_daily_bars=market_daily_bars,
             )
 
     async def _analyze_ticker_impl(
@@ -605,6 +958,9 @@ class ScannerService:
         breadth_snapshot: BreadthSnapshot | None = None,
         defillama_snapshot: DefiLlamaSnapshot | None = None,
         alpaca_served_stale_cache: bool | None = None,
+        market_bars_source: str | None = None,
+        daily_bars: list[dict] | None = None,
+        market_daily_bars: list[dict] | None = None,
     ) -> ScanResult | None:
         if not item or (asset_type == "stock" and ticker in {"SPY", "QQQ"}):
             return None
@@ -673,8 +1029,8 @@ class ScannerService:
         news_warnings: list[str] = []
 
         if (
-            abs(price_change_pct) >= 1.25
-            or abs(relative_strength_pct) >= 1.25
+            abs(price_change_pct) >= self.settings.news_trigger_abs_move_pct
+            or abs(relative_strength_pct) >= self.settings.news_trigger_abs_move_pct
             or breakout_flag
             or breakdown_flag
         ):
@@ -703,6 +1059,7 @@ class ScannerService:
             item=item,
             observed_at=created_at,
         )
+        bar_as_of = self._latest_bar_as_of(item) if item else None
         freshness_flags = self._freshness_flags(
             asset_type=asset_type,
             item=item,
@@ -718,8 +1075,31 @@ class ScannerService:
             breadth_snapshot=breadth_snapshot,
             defillama_snapshot=defillama_snapshot,
         )
+        price_source, fallback_used = self._derive_price_provenance(
+            asset_type=asset_type,
+            freshness_flags=freshness_flags,
+            alpaca_served_stale_cache=alpaca_served_stale_cache,
+            market_bars_source=market_bars_source,
+        )
+        if market_bars_source == "polygon" and "polygon_stock_bars_fallback" not in provider_warnings:
+            provider_warnings.append("polygon_stock_bars_fallback")
 
         signal = compute_signal_and_explanation(
+            buy_threshold=(
+                self.settings.signal_crypto_buy_threshold
+                if asset_type == "crypto"
+                else self.settings.signal_buy_threshold
+            ),
+            sell_threshold=(
+                self.settings.signal_crypto_sell_threshold
+                if asset_type == "crypto"
+                else self.settings.signal_sell_threshold
+            ),
+            signal_margin=(
+                self.settings.signal_crypto_margin
+                if asset_type == "crypto"
+                else self.settings.signal_margin
+            ),
             ticker=ticker,
             price=price,
             price_change_pct=price_change_pct,
@@ -742,10 +1122,19 @@ class ScannerService:
             trend_above_sma=trend_above_sma,
             trend_strength_pct=trend_strength_pct,
         )
+        weekly_prediction = await self.weekly_prediction_service.build_weekly_prediction(
+            symbol=ticker,
+            asset_type=asset_type,
+            as_of=created_at,
+            daily_bars=daily_bars,
+            market_daily_bars=market_daily_bars,
+        )
+        pattern_name = weekly_prediction.pattern_name if weekly_prediction else None
         calibrated_confidence, calibration_source, gate_passed, gate_reason, gate_checks = self._gate_signal(
             asset_type=asset_type,
             signal=signal,
             observed_at=created_at,
+            pattern_name=pattern_name,
         )
         confidence_overlay = compute_confidence_overlay(
             asset_type=asset_type,
@@ -833,6 +1222,21 @@ class ScannerService:
                 ),
             )
         gated_explanation = compute_signal_and_explanation(
+            buy_threshold=(
+                self.settings.signal_crypto_buy_threshold
+                if asset_type == "crypto"
+                else self.settings.signal_buy_threshold
+            ),
+            sell_threshold=(
+                self.settings.signal_crypto_sell_threshold
+                if asset_type == "crypto"
+                else self.settings.signal_sell_threshold
+            ),
+            signal_margin=(
+                self.settings.signal_crypto_margin
+                if asset_type == "crypto"
+                else self.settings.signal_margin
+            ),
             ticker=ticker,
             price=price,
             price_change_pct=price_change_pct,
@@ -857,6 +1261,45 @@ class ScannerService:
             trend_strength_pct=trend_strength_pct,
         )
 
+        decision_enrichment = build_decision_enrichment(
+            price=price,
+            decision_signal=signal.decision_signal,
+            volatility_regime=volatility_regime,
+            horizon=self.settings.trade_gate_horizon,
+            asset_type=asset_type,
+            evidence_quality=strategy_metadata.evidence_quality,
+            directional_reasons=signal.directional_reasons,
+            score_contributions=dict(signal.directional_contributions or {}),
+            evidence_quality_reasons=strategy_metadata.evidence_quality_reasons,
+            explanation=gated_explanation.explanation,
+            gate_reason=gate_reason,
+            gate_passed=gate_passed,
+        )
+
+        exit_window = build_exit_window(
+            price=price,
+            weekly_prediction=weekly_prediction,
+            price_prediction=decision_enrichment.price_prediction,
+            decision_signal=signal.decision_signal,
+            evidence_quality=strategy_metadata.evidence_quality,
+            data_quality=data_quality,
+            forward_days=self.settings.weekly_forward_days,
+        )
+        upside_probability_pct = (
+            weekly_prediction.upside_probability_pct if weekly_prediction is not None else None
+        )
+        evidence_provenance = (
+            weekly_prediction.evidence_basis if weekly_prediction is not None else "insufficient"
+        )
+        confidence_score = cap_confidence_by_data_quality(calibrated_confidence, data_quality)
+        buy_candidate = is_buy_candidate(
+            decision_signal=signal.decision_signal,
+            weekly_directional_bias=(
+                weekly_prediction.directional_bias if weekly_prediction is not None else None
+            ),
+            upside_probability_pct=upside_probability_pct,
+        )
+
         return ScanResult(
             ticker=ticker,
             asset_type=asset_type,
@@ -874,6 +1317,15 @@ class ScannerService:
             evidence_quality=strategy_metadata.evidence_quality,
             evidence_quality_score=strategy_metadata.evidence_quality_score,
             evidence_quality_reasons=list(strategy_metadata.evidence_quality_reasons),
+            evidence_grade=decision_enrichment.evidence_grade,
+            top_reasons=decision_enrichment.top_reasons,
+            price_prediction=decision_enrichment.price_prediction,
+            weekly_prediction=weekly_prediction,
+            exit_window=exit_window,
+            upside_probability_pct=upside_probability_pct,
+            confidence_score=confidence_score,
+            evidence_provenance=evidence_provenance,
+            is_buy_candidate=buy_candidate,
             data_grade=strategy_metadata.data_grade,
             execution_eligibility=execution_eligibility,
             buy_score=signal.buy_score,
@@ -916,7 +1368,10 @@ class ScannerService:
             fear_greed_label=fear_greed_label,
             provider_status=provider_status,
             provider_warnings=provider_warnings,
+            price_source=price_source,
+            fallback_used=fallback_used,
             bar_age_minutes=bar_age_minutes,
+            bar_as_of=bar_as_of,
             freshness_flags=freshness_flags,
             layer_details={
                 "directional": {
@@ -927,6 +1382,14 @@ class ScannerService:
                     "market_status": market_status,
                     "relative_strength_pct": relative_strength_pct,
                     "volatility_regime": volatility_regime,
+                },
+                "decision": {
+                    "evidence_grade": decision_enrichment.evidence_grade,
+                    "top_reasons": decision_enrichment.top_reasons,
+                    "prediction": decision_enrichment.price_prediction.model_dump(),
+                    "weekly_prediction": (
+                        weekly_prediction.model_dump() if weekly_prediction is not None else None
+                    ),
                 },
                 "confidence": {
                     "adjustment_delta": confidence_overlay.delta,
@@ -947,6 +1410,9 @@ class ScannerService:
                 "provider_health": {
                     "provider_status": provider_status,
                     "warnings": provider_warnings,
+                    "price_source": price_source,
+                    "fallback_used": fallback_used,
+                    "options_flow_source": options_flow_snapshot.source,
                     "bar_age_minutes": bar_age_minutes,
                     "freshness_flags": freshness_flags,
                     "binance": (
@@ -1021,7 +1487,12 @@ class ScannerService:
         watchlist = stock_watchlist + crypto_watchlist
         observed_at = datetime.now(timezone.utc)
         await self.refresh_due_signal_outcomes(observed_at=observed_at)
-        stock_bars_task = self.alpaca.get_latest_bars(stock_watchlist) if stock_watchlist else None
+        await self.refresh_due_prediction_snapshots(observed_at=observed_at)
+        stock_bars_task = (
+            self._get_stock_bars_with_fallback(stock_watchlist)
+            if stock_watchlist
+            else None
+        )
         crypto_bars_task = self.alpaca.get_latest_crypto_bars(crypto_watchlist) if crypto_watchlist else None
         fear_greed_task = self.fear_greed.get_index()
         coingecko_task = self.coingecko.get_market_context(crypto_watchlist) if crypto_watchlist else None
@@ -1041,8 +1512,8 @@ class ScannerService:
             if crypto_watchlist and self.settings.defillama_enabled
             else None
         )
-        stock_bars, crypto_bars, fear_greed, crypto_context, binance_context, deribit_context, fred_snapshot, defillama_snapshot = await asyncio.gather(
-            stock_bars_task if stock_bars_task is not None else asyncio.sleep(0, result={}),
+        stock_bars_result, crypto_bars, fear_greed, crypto_context, binance_context, deribit_context, fred_snapshot, defillama_snapshot = await asyncio.gather(
+            stock_bars_task if stock_bars_task is not None else asyncio.sleep(0, result=({}, "alpaca")),
             crypto_bars_task if crypto_bars_task is not None else asyncio.sleep(0, result={}),
             fear_greed_task,
             coingecko_task if coingecko_task is not None else asyncio.sleep(0, result={}),
@@ -1051,7 +1522,8 @@ class ScannerService:
             fred_task if fred_task is not None else asyncio.sleep(0, result=None),
             defillama_task if defillama_task is not None else asyncio.sleep(0, result=None),
         )
-        alpaca_served_stale_cache = self.alpaca.consume_last_stale_flag()
+        stock_bars, stock_bars_source = stock_bars_result
+        crypto_alpaca_served_stale_cache = self.alpaca.consume_last_stale_flag()
         crypto_bars = self.market_data_service.apply_crypto_price_overrides(crypto_bars)
         market_status, spy_change_pct, qqq_change_pct = self._compute_market_status(stock_bars)
         fear_greed_value, fear_greed_label = fear_greed
@@ -1069,6 +1541,37 @@ class ScannerService:
         )
         crypto_market_status = self._crypto_market_status(crypto_benchmark_change_pct, fear_greed_value)
         created_at = observed_at
+        daily_bars_by_symbol: dict[str, list[dict]] = {}
+        stock_market_daily_bars: list[dict] | None = None
+        crypto_market_daily_bars: list[dict] | None = None
+        if self.settings.weekly_primary_horizon_enabled:
+            daily_fetch_pairs = await asyncio.gather(
+                *[
+                    self.daily_bar_service.get_daily_bars(
+                        ticker,
+                        asset_type="stock" if ticker not in crypto_watchlist else "crypto",
+                    )
+                    for ticker in watchlist
+                ]
+            )
+            for ticker, (bars, _) in zip(watchlist, daily_fetch_pairs):
+                daily_bars_by_symbol[ticker] = bars
+            # Benchmark daily series for live relative-strength parity with the
+            # walk-forward proof (SPY for stock, BTC/USD for crypto). Fetched once
+            # and cached; reused from the per-symbol map when already present.
+            stock_market_daily_bars = daily_bars_by_symbol.get("SPY")
+            if stock_market_daily_bars is None:
+                stock_market_daily_bars = (
+                    await self.daily_bar_service.get_daily_bars("SPY", asset_type="stock")
+                )[0]
+            crypto_benchmark_symbol = crypto_benchmark_ticker or "BTC/USD"
+            crypto_market_daily_bars = daily_bars_by_symbol.get(crypto_benchmark_symbol)
+            if crypto_market_daily_bars is None:
+                crypto_market_daily_bars = (
+                    await self.daily_bar_service.get_daily_bars(
+                        crypto_benchmark_symbol, asset_type="crypto"
+                    )
+                )[0]
 
         analyzed = await asyncio.gather(
             *[
@@ -1082,7 +1585,12 @@ class ScannerService:
                     created_at=created_at,
                     fred_snapshot=fred_snapshot,
                     breadth_snapshot=stock_breadth,
-                    alpaca_served_stale_cache=alpaca_served_stale_cache,
+                    alpaca_served_stale_cache=stock_bars_source == "stale_cache",
+                    market_bars_source=(
+                        None if stock_bars_source == "stale_cache" else stock_bars_source
+                    ),
+                    daily_bars=daily_bars_by_symbol.get(ticker),
+                    market_daily_bars=stock_market_daily_bars,
                 )
                 for ticker in stock_watchlist
             ],
@@ -1103,18 +1611,36 @@ class ScannerService:
                     fred_snapshot=fred_snapshot,
                     breadth_snapshot=crypto_breadth,
                     defillama_snapshot=defillama_snapshot,
-                    alpaca_served_stale_cache=alpaca_served_stale_cache,
+                    alpaca_served_stale_cache=crypto_alpaca_served_stale_cache,
+                    daily_bars=daily_bars_by_symbol.get(ticker),
+                    market_daily_bars=crypto_market_daily_bars,
                 )
                 for ticker in crypto_watchlist
             ],
         )
-        results = sorted(
+        ranked = sorted(
             [row for row in analyzed if row is not None],
-            key=lambda r: (
-                0 if r.gate_passed and r.decision_signal in {"BUY", "SELL"} else 1 if r.decision_signal in {"BUY", "SELL"} else 2,
-                -r.score,
-                r.ticker,
+            key=lambda r: display_sort_key(
+                r,
+                settings=self.settings,
+                resolve_signal=lambda row: row.decision_signal,
+                scan_result=r,
             ),
+        )
+        results = [
+            row.model_copy(update={"rank": index + 1})
+            for index, row in enumerate(ranked)
+        ]
+        results = apply_top_pick_selection(
+            results, settings=self.settings, limit=self.settings.effective_top_pick_limit
+        )
+        top_stocks = sorted(
+            [row for row in results if row.is_top_pick and row.asset_type == "stock"],
+            key=lambda row: row.selection_rank or 999,
+        )
+        top_crypto = sorted(
+            [row for row in results if row.is_top_pick and row.asset_type == "crypto"],
+            key=lambda row: row.selection_rank or 999,
         )
 
         run = ScanRun(
@@ -1128,6 +1654,8 @@ class ScannerService:
             fear_greed_value=fear_greed_value,
             fear_greed_label=fear_greed_label,
             results=results,
+            top_stocks=top_stocks,
+            top_crypto=top_crypto,
         )
         try:
             await self.alerts.dispatch_for_run(run)
@@ -1159,17 +1687,17 @@ class ScannerService:
             observed_at=observed_at or datetime.now(timezone.utc)
         )
 
+    async def refresh_due_prediction_snapshots(self, *, observed_at: datetime | None = None) -> int:
+        return await self._refresh_due_prediction_snapshots(
+            observed_at=observed_at or datetime.now(timezone.utc)
+        )
+
     def latest(self) -> ScanRun | None:
-        return self.repo.get_latest_run()
+        run = self.repo.get_latest_run()
+        if run is None:
+            return None
+        age_minutes, scan_fresh = self.repo.scan_run_freshness_fields(run.created_at)
+        return run.model_copy(update={"scan_age_minutes": age_minutes, "scan_fresh": scan_fresh})
 
     def history(self, limit: int = 12) -> list[ScanRun]:
         return self.repo.get_run_history(limit)
-
-    def start_scheduler(self) -> bool:
-        return False
-
-    def stop_scheduler(self) -> bool:
-        return False
-
-    def scheduler_running(self) -> bool:
-        return False

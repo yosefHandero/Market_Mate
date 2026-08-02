@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from datetime import datetime
 
@@ -71,9 +71,16 @@ class ScanResultORM(Base):
     provider_warnings_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     data_grade: Mapped[str] = mapped_column(String(16), default="research", index=True)
     bar_age_minutes: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bar_as_of: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     freshness_flags_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     layer_details_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     comparison_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    readiness_score: Mapped[float] = mapped_column(Float, default=0.0)
+    readiness_band: Mapped[str] = mapped_column(String(16), default="none")
+    readiness_hard_stop: Mapped[bool] = mapped_column(Boolean, default=False)
+    readiness_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    selection_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_top_pick: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class SignalOutcomeORM(Base):
@@ -121,6 +128,12 @@ class SignalOutcomeORM(Base):
     return_after_1d: Mapped[float | None] = mapped_column(Float, nullable=True)
     evaluated_at_1d: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status_1d: Mapped[str] = mapped_column(String(16), default="pending")
+    price_after_1w: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_after_1w: Mapped[float | None] = mapped_column(Float, nullable=True)
+    evaluated_at_1w: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status_1w: Mapped[str] = mapped_column(String(16), default="pending")
+    sample_source: Mapped[str] = mapped_column(String(32), default="live_paper_forward", index=True)
+    pattern_name: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 class ExecutionAuditORM(Base):
@@ -220,6 +233,108 @@ class PaperPositionORM(Base):
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class PredictionSnapshotORM(Base):
+    __tablename__ = "prediction_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(64), index=True)
+    ticker: Mapped[str] = mapped_column(String(16), index=True)
+    asset_type: Mapped[str] = mapped_column(String(16), default="stock", index=True)
+    signal: Mapped[str] = mapped_column(String(16), index=True)
+    evidence_grade: Mapped[str] = mapped_column(String(16), default="Weak")
+    entry_price: Mapped[float] = mapped_column(Float)
+    range_low: Mapped[float] = mapped_column(Float)
+    range_high: Mapped[float] = mapped_column(Float)
+    horizon: Mapped[str] = mapped_column(String(16), default="1h", index=True)
+    invalidation: Mapped[str] = mapped_column(Text, default="")
+    methodology: Mapped[str] = mapped_column(String(32), default="structural_stop_target")
+    generated_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    price_at_horizon: Mapped[float | None] = mapped_column(Float, nullable=True)
+    accuracy_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    in_range: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    sample_source: Mapped[str] = mapped_column(String(32), default="live_paper_forward", index=True)
+    pattern_name: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    pattern_metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    estimated_exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    invalidation_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    projected_range_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_window_status: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    exit_hit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    invalidation_hit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    protected_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hold_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_window_helped: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # --- Phase 4 immutable live-forward provenance (all nullable for back-compat) ---
+    # Existing pre-campaign rows keep these NULL and are rendered as "pre-campaign
+    # evidence", excluded from campaign metrics.
+    campaign_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    strategy_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    code_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    config_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    feature_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    data_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expected_friction_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    candidate_rank: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # selected | accepted_outside_top_n | rejected
+    selection_status: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    resolve_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    resolved_late: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # SHA-256 over the immutable core prediction fields, set once at insert.
+    record_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+
+class EvidenceCampaignORM(Base):
+    """A frozen strategy+config window over which live-forward evidence is collected.
+
+    A meaningful change to the strategy or evidence-relevant configuration closes
+    the active campaign and opens a new one, so incompatible results never mix.
+    """
+
+    __tablename__ = "evidence_campaigns"
+
+    campaign_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    strategy_id: Mapped[str] = mapped_column(String(64), default="")
+    strategy_version: Mapped[str] = mapped_column(String(32), default="")
+    feature_version: Mapped[str] = mapped_column(String(32), default="")
+    config_fingerprint: Mapped[str] = mapped_column(String(64), default="", index=True)
+    code_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    close_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    notes_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ScanWindowORM(Base):
+    """Expected scheduler window instances vs actual execution.
+
+    Lets the app answer "did we scan when we should have?" and surface missed
+    windows after downtime, sleep, or a skipped wake timer.
+    """
+
+    __tablename__ = "scan_windows"
+    __table_args__ = (
+        UniqueConstraint(
+            "window_name", "expected_start", name="uq_scan_windows_name_start"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    window_name: Mapped[str] = mapped_column(String(48), index=True)
+    expected_start: Mapped[datetime] = mapped_column(DateTime, index=True)
+    expected_end: Mapped[datetime] = mapped_column(DateTime)
+    # executed | missed | partial | pending
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    scan_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
 class PaperLoopBreakerORM(Base):
     """Single-row persisted circuit breaker for paper-loop execution (dry-run)."""
 
@@ -235,3 +350,117 @@ class PaperLoopBreakerORM(Base):
     probe_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+class StrategyReplayRunORM(Base):
+    __tablename__ = "strategy_replay_runs"
+
+    replay_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    request_json: Mapped[str] = mapped_column(Text, default="{}")
+    response_json: Mapped[str] = mapped_column(Text, default="{}")
+    symbol_count: Mapped[int] = mapped_column(Integer, default=0)
+    snapshot_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class DailyBarHistoryORM(Base):
+    """Persistent, incremental daily OHLCV cache for reproducible walk-forward proof.
+
+    Separate from the 24h TTL file cache used by live scans; append-only per
+    (symbol, asset_type, bar_date) so provider limits do not block long-range proof.
+    """
+
+    __tablename__ = "daily_bar_history"
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol", "asset_type", "bar_date", name="uq_daily_bar_history_symbol_asset_date"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(24), index=True)
+    asset_type: Mapped[str] = mapped_column(String(16), default="stock", index=True)
+    bar_date: Mapped[str] = mapped_column(String(10), index=True)
+    bar_ts: Mapped[str] = mapped_column(String(40))
+    open: Mapped[float] = mapped_column(Float, default=0.0)
+    high: Mapped[float] = mapped_column(Float, default=0.0)
+    low: Mapped[float] = mapped_column(Float, default=0.0)
+    close: Mapped[float] = mapped_column(Float, default=0.0)
+    volume: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[str] = mapped_column(String(16), default="alpaca")
+    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+    # Corporate-action adjustment applied by the provider for this row. Stocks are
+    # split-adjusted; crypto has no corporate actions ("none").
+    adjustment_policy: Mapped[str] = mapped_column(String(16), default="raw")
+    # Point-in-time revision tracking: how many times a refetch changed this row,
+    # and when it last changed. First write leaves these at 0 / NULL.
+    revision_count: Mapped[int] = mapped_column(Integer, default=0)
+    revised_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class WalkForwardRunORM(Base):
+    __tablename__ = "walk_forward_runs"
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="complete", index=True)
+    params_json: Mapped[str] = mapped_column(Text, default="{}")
+    window_start: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    window_end: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    holdout_start: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    validation_start: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    symbol_count: Mapped[int] = mapped_column(Integer, default=0)
+    prediction_count: Mapped[int] = mapped_column(Integer, default=0)
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")
+    verdict_json: Mapped[str] = mapped_column(Text, default="{}")
+    coverage_json: Mapped[str] = mapped_column(Text, default="{}")
+    # Run manifest for deterministic, versioned, auditable reruns.
+    config_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    code_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    engine_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    universe_json: Mapped[str] = mapped_column(Text, default="[]")
+    data_quality_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class WalkForwardPredictionORM(Base):
+    """One stored historical walk-forward top-candidate prediction and its 1w resolution."""
+
+    __tablename__ = "walk_forward_predictions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(64), index=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime, index=True)
+    asset_type: Mapped[str] = mapped_column(String(16), default="stock", index=True)
+    ticker: Mapped[str] = mapped_column(String(24), index=True)
+    selection_rank: Mapped[int] = mapped_column(Integer, default=0)
+    sample_source: Mapped[str] = mapped_column(String(32), default="historical", index=True)
+    pattern_name: Mapped[str] = mapped_column(String(64), default="range_neutral")
+    decision_signal: Mapped[str] = mapped_column(String(16), default="BUY")
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    upside_probability_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    historical_hit_rate_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    entry_price: Mapped[float] = mapped_column(Float, default=0.0)
+    projected_range_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    projected_range_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimated_exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    invalidation_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_growing_signal: Mapped[str | None] = mapped_column(Text, nullable=True)
+    horizon: Mapped[str] = mapped_column(String(8), default="1w")
+    forward_days: Mapped[int] = mapped_column(Integer, default=7)
+    expected_friction_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    generated_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    resolve_due_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    price_after_1w: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_after_1w: Mapped[float | None] = mapped_column(Float, nullable=True)
+    in_range: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    accuracy_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    exit_window_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    exit_hit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    invalidation_hit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    protected_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hold_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_window_helped: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    exit_conflict: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

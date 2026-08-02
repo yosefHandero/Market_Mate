@@ -306,7 +306,13 @@ def _paper_trading_ops_summary(*, readyz: dict, execution_alignment: dict, gate_
         "scheduler_running": bool(readyz.get("scheduler_running")),
         "threshold_evidence_ready": bool(readyz.get("trust_evidence_ready")),
         "critical_pending_due": any(
-            (readyz.get(key) or 0) > 0 for key in ("pending_due_15m_count", "pending_due_1h_count", "pending_due_1d_count")
+            (readyz.get(key) or 0) > 0
+            for key in (
+                "pending_due_15m_count",
+                "pending_due_1h_count",
+                "pending_due_1d_count",
+                "pending_due_1w_count",
+            )
         ),
         "gate_consistency_ok": (gate_consistency.get("mismatch_count", 0) or 0) == 0,
     }

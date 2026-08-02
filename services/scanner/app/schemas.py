@@ -13,8 +13,15 @@ DecisionSignal = Literal["BUY", "SELL", "HOLD"]
 AssetType = Literal["stock", "crypto"]
 ProviderStatus = Literal["ok", "degraded", "critical"]
 EvidenceQuality = Literal["high", "moderate", "low", "degraded"]
+EvidenceGrade = Literal["Strong", "Mixed", "Weak"]
 ExecutionEligibility = Literal["eligible", "blocked", "not_applicable", "review"]
 DataGrade = Literal["decision", "research", "degraded"]
+RecommendedAction = Literal["ignore", "review", "preview", "dry_run", "blocked"]
+ReadinessBand = Literal["high", "watch", "low", "none"]
+OutcomeHorizon = Literal["15m", "1h", "1d", "1w"]
+SampleSource = Literal["historical", "backfilled_replay", "live_paper_forward", "out_of_sample"]
+WeeklyEvidenceBasis = Literal["historical_only", "live_forward_proven", "mixed", "insufficient"]
+WeeklyDirectionalBias = Literal["bullish", "bearish", "neutral"]
 JournalActionState = Literal["watching", "reviewed", "took", "skipped"]
 AutomationPhase = Literal["disabled", "shadow", "limited", "broad"]
 PaperPositionStatus = Literal["open", "closed"]
@@ -58,6 +65,9 @@ def _normalize_optional_text(value: str | None) -> str | None:
 
 
 
+OptionsFlowSource = Literal["marketdata", "yahooquery", "yfinance", "unavailable"]
+
+
 class OptionsFlowSnapshot(BaseModel):
     expiry: str | None = None
     call_volume: int = 0
@@ -69,6 +79,7 @@ class OptionsFlowSnapshot(BaseModel):
     bullish_score: float = 0.0
     bearish_score: float = 0.0
     summary: str = "No options data."
+    source: OptionsFlowSource = "unavailable"
 
 
 class GateCheck(BaseModel):
@@ -102,6 +113,64 @@ class ErrorResponse(BaseModel):
     error: ErrorDetails
 
 
+class PricePrediction(BaseModel):
+    range_low: float
+    range_high: float
+    horizon: OutcomeHorizon = "1w"
+    horizon_label: str = "1 week"
+    invalidation: str
+    methodology: str = "structural_stop_target"
+    disclaimer: str = (
+        "Structural range from stop/target levels aligned with paper sizing. "
+        "Not a guarantee or price target."
+    )
+
+
+class ExitWindow(BaseModel):
+    expected_growth_window_label: str = "~1 week"
+    expected_growth_days: int = 7
+    estimated_exit_price: float | None = None
+    projected_range_low: float | None = None
+    projected_range_high: float | None = None
+    invalidation_level: float | None = None
+    invalidation_note: str = "No directional thesis."
+    stop_growing_signal: str = "Growth expected to slow near the projected range high."
+    stop_growing_conditions: list[str] = []
+    risk_warning: str = ""
+    confidence_change_note: str = ""
+    methodology: str = "weekly_pattern_exit_window"
+    disclaimer: str = (
+        "Exit window is a forecast of when growth may slow or the thesis may break. "
+        "It is not a sell order or automatic exit; paper-only decision support."
+    )
+
+
+class WeeklyPatternPrediction(BaseModel):
+    horizon: Literal["1w"] = "1w"
+    horizon_label: str = "1 week"
+    pattern_name: str
+    directional_bias: WeeklyDirectionalBias
+    range_low: float
+    range_high: float
+    upside_probability_pct: float | None = None
+    historical_hit_rate_pct: float | None = None
+    avg_forward_1w_return_pct: float | None = None
+    sample_size: int = 0
+    data_quality: Literal["ok", "low", "degraded"] = "low"
+    daily_bars_stale: bool = False
+    daily_bars_source: str = "unknown"
+    forward_days: int = 7
+    hold_return_tolerance_pct: float = 1.0
+    evidence_basis: WeeklyEvidenceBasis = "insufficient"
+    real_money_trust_blocked: bool = True
+    pattern_gate_checks: list[GateCheck] = []
+    methodology: str = "pattern_recognition"
+    disclaimer: str = (
+        "Weekly pattern-recognition range from daily-bar rules and walk-forward stats. "
+        "Paper-only; not a guarantee or live execution signal."
+    )
+
+
 class ScanResult(BaseModel):
     ticker: str
     asset_type: AssetType = "stock"
@@ -113,12 +182,21 @@ class ScanResult(BaseModel):
     confidence_label: str = "calibrated_confidence"
     strategy_id: str = "scanner-directional"
     strategy_version: str = "v4.0-layered"
-    strategy_primary_horizon: str = "1h"
+    strategy_primary_horizon: str = "1w"
     strategy_entry_assumption: str = ""
     strategy_exit_assumption: str = ""
     evidence_quality: EvidenceQuality = "low"
     evidence_quality_score: float = 0.0
     evidence_quality_reasons: list[str] = []
+    evidence_grade: EvidenceGrade = "Weak"
+    top_reasons: list[str] = []
+    price_prediction: PricePrediction | None = None
+    weekly_prediction: WeeklyPatternPrediction | None = None
+    exit_window: ExitWindow | None = None
+    upside_probability_pct: float | None = None
+    confidence_score: float = 0.0
+    evidence_provenance: WeeklyEvidenceBasis = "insufficient"
+    is_buy_candidate: bool = False
     data_grade: DataGrade = "research"
     execution_eligibility: ExecutionEligibility = "not_applicable"
     buy_score: float = 0.0
@@ -157,8 +235,19 @@ class ScanResult(BaseModel):
     fear_greed_label: str | None = None
     provider_status: ProviderStatus = "ok"
     provider_warnings: list[str] = []
+    price_source: Literal["alpaca", "coinbase_ws", "polygon", "stale_cache"] = "alpaca"
+    fallback_used: bool = False
     bar_age_minutes: float | None = None
+    bar_as_of: datetime | None = None
     freshness_flags: dict[str, str] = {}
+    rank: int | None = None
+    recommended_action: RecommendedAction | None = None
+    readiness_score: float = 0.0
+    readiness_band: ReadinessBand = "none"
+    readiness_hard_stop: bool = False
+    readiness_reason: str | None = None
+    selection_rank: int | None = None
+    is_top_pick: bool = False
     layer_details: dict = {}
     comparison: VariantComparison | None = None
     created_at: datetime
@@ -175,7 +264,11 @@ class ScanRun(BaseModel):
     alerts_sent: int = 0
     fear_greed_value: int | None = None
     fear_greed_label: str | None = None
+    scan_age_minutes: float | None = None
+    scan_fresh: bool | None = None
     results: list[ScanResult]
+    top_stocks: list[ScanResult] = []
+    top_crypto: list[ScanResult] = []
 
 
 class CryptoMarketPrice(BaseModel):
@@ -202,6 +295,8 @@ class HealthResponse(BaseModel):
     schema_ok: bool = True
     missing_schema_items: list[str] = []
     scheduler_running: bool = False
+    worker_alive: bool = False
+    last_worker_heartbeat_at: datetime | None = None
     last_scan_at: datetime | None = None
     last_scan_age_minutes: float | None = None
     max_stale_minutes: int | None = None
@@ -227,6 +322,7 @@ class HealthResponse(BaseModel):
     pending_due_15m_count: int | None = None
     pending_due_1h_count: int | None = None
     pending_due_1d_count: int | None = None
+    pending_due_1w_count: int | None = None
     request_id: str | None = None
 
 
@@ -238,6 +334,8 @@ class OrderPreviewRequest(BaseModel):
     limit_price: float | None = Field(default=None, gt=0)
     preview_audit_id: int | None = None
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+    # Paper-only build: the only accepted mode is an omitted value or "dry_run".
+    # Any other mode is rejected at the schema boundary (422) before the service.
     mode: Literal["dry_run"] | None = None
     entry_price: float | None = Field(default=None, gt=0)
     stop_price: float | None = Field(default=None, gt=0)
@@ -279,7 +377,9 @@ class OrderPreviewResponse(BaseModel):
 
 
 class OrderPlaceRequest(OrderPreviewRequest):
-    dry_run: bool = False
+    # Paper-only build: dry_run is structurally fixed to True. A request with
+    # dry_run=false is rejected at the schema boundary (422) before the service.
+    dry_run: Literal[True] = True
 
 
 class OrderPlaceResponse(BaseModel):
@@ -411,6 +511,55 @@ class AutomationStatusResponse(BaseModel):
     candidates_reached_execution_call: int = 0
     filter_rate_pct: float | None = None
 
+
+class SystemReadinessAutomation(BaseModel):
+    scheduler_enabled: bool = False
+    scheduler_running: bool = False
+    worker_alive: bool = False
+    automation_enabled: bool = False
+    automation_phase: AutomationPhase = "disabled"
+    automation_ready: bool = False
+    dry_run_only: bool = True
+    kill_switch_enabled: bool = False
+    breaker_state: Literal["closed", "open", "half_open", "unknown"] = "unknown"
+
+
+class SystemReadinessProviderSummary(BaseModel):
+    worst_status: str = "unknown"
+    total_count: int = 0
+    critical_count: int = 0
+    degraded_count: int = 0
+
+
+class SystemReadinessFreshnessSummary(BaseModel):
+    last_scan_at: datetime | None = None
+    last_scan_age_minutes: float | None = None
+    max_stale_minutes: int | None = None
+    scan_fresh: bool | None = None
+    total_count: int = 0
+    stale_count: int = 0
+    severe_stale_count: int = 0
+
+
+class SystemReadinessDiagnostics(BaseModel):
+    """First-class answers to 'why no candidates?' and 'did we miss a window?'."""
+
+    top_rejection_reasons: list[dict[str, object]] = []
+    missed_windows_14d: int = 0
+    pending_prediction_resolutions: int = 0
+    candidate_shortage: bool = False
+
+
+class SystemReadinessResponse(BaseModel):
+    status: Literal["PASS", "FAIL"]
+    reasons: list[str] = []
+    safety_blockers: list[str] = []
+    automation: SystemReadinessAutomation
+    provider: SystemReadinessProviderSummary
+    freshness: SystemReadinessFreshnessSummary
+    diagnostics: SystemReadinessDiagnostics = SystemReadinessDiagnostics()
+    request_id: str | None = None
+
 class JournalEntryCreateRequest(BaseModel):
     ticker: str
     run_id: str | None = None
@@ -515,7 +664,23 @@ class DecisionRow(BaseModel):
     signal_age_minutes: float | None = None
     freshness_flags: dict[str, str] | None = None
     recommended_action: Literal["ignore", "review", "preview", "dry_run", "blocked"] | None = None
+    readiness_score: float | None = None
+    readiness_band: ReadinessBand | None = None
+    readiness_hard_stop: bool | None = None
+    readiness_reason: str | None = None
+    selection_rank: int | None = None
+    is_top_pick: bool | None = None
+    rank: int | None = None
     score_contributions: dict[str, float] = {}
+    evidence_grade: EvidenceGrade | None = None
+    top_reasons: list[str] = []
+    price_prediction: PricePrediction | None = None
+    weekly_prediction: WeeklyPatternPrediction | None = None
+    exit_window: ExitWindow | None = None
+    upside_probability_pct: float | None = None
+    confidence_score: float | None = None
+    evidence_provenance: WeeklyEvidenceBasis | None = None
+    is_buy_candidate: bool | None = None
     strategy_version: str | None = None
     short_metric_summary: str
     last_updated: datetime
@@ -533,6 +698,9 @@ class SignalOutcomePerformanceBucket(BaseModel):
     evaluated_1d_count: int
     win_rate_1d: float | None = None
     avg_return_1d: float | None = None
+    evaluated_1w_count: int = 0
+    win_rate_1w: float | None = None
+    avg_return_1w: float | None = None
 
 
 class SignalOutcomeSummary(BaseModel):
@@ -540,6 +708,7 @@ class SignalOutcomeSummary(BaseModel):
     pending_15m_count: int
     pending_1h_count: int
     pending_1d_count: int
+    pending_1w_count: int = 0
     overall: SignalOutcomePerformanceBucket
     by_signal: list[SignalOutcomePerformanceBucket]
     by_confidence_bucket: list[SignalOutcomePerformanceBucket]
@@ -547,8 +716,53 @@ class SignalOutcomeSummary(BaseModel):
     by_signal_score_bucket: list[SignalOutcomePerformanceBucket]
 
 
+class TickerScanHistoryRow(BaseModel):
+    run_id: str
+    run_created_at: datetime
+    market_status: MarketStatus
+    result: ScanResult
+
+
+class TickerSignalOutcomeRecord(BaseModel):
+    id: int
+    run_id: str
+    ticker: str
+    asset_type: AssetType = "stock"
+    signal: DecisionSignal
+    confidence: float
+    raw_score: float
+    generated_at: datetime
+    entry_price: float
+    horizon: Literal["15m", "1h", "1d", "1w"]
+    status: str
+    return_pct: float | None = None
+    evaluated_at: datetime | None = None
+    strategy_variant: str | None = None
+    gate_passed: bool | None = None
+    gate_reason: str | None = None
+
+
+class TickerSignalOutcomeEvidence(BaseModel):
+    ticker: str
+    horizon: Literal["15m", "1h", "1d", "1w"]
+    strategy_variant: str | None = None
+    trust_window_start: datetime | None = None
+    trust_window_end: datetime | None = None
+    sample_size: int
+    evaluated_count: int
+    pending_count: int
+    win_count: int
+    loss_count: int
+    win_rate: float | None = None
+    mean_return: float | None = None
+    median_return: float | None = None
+    insufficient_sample: bool
+    min_evaluated_for_rate: int
+    recent_outcomes: list[TickerSignalOutcomeRecord] = []
+
+
 class HorizonMetrics(BaseModel):
-    horizon: Literal["15m", "1h", "1d"]
+    horizon: Literal["15m", "1h", "1d", "1w"]
     total_signals: int
     evaluated_count: int
     pending_count: int
@@ -572,11 +786,12 @@ class OutcomePerformanceSlice(BaseModel):
     metrics_15m: HorizonMetrics
     metrics_1h: HorizonMetrics
     metrics_1d: HorizonMetrics
+    metrics_1w: HorizonMetrics
 
 
 class OutcomeBaselineCheck(BaseModel):
     key: str
-    horizon: Literal["15m", "1h", "1d"]
+    horizon: OutcomeHorizon
     evaluated_count: int
     mean_return: float | None = None
     meets_min_sample: bool
@@ -586,7 +801,7 @@ class OutcomeBaselineCheck(BaseModel):
 
 
 class OutcomeBaselineSummary(BaseModel):
-    primary_horizon: Literal["15m", "1h", "1d"]
+    primary_horizon: Literal["15m", "1h", "1d", "1w"]
     min_evaluated_per_horizon: int
     min_mean_return_pct: float
     passes_baseline: bool
@@ -631,7 +846,7 @@ class TradeEligibility(BaseModel):
     execution_eligibility: ExecutionEligibility | None = None
     strategy_id: str = "scanner-directional"
     strategy_version: str = "v4.0-layered"
-    strategy_primary_horizon: str = "1h"
+    strategy_primary_horizon: str = "1w"
     strategy_entry_assumption: str | None = None
     strategy_exit_assumption: str | None = None
     signal_age_minutes: float | None = None
@@ -641,6 +856,8 @@ class TradeEligibility(BaseModel):
     horizon: str
     gate_evaluation_mode: str | None = None
     evidence_basis: str | None = None
+    real_money_trust_blocked: bool | None = None
+    real_money_eligible: bool = False
     trust_window_start: datetime | None = None
     trust_window_end: datetime | None = None
     latest_scan_age_minutes: float | None = None
@@ -692,12 +909,16 @@ class ValidationSummary(BaseModel):
     generated_at_field: str = "generated_at"
     start: datetime | None = None
     end: datetime | None = None
-    primary_horizon: Literal["15m", "1h", "1d"]
+    primary_horizon: Literal["15m", "1h", "1d", "1w"]
     win_threshold_pct: float
     false_positive_threshold_pct: float
     total_signals: int
     evaluated_count: int
     pending_count: int
+    minimum_sample_size: int = 30
+    sample_size_sufficient: bool = False
+    evaluated_fraction: float | None = None
+    confidence_note: str = ""
     overall: ValidationBucket
     in_sample: ValidationBucket | None = None
     out_of_sample: ValidationBucket | None = None
@@ -750,7 +971,7 @@ class ThresholdSweepResponse(BaseModel):
     generated_at_field: str = "generated_at"
     start: datetime | None = None
     end: datetime | None = None
-    primary_horizon: Literal["15m", "1h", "1d"]
+    primary_horizon: Literal["15m", "1h", "1d", "1w"]
     win_threshold_pct: float
     false_positive_threshold_pct: float
     baseline: ValidationBucket
@@ -778,7 +999,7 @@ class ExecutionAlignmentResponse(BaseModel):
     generated_at_field: str = "generated_at"
     start: datetime | None = None
     end: datetime | None = None
-    primary_horizon: Literal["15m", "1h", "1d"]
+    primary_horizon: Literal["15m", "1h", "1d", "1w"]
     win_threshold_pct: float
     false_positive_threshold_pct: float
     all_signals: CohortValidationSummary
@@ -823,6 +1044,313 @@ class PaperLedgerSummaryResponse(BaseModel):
     win_rate_pct: float | None = None
     gross_pnl_usd: float = 0.0
     max_drawdown_usd: float = 0.0
+    total_unrealized_pnl: float | None = None
+
+
+class ProofLoopMetrics(BaseModel):
+    recent_dry_runs: int
+    recent_previewed: int
+    recent_blocked: int
+    total_audits: int
+
+
+class PredictionAccuracyMetrics(BaseModel):
+    evaluated_count: int = 0
+    pending_count: int = 0
+    in_range_count: int = 0
+    in_range_rate_pct: float | None = None
+    below_range_count: int = 0
+    above_range_count: int = 0
+    missed_count: int = 0
+    note: str | None = None
+
+
+class WeeklyEvidenceProgress(BaseModel):
+    live_forward_samples: int = 0
+    out_of_sample_samples: int = 0
+    historical_samples: int = 0
+    backfilled_replay_samples: int = 0
+    min_live_forward_samples: int = 0
+    min_out_of_sample_samples: int = 0
+    min_historical_samples: int = 0
+    min_backfilled_replay_samples: int = 0
+    # Sample-count gate only. Per-candidate performance (win-rate / avg-return) and
+    # per-pattern checks still apply; this is transparency progress, not a trust grant.
+    trust_sample_gate_met: bool = False
+    calibration_sample_gate_met: bool = False
+
+
+class LiveForwardAssetProgress(BaseModel):
+    asset_type: str
+    selected: int = 0
+    accepted_outside_top_n: int = 0
+    rejected: int = 0
+    resolved: int = 0
+    pending: int = 0
+    resolved_late: int = 0
+
+
+class LiveForwardProgress(BaseModel):
+    """Live-forward evidence accumulation for the active campaign. This is
+    completion/transparency progress, NOT a real-money readiness signal."""
+
+    campaign_id: str | None = None
+    campaign_started_at: datetime | None = None
+    config_fingerprint: str | None = None
+    strategy_version: str | None = None
+    code_commit: str | None = None
+    selected_count: int = 0
+    accepted_outside_top_n_count: int = 0
+    rejected_count: int = 0
+    resolved_count: int = 0
+    pending_count: int = 0
+    resolved_late_count: int = 0
+    by_asset: list[LiveForwardAssetProgress] = []
+    last_scan_at: datetime | None = None
+    last_scan_age_minutes: float | None = None
+    scan_gap_exceeded: bool = False
+    max_expected_scan_gap_minutes: float | None = None
+    missed_windows_14d: int = 0
+    note: str | None = None
+
+
+class ConfidenceTierBucket(BaseModel):
+    score_band: str
+    asset_type: str
+    signal: str
+    sample_source: str
+    evaluated_count: int
+    win_rate_pct: float | None = None
+    avg_return_pct: float | None = None
+    avg_return_after_friction_base_pct: float | None = None
+    avg_return_after_friction_stressed_pct: float | None = None
+
+
+class ConfidenceRanking(BaseModel):
+    buckets: list[ConfidenceTierBucket] = []
+    # True only if every comparable group (same asset_type/signal/sample_source with
+    # 2+ evaluated bands) is non-decreasing in avg return as confidence rises; None if
+    # there is not yet enough data to judge ranking.
+    monotonic_by_group: bool | None = None
+    note: str | None = None
+
+
+class ConfidenceCalibrationBucket(BaseModel):
+    probability_band: str
+    asset_type: str
+    evaluated_count: int
+    avg_predicted_pct: float | None = None
+    realized_up_rate_pct: float | None = None
+    reliability_gap_pct: float | None = None
+
+
+class ConfidenceCalibration(BaseModel):
+    buckets: list[ConfidenceCalibrationBucket] = []
+    mean_abs_reliability_gap_pct: float | None = None
+    note: str | None = None
+
+
+class ConfidencePerformance(BaseModel):
+    ranking: ConfidenceRanking = ConfidenceRanking()
+    calibration: ConfidenceCalibration = ConfidenceCalibration()
+
+
+class ExitWindowAssetMetrics(BaseModel):
+    asset_type: str
+    evaluated_count: int = 0
+    pending_count: int = 0
+    helped_count: int = 0
+    helped_rate_pct: float | None = None
+    avg_protected_return_pct: float | None = None
+    avg_hold_return_pct: float | None = None
+    avg_protected_after_friction_stressed_pct: float | None = None
+    avg_hold_after_friction_stressed_pct: float | None = None
+
+
+class ExitWindowAccuracyMetrics(BaseModel):
+    evaluated_count: int = 0
+    pending_count: int = 0
+    helped_count: int = 0
+    helped_rate_pct: float | None = None
+    by_asset_type: list[ExitWindowAssetMetrics] = []
+    note: str | None = None
+
+
+WalkForwardTrack = Literal["research", "validation", "holdout"]
+
+
+class WalkForwardCalibrationBucket(BaseModel):
+    probability_band: str
+    asset_type: AssetType
+    track: WalkForwardTrack
+    evaluated_count: int = 0
+    avg_predicted_pct: float | None = None
+    realized_up_rate_pct: float | None = None
+    reliability_gap_pct: float | None = None
+
+
+class WalkForwardAssetMetrics(BaseModel):
+    asset_type: AssetType
+    track: WalkForwardTrack
+    prediction_count: int = 0
+    resolved_count: int = 0
+    pending_count: int = 0
+    upside_hit_rate_pct: float | None = None
+    avg_return_pct: float | None = None
+    avg_return_after_friction_pct: float | None = None
+    avg_return_after_friction_stressed_pct: float | None = None
+    calibration_mean_abs_gap_pct: float | None = None
+    calibrated_calibration_gap_pct: float | None = None
+    confidence_discrimination_pct: float | None = None
+    exit_window_helped_rate_pct: float | None = None
+    exit_conflict_rate_pct: float | None = None
+    avg_protected_return_pct: float | None = None
+    avg_hold_return_pct: float | None = None
+    worst_return_pct: float | None = None
+    p05_return_pct: float | None = None
+    worst_decile_mean_pct: float | None = None
+    max_drawdown_pct: float | None = None
+    # Statistical-solidity measures (quant-research rigor): significance of the
+    # realized edge, signal-vs-outcome information coefficient, and cross-regime
+    # robustness. Reported for confidence; real-money trust stays separately gated.
+    upside_hit_rate_lb95_pct: float | None = None
+    edge_significant: bool | None = None
+    information_coefficient: float | None = None
+    ic_t_stat: float | None = None
+    regime_sample_counts: dict[str, int] | None = None
+    regime_avg_return_pct: dict[str, float] | None = None
+    cross_regime_edge_ok: bool | None = None
+    edge_after_friction_vs_buy_and_hold_pct: float | None = None
+    edge_after_friction_vs_market_pct: float | None = None
+    edge_after_friction_vs_momentum_pct: float | None = None
+    edge_after_friction_vs_sma_cross_pct: float | None = None
+    edge_after_friction_vs_random_pct: float | None = None
+
+
+class WalkForwardBenchmark(BaseModel):
+    asset_type: AssetType
+    track: WalkForwardTrack
+    strategy: str
+    periods: int = 0
+    avg_return_pct: float | None = None
+    avg_return_after_friction_pct: float | None = None
+
+
+class WalkForwardCoverageRow(BaseModel):
+    symbol: str
+    asset_type: AssetType
+    bar_count: int = 0
+    first_date: str | None = None
+    last_date: str | None = None
+    years_available: float = 0.0
+    source: str = "cache"
+    sufficient: bool = False
+    note: str = ""
+
+
+class WalkForwardAssetVerdict(BaseModel):
+    # Independent per-asset-class verdict. Stock and crypto are judged separately
+    # and never merged; each carries its own checks and sample floors.
+    asset_type: AssetType
+    ready: bool = False
+    real_money_trust_blocked: bool = True
+    summary: str = "Historical walk-forward proof only; not a real-money trust grant."
+    checks: list[GateCheck] = []
+
+
+class WalkForwardPilotVerdict(BaseModel):
+    # Report-only. This never enables execution; real-money trust stays blocked
+    # and paper-only / dry-run boundaries are unaffected. `ready` is true only if
+    # every asset class in `by_asset` is ready, but the per-asset verdicts are the
+    # authoritative, independent results.
+    ready: bool = False
+    real_money_trust_blocked: bool = True
+    summary: str = "Historical walk-forward proof only; not a real-money trust grant."
+    checks: list[GateCheck] = []
+    by_asset: list[WalkForwardAssetVerdict] = []
+
+
+class EvidenceTrackDescriptor(BaseModel):
+    key: str
+    label: str
+    description: str
+    is_forward: bool
+    counts_toward_real_money: bool
+
+
+class WalkForwardRunSummary(BaseModel):
+    run_id: str
+    created_at: datetime
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    holdout_start: datetime | None = None
+    target_years: int = 3
+    step_days: int = 7
+    forward_days: int = 7
+    top_n_per_asset: int = 5
+    symbol_count: int = 0
+    prediction_count: int = 0
+    resolved_count: int = 0
+    pending_count: int = 0
+    evidence_track: str = "historical_walk_forward"
+    validation_start: datetime | None = None
+    by_asset_track: list[WalkForwardAssetMetrics] = []
+    calibration_buckets: list[WalkForwardCalibrationBucket] = []
+    benchmarks: list[WalkForwardBenchmark] = []
+    coverage: list[WalkForwardCoverageRow] = []
+    pilot_verdict: WalkForwardPilotVerdict = WalkForwardPilotVerdict()
+    # Run manifest for deterministic, versioned, auditable reruns.
+    config_fingerprint: str | None = None
+    code_commit: str | None = None
+    engine_version: str | None = None
+    universe: list[str] = []
+    universe_source: str | None = None
+    data_quality_ok: bool | None = None
+    data_quality_issues: list[str] = []
+    survivorship_caveat: str = (
+        "Universe is the current watchlist only; delisted names are absent, so "
+        "results are survivorship-limited."
+    )
+    overlap_status: str | None = None
+    note: str | None = None
+
+
+class WalkForwardProofRequest(BaseModel):
+    symbols: list[str] | None = None
+    years: int | None = Field(default=None, ge=1, le=10)
+    step_days: int | None = Field(default=None, ge=1, le=31)
+    top_n_per_asset: int | None = Field(default=None, ge=3, le=5)
+    force_refresh: bool = False
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_symbols(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        normalized = [_normalize_required_symbol(value) for value in values]
+        return normalized or None
+
+
+class WalkForwardProofRunResponse(BaseModel):
+    run_id: str
+    summary: WalkForwardRunSummary
+
+
+class ProofSummaryResponse(BaseModel):
+    generated_at: datetime
+    ledger: PaperLedgerSummaryResponse
+    loop_metrics: ProofLoopMetrics
+    prediction_accuracy: PredictionAccuracyMetrics | None = None
+    confidence_performance: ConfidencePerformance | None = None
+    exit_window_accuracy: ExitWindowAccuracyMetrics | None = None
+    weekly_evidence: WeeklyEvidenceProgress | None = None
+    walk_forward: WalkForwardRunSummary | None = None
+    live_forward: LiveForwardProgress | None = None
+    evidence_contract: list[EvidenceTrackDescriptor] = []
+    last_scan_at: datetime | None = None
+    scan_fresh: bool | None = None
+    mark_prices_source: str = "latest_scan"
+    note: str | None = None
 
 
 class PromotionGateResult(BaseModel):
@@ -897,6 +1425,9 @@ class ReplayRequest(BaseModel):
     compare_strategy_variant: str | None = None
     include_secondary_providers: bool = False
     apply_friction: bool = True
+    replay_mode: Literal["intraday", "weekly"] = "intraday"
+    sample_source: SampleSource = "backfilled_replay"
+    persist_outcomes: bool = False
 
     @field_validator("symbols")
     @classmethod
@@ -931,7 +1462,7 @@ class ReplaySignalRow(BaseModel):
     future_price: float | None = None
     raw_return_pct: float | None = None
     friction_adjusted_return_pct: float | None = None
-    horizon: Literal["15m", "1h", "1d"] = "1h"
+    horizon: OutcomeHorizon = "1w"
 
 
 class ReplaySummary(BaseModel):

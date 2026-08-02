@@ -134,6 +134,34 @@ class AlpacaClient:
             }
         return bars_by_symbol
 
+    async def _fetch_bars_paginated(
+        self,
+        *,
+        url: str,
+        base_params: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Alpaca's multi-symbol bars endpoints cap each response at `limit` bars
+        # TOTAL across all symbols and return a next_page_token for the rest.
+        # Without following it, only the first few symbols receive bars and the
+        # remainder look like missing market data. Follow the token so every
+        # symbol in a batched request gets its full history.
+        merged: dict[str, list[Any]] = {}
+        page_token: str | None = None
+        pages = 0
+        while True:
+            params = dict(base_params)
+            if page_token:
+                params["page_token"] = page_token
+            payload = await self._request_json("GET", url, params=params)
+            for symbol, rows in (payload.get("bars") or {}).items():
+                if rows:
+                    merged.setdefault(symbol, []).extend(rows)
+            page_token = payload.get("next_page_token")
+            pages += 1
+            if not page_token or pages >= 25:
+                break
+        return {"bars": merged}
+
     async def _fetch_stock_bars(
         self,
         *,
@@ -143,16 +171,18 @@ class AlpacaClient:
         timeframe: str,
         limit: int,
     ) -> dict[str, Any]:
-        return await self._request_json(
-            "GET",
-            f"{self.settings.alpaca_market_data_url}/v2/stocks/bars",
-            params={
+        return await self._fetch_bars_paginated(
+            url=f"{self.settings.alpaca_market_data_url}/v2/stocks/bars",
+            base_params={
                 "symbols": ",".join(symbols),
                 "timeframe": timeframe,
                 "start": start.isoformat(),
                 "end": end.isoformat(),
                 "limit": limit,
-                "adjustment": "raw",
+                # Split-adjusted for parity with the Polygon fallback (adjusted=true).
+                # Mixing raw and split-adjusted bars across a split corrupts
+                # walk-forward outcomes, so both providers must agree.
+                "adjustment": "split",
                 "feed": "iex",
                 "sort": "asc",
             },
@@ -167,10 +197,9 @@ class AlpacaClient:
         timeframe: str,
         limit: int,
     ) -> dict[str, Any]:
-        return await self._request_json(
-            "GET",
-            f"{self.settings.alpaca_market_data_url}/v1beta3/crypto/us/bars",
-            params={
+        return await self._fetch_bars_paginated(
+            url=f"{self.settings.alpaca_market_data_url}/v1beta3/crypto/us/bars",
+            base_params={
                 "symbols": ",".join(symbols),
                 "timeframe": timeframe,
                 "start": start.isoformat(),
@@ -227,7 +256,7 @@ class AlpacaClient:
             start=start,
             end=end,
             timeframe=timeframe,
-            limit=1000,
+            limit=10000,
         )
         return self._build_bars_by_symbol(payload)
 
@@ -244,7 +273,7 @@ class AlpacaClient:
             start=start,
             end=end,
             timeframe=timeframe,
-            limit=1000,
+            limit=10000,
         )
         return self._build_bars_by_symbol(payload)
 
@@ -365,55 +394,6 @@ class AlpacaClient:
             if row_time >= target:
                 return float(row.get("c", 0)) or None
         return None
-
-    async def submit_order(
-        self,
-        *,
-        symbol: str,
-        side: str,
-        qty: float,
-        order_type: str = "market",
-        time_in_force: str | None = None,
-        limit_price: float | None = None,
-        idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        self._require_credentials()
-        payload: dict[str, Any] = {
-            "symbol": symbol.upper(),
-            "side": side,
-            "type": order_type,
-            "qty": round(qty, 6),
-            "time_in_force": time_in_force or self.settings.execution_default_time_in_force,
-        }
-        if order_type == "limit":
-            if limit_price is None:
-                raise RuntimeError("limit_price is required for limit orders")
-            payload["limit_price"] = round(limit_price, 4)
-        if idempotency_key:
-            payload["client_order_id"] = idempotency_key[:48]
-
-        return await self._request_json(
-            "POST",
-            f"{self.settings.alpaca_base_url}/v2/orders",
-            json=payload,
-        )
-
-    async def get_account(self) -> dict[str, Any]:
-        self._require_credentials()
-        return await self._request_json(
-            "GET",
-            f"{self.settings.alpaca_base_url}/v2/account",
-        )
-
-    async def get_positions(self) -> list[dict[str, Any]]:
-        self._require_credentials()
-        payload = await self._request_json(
-            "GET",
-            f"{self.settings.alpaca_base_url}/v2/positions",
-        )
-        if isinstance(payload, list):
-            return payload
-        return []
 
     async def get_historical_stock_bars(
         self,

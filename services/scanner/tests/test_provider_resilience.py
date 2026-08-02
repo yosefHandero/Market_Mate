@@ -19,12 +19,54 @@ from app.clients.deribit import DeribitClient
 from app.clients.fred import FREDClient
 from app.clients.options_flow import OptionsFlowClient
 from app.clients.sec import SECClient
-from app.http_client import request_json
+from app.http_client import ProviderRequestError, _apply_retry_jitter, request_json
 from app.provider_resilience import AsyncProviderGuard
 from app.schemas import OptionsFlowSnapshot
 
 
 class HttpClientResilienceTests(unittest.TestCase):
+    def test_apply_retry_jitter_increases_delay(self) -> None:
+        base = 1.0
+        jittered = [_apply_retry_jitter(base) for _ in range(20)]
+        self.assertTrue(all(value >= base for value in jittered))
+        self.assertTrue(any(value > base for value in jittered))
+
+    def test_request_json_honors_retry_after_on_429(self) -> None:
+        client = MagicMock()
+        client.request = AsyncMock(
+            side_effect=[
+                httpx.Response(
+                    429,
+                    headers={"retry-after": "0"},
+                    text="rate limit exceeded",
+                ),
+                httpx.Response(
+                    200,
+                    headers={"content-type": "application/json"},
+                    json={"ok": True},
+                ),
+            ]
+        )
+        guard = AsyncProviderGuard("test")
+
+        async def run() -> dict:
+            with patch("app.http_client.get_settings") as mocked_settings:
+                mocked_settings.return_value = SimpleNamespace(
+                    provider_retry_attempts=1,
+                    provider_retry_backoff_seconds=0.0,
+                )
+                return await request_json(
+                    client,
+                    method="GET",
+                    url="https://example.com/data",
+                    provider="test",
+                    on_backoff=guard.register_backoff,
+                )
+
+        payload = asyncio.run(run())
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(client.request.await_count, 2)
+
     def test_request_json_retries_html_block_page_then_succeeds(self) -> None:
         client = MagicMock()
         client.request = AsyncMock(
@@ -138,6 +180,51 @@ class ProviderCacheTests(unittest.TestCase):
         first_payload, second_payload = asyncio.run(run())
         self.assertEqual(first_payload["BTC/USD"]["market_cap_rank"], 1)
         self.assertEqual(second_payload, first_payload)
+
+    def test_options_flow_falls_back_to_yahooquery_when_marketdata_fails(self) -> None:
+        client = OptionsFlowClient()
+        client.settings.marketdata_options_enabled = True
+        client.settings.marketdata_api_token = "test-token"
+        yahoo_snapshot = OptionsFlowSnapshot(summary="from yahoo.", source="yahooquery")
+
+        async def run() -> OptionsFlowSnapshot:
+            with patch.object(
+                client,
+                "_get_marketdata_snapshot_sync",
+                side_effect=RuntimeError("marketdata unavailable"),
+            ):
+                with patch.object(
+                    client,
+                    "_get_yahooquery_snapshot_sync",
+                    return_value=yahoo_snapshot,
+                ):
+                    return await client.get_flow_snapshot("AAPL")
+
+        snapshot = asyncio.run(run())
+        self.assertEqual(snapshot.source, "yahooquery")
+        self.assertEqual(snapshot.summary, "from yahoo.")
+
+    def test_options_flow_skips_marketdata_when_disabled(self) -> None:
+        client = OptionsFlowClient()
+        client.settings.marketdata_options_enabled = False
+        client.settings.marketdata_api_token = "test-token"
+        yahoo_snapshot = OptionsFlowSnapshot(summary="from yahoo.", source="yahooquery")
+
+        async def run() -> OptionsFlowSnapshot:
+            with patch.object(
+                client,
+                "_get_marketdata_snapshot_sync",
+                side_effect=AssertionError("marketdata should not be called"),
+            ):
+                with patch.object(
+                    client,
+                    "_get_yahooquery_snapshot_sync",
+                    return_value=yahoo_snapshot,
+                ):
+                    return await client.get_flow_snapshot("AAPL")
+
+        snapshot = asyncio.run(run())
+        self.assertEqual(snapshot.source, "yahooquery")
 
     def test_options_flow_deduplicates_concurrent_identical_requests(self) -> None:
         client = OptionsFlowClient()

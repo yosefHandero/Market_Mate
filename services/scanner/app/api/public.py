@@ -1,6 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
@@ -10,51 +10,70 @@ from app.db import check_database_connection, get_schema_status
 from app.dependencies import (
     get_automation_service,
     get_coinbase_market_data_service,
-    get_journal_repository,
     get_scan_repository,
     get_scheduler_service,
     get_scanner_service,
+    get_walk_forward_repository,
 )
+from app.core.freshness_policy import (
+    row_has_bad_freshness_flags,
+    row_is_bar_stale,
+    row_is_severely_stale,
+    row_is_unusable_or_stale,
+    unified_bar_freshness_max_age_minutes,
+)
+from app.core.evidence_contract import evidence_track_manifest
 from app.core.strategy_contract import get_current_strategy_contract
 from app.schemas import (
     AutomationStatusResponse,
     CryptoMarketSnapshotResponse,
     DecisionRow,
+    EvidenceTrackDescriptor,
     ExecutionAuditSummary,
-    ExecutionAlignmentResponse,
     HealthResponse,
-    JournalAnalyticsResponse,
-    JournalEntryResponse,
     PaperLedgerSummaryResponse,
     PaperPositionSummary,
-    ProjectionResponse,
-    ProjectionWeek,
+    ProofLoopMetrics,
+    ProofSummaryResponse,
+    ScanResult,
     ScanRun,
     StrategyContractResponse,
     StrategySignalContractResponse,
-    ThresholdSweepResponse,
-    ValidationSummary,
+    SystemReadinessAutomation,
+    SystemReadinessDiagnostics,
+    SystemReadinessFreshnessSummary,
+    SystemReadinessProviderSummary,
+    SystemReadinessResponse,
 )
-from app.services.journal_repository import JournalRepository
 from app.services.automation import AutomationService
 from app.services.coinbase_market_data import CoinbaseMarketDataService
 from app.services.readiness import compute_scan_freshness_fields, evaluate_operational_readiness
 from app.services.repository import ScanRepository
+from app.services.walk_forward_repository import WalkForwardRepository
 from app.services.scheduler import SchedulerService
 from app.services.scanner import ScannerService
 
 router = APIRouter()
-protected_router = APIRouter(dependencies=[Depends(require_read_access)])
 
 
-def _validate_time_window(
-    *,
-    start: datetime | None,
-    end: datetime | None,
-) -> tuple[datetime | None, datetime | None]:
-    if start is not None and end is not None and end <= start:
-        raise ValueError("end must be greater than start")
-    return start, end
+def require_schema_ready() -> None:
+    """Return 503 (not 500) when the DB schema is behind the ORM models."""
+    schema_status = get_schema_status()
+    if not schema_status.ok:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "message": (
+                    "Database schema is incomplete. Run: cd services/scanner && alembic upgrade head"
+                ),
+                "missing_schema_items": schema_status.missing_items,
+            },
+        )
+
+
+protected_router = APIRouter(
+    dependencies=[Depends(require_read_access), Depends(require_schema_ready)],
+)
 
 
 def _build_health_response(
@@ -68,6 +87,27 @@ def _build_health_response(
     settings = get_settings()
     schema_status = get_schema_status()
     scheduler_state = scheduler_service.state()
+    if not schema_status.ok:
+        return HealthResponse(
+            ok=live,
+            env=settings.app_env,
+            app_version=settings.app_version,
+            ready=False,
+            live=live,
+            schema_ok=False,
+            missing_schema_items=schema_status.missing_items,
+            scheduler_running=scheduler_state.running,
+            worker_alive=scheduler_state.worker_alive,
+            last_worker_heartbeat_at=scheduler_state.worker_heartbeat_at,
+            scheduler_enabled=scheduler_state.enabled,
+            scheduler_interval_seconds=settings.scan_interval_seconds,
+            next_scan_due_at=scheduler_state.next_run_at,
+            last_scheduler_run_started_at=scheduler_state.last_run_started_at,
+            last_scheduler_run_finished_at=scheduler_state.last_run_finished_at,
+            last_scheduler_error=scheduler_state.last_error,
+            max_stale_minutes=settings.health_max_stale_minutes,
+            request_id=getattr(request.state, "request_id", None),
+        )
     last_scan_at = scan_repository.get_latest_run_timestamp()
     trust_snapshot = scan_repository.get_trust_readiness_snapshot()
     gate_buckets = {bucket.key: bucket for bucket in trust_snapshot.summary.by_signal_and_gate}
@@ -84,6 +124,8 @@ def _build_health_response(
         schema_ok=schema_status.ok,
         missing_schema_items=schema_status.missing_items,
         scheduler_running=scheduler_state.running,
+        worker_alive=scheduler_state.worker_alive,
+        last_worker_heartbeat_at=scheduler_state.worker_heartbeat_at,
         last_scan_at=last_scan_at,
         last_scan_age_minutes=last_scan_age_minutes,
         max_stale_minutes=settings.health_max_stale_minutes,
@@ -109,6 +151,185 @@ def _build_health_response(
         pending_due_15m_count=trust_snapshot.pending_due_15m_count,
         pending_due_1h_count=trust_snapshot.pending_due_1h_count,
         pending_due_1d_count=trust_snapshot.pending_due_1d_count,
+        pending_due_1w_count=trust_snapshot.pending_due_1w_count,
+        request_id=getattr(request.state, "request_id", None),
+    )
+
+
+def _provider_rank(status_value: str | None) -> int:
+    normalized = (status_value or "").strip().lower()
+    if normalized in {"critical", "error"}:
+        return 3
+    if normalized == "degraded":
+        return 2
+    if normalized in {"ok", "healthy"}:
+        return 0
+    return 1
+
+
+def _row_provider_critical(row: ScanResult) -> bool:
+    return (row.provider_status or "").strip().lower() in {"critical", "error"}
+
+
+def _row_has_bad_freshness_flags(row: ScanResult) -> bool:
+    return row_has_bad_freshness_flags(row)
+
+
+def _row_severely_stale(row: ScanResult, settings) -> bool:
+    return row_is_severely_stale(row, settings)
+
+
+def _row_unusable_or_stale(row: ScanResult, settings) -> bool:
+    return row_is_unusable_or_stale(row, settings)
+
+
+def _provider_summary(rows: list[ScanResult]) -> SystemReadinessProviderSummary:
+    if not rows:
+        return SystemReadinessProviderSummary()
+    statuses = [row.provider_status or "unknown" for row in rows]
+    worst_status = max(statuses, key=_provider_rank)
+    return SystemReadinessProviderSummary(
+        worst_status=(worst_status or "unknown").strip().lower(),
+        total_count=len(rows),
+        critical_count=sum(1 for row in rows if _row_provider_critical(row)),
+        degraded_count=sum(1 for row in rows if (row.provider_status or "").strip().lower() == "degraded"),
+    )
+
+
+def _freshness_summary(
+    *,
+    latest_run: ScanRun | None,
+    last_scan_age_minutes: float | None,
+    scan_fresh: bool | None,
+    max_stale_minutes: int,
+) -> SystemReadinessFreshnessSummary:
+    settings = get_settings()
+    bar_max_age_minutes = unified_bar_freshness_max_age_minutes(settings)
+    rows = latest_run.results if latest_run else []
+    return SystemReadinessFreshnessSummary(
+        last_scan_at=latest_run.created_at if latest_run else None,
+        last_scan_age_minutes=last_scan_age_minutes,
+        max_stale_minutes=max_stale_minutes,
+        scan_fresh=scan_fresh,
+        total_count=len(rows),
+        stale_count=sum(
+            1
+            for row in rows
+            if row_is_bar_stale(row, settings) or _row_has_bad_freshness_flags(row)
+        ),
+        severe_stale_count=sum(
+            1 for row in rows if _row_severely_stale(row, settings)
+        ),
+    )
+
+def _build_system_readiness_response(
+    request: Request,
+    *,
+    scheduler_service: SchedulerService,
+    scan_repository: ScanRepository,
+    automation_service: AutomationService,
+) -> SystemReadinessResponse:
+    settings = get_settings()
+    db_ok = check_database_connection()
+    schema_status = get_schema_status()
+    scheduler_state = scheduler_service.state()
+    automation_status = automation_service.status()
+    latest_run = scan_repository.get_latest_run() if db_ok and schema_status.ok else None
+    rows = latest_run.results if latest_run else []
+    last_scan_at = latest_run.created_at if latest_run else None
+    last_scan_age_minutes, scan_fresh = compute_scan_freshness_fields(
+        last_scan_at=last_scan_at,
+        health_max_stale_minutes=settings.health_max_stale_minutes,
+    )
+    provider = _provider_summary(rows)
+    freshness = _freshness_summary(
+        latest_run=latest_run,
+        last_scan_age_minutes=last_scan_age_minutes,
+        scan_fresh=scan_fresh,
+        max_stale_minutes=settings.health_max_stale_minutes,
+    )
+    breaker_state = automation_status.breaker.state if automation_status.breaker else "unknown"
+    automation_ready = (
+        automation_status.enabled
+        and scheduler_state.enabled
+        and (scheduler_state.running or scheduler_state.worker_alive)
+        and not automation_status.kill_switch_enabled
+        and breaker_state != "open"
+    )
+    automation_summary = SystemReadinessAutomation(
+        scheduler_enabled=scheduler_state.enabled,
+        scheduler_running=scheduler_state.running,
+        worker_alive=scheduler_state.worker_alive,
+        automation_enabled=automation_status.enabled,
+        automation_phase=automation_status.phase,
+        automation_ready=automation_ready,
+        dry_run_only=automation_status.dry_run_only,
+        kill_switch_enabled=automation_status.kill_switch_enabled,
+        breaker_state=breaker_state,
+    )
+
+    reasons: list[str] = []
+    safety_blockers: list[str] = []
+    if not db_ok:
+        reasons.append("Database unavailable")
+        safety_blockers.append("Database unavailable")
+    if not schema_status.ok:
+        reasons.append("Schema check failed")
+        safety_blockers.append("Schema check failed")
+    if automation_status.kill_switch_enabled:
+        reasons.append("Kill switch on")
+        safety_blockers.append("Kill switch on")
+    if breaker_state == "open":
+        reasons.append("Circuit breaker open")
+        safety_blockers.append("Circuit breaker open")
+    if scan_fresh is False or (rows and all(_row_severely_stale(row, settings) for row in rows)):
+        reasons.append("Severe global freshness failure")
+    if rows and all(_row_provider_critical(row) and _row_unusable_or_stale(row, settings) for row in rows):
+        reasons.append("Provider critical with unusable/stale data")
+
+    top_rejection_reasons: list[dict[str, object]] = []
+    missed_windows_14d = 0
+    pending_prediction_resolutions = 0
+    if db_ok and schema_status.ok:
+        try:
+            top_rejection_reasons = scan_repository.get_top_rejection_reasons()
+            pending_prediction_resolutions = scan_repository.get_pending_prediction_count()
+        except Exception:
+            top_rejection_reasons = []
+            pending_prediction_resolutions = 0
+        try:
+            from app.services.scan_windows import ScanWindowService
+
+            window_service = ScanWindowService()
+            window_service.ensure_and_sweep()
+            missed_windows_14d = window_service.missed_count(lookback_days=14)
+        except Exception:
+            missed_windows_14d = 0
+
+    buy_count = sum(1 for row in rows if (row.decision_signal or "").upper() == "BUY")
+    # Candidate shortage and missed windows are first-class diagnostics, but they
+    # must not flip System Readiness to FAIL on an otherwise healthy host — they
+    # explain "why no candidates / did we miss a window?" without blocking paper use.
+    candidate_shortage = bool(rows) and buy_count < 3
+
+    if not reasons:
+        reasons.append("Core safety and data checks pass")
+
+    diagnostics = SystemReadinessDiagnostics(
+        top_rejection_reasons=top_rejection_reasons,
+        missed_windows_14d=missed_windows_14d,
+        pending_prediction_resolutions=pending_prediction_resolutions,
+        candidate_shortage=candidate_shortage,
+    )
+
+    return SystemReadinessResponse(
+        status="FAIL" if safety_blockers or reasons != ["Core safety and data checks pass"] else "PASS",
+        reasons=reasons,
+        safety_blockers=safety_blockers,
+        automation=automation_summary,
+        provider=provider,
+        freshness=freshness,
+        diagnostics=diagnostics,
         request_id=getattr(request.state, "request_id", None),
     )
 
@@ -171,6 +392,8 @@ async def readyz(
         schema_ok=schema_status.ok,
         missing_schema_items=schema_status.missing_items,
         scheduler_running=scheduler_state.running,
+        worker_alive=scheduler_state.worker_alive,
+        last_worker_heartbeat_at=scheduler_state.worker_heartbeat_at,
         last_scan_at=last_scan_at,
         last_scan_age_minutes=last_scan_age_minutes,
         max_stale_minutes=settings.health_max_stale_minutes,
@@ -196,6 +419,7 @@ async def readyz(
         pending_due_15m_count=trust_snapshot.pending_due_15m_count,
         pending_due_1h_count=trust_snapshot.pending_due_1h_count,
         pending_due_1d_count=trust_snapshot.pending_due_1d_count,
+        pending_due_1w_count=trust_snapshot.pending_due_1w_count,
         request_id=getattr(request.state, "request_id", None),
     )
 
@@ -265,14 +489,6 @@ async def get_latest_scan(
     return scanner_service.latest()
 
 
-@protected_router.get("/scan/history", response_model=list[ScanRun])
-async def get_scan_history(
-    limit: int = Query(default=12, ge=1, le=100),
-    scanner_service: ScannerService = Depends(get_scanner_service),
-) -> list[ScanRun]:
-    return scanner_service.history(limit=limit)
-
-
 @protected_router.get("/market/crypto/latest", response_model=CryptoMarketSnapshotResponse)
 async def get_latest_crypto_market_prices(
     market_data_service: CoinbaseMarketDataService = Depends(get_coinbase_market_data_service),
@@ -288,80 +504,6 @@ async def get_latest_decisions(
     return scan_repository.get_latest_decisions(limit=limit)
 
 
-@protected_router.get("/signals/validation/summary", response_model=ValidationSummary)
-async def get_signal_validation_summary(
-    asset_type: str | None = Query(default=None, pattern="^(stock|crypto)$"),
-    start: datetime | None = Query(default=None),
-    end: datetime | None = Query(default=None),
-    regime: str | None = Query(default=None, pattern="^(bullish|neutral|bearish)$"),
-    data_grade: str | None = Query(default=None, pattern="^(decision|research|degraded)$"),
-    scan_repository: ScanRepository = Depends(get_scan_repository),
-) -> ValidationSummary:
-    try:
-        start, end = _validate_time_window(start=start, end=end)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return scan_repository.get_signal_validation_summary(
-        asset_type=asset_type,
-        start=start,
-        end=end,
-        regime=regime,
-        data_grade=data_grade,
-    )
-
-
-@protected_router.get(
-    "/signals/validation/threshold-sweep",
-    response_model=ThresholdSweepResponse,
-)
-async def get_validation_threshold_sweep(
-    asset_type: str | None = Query(default=None, pattern="^(stock|crypto)$"),
-    start: datetime | None = Query(default=None),
-    end: datetime | None = Query(default=None),
-    scan_repository: ScanRepository = Depends(get_scan_repository),
-) -> ThresholdSweepResponse:
-    try:
-        start, end = _validate_time_window(start=start, end=end)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return scan_repository.get_validation_threshold_sweep(
-        asset_type=asset_type,
-        start=start,
-        end=end,
-    )
-
-
-@protected_router.get(
-    "/signals/validation/execution-alignment",
-    response_model=ExecutionAlignmentResponse,
-)
-async def get_execution_alignment_summary(
-    asset_type: str | None = Query(default=None, pattern="^(stock|crypto)$"),
-    start: datetime | None = Query(default=None),
-    end: datetime | None = Query(default=None),
-    friction_scenario: str = Query(default="base", pattern="^(base|stressed|worst)$"),
-    scan_repository: ScanRepository = Depends(get_scan_repository),
-) -> ExecutionAlignmentResponse:
-    try:
-        start, end = _validate_time_window(start=start, end=end)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return scan_repository.get_execution_alignment_summary(
-        asset_type=asset_type,
-        start=start,
-        end=end,
-        friction_scenario=friction_scenario,
-    )
-
-
-@protected_router.get("/journal/entries", response_model=list[JournalEntryResponse])
-async def list_journal_entries(
-    limit: int = Query(default=50, ge=1, le=200),
-    journal_repository: JournalRepository = Depends(get_journal_repository),
-) -> list[JournalEntryResponse]:
-    return journal_repository.list_entries(limit=limit)
-
-
 @protected_router.get("/orders/audits", response_model=list[ExecutionAuditSummary])
 async def list_execution_audits(
     limit: int = Query(default=50, ge=1, le=200),
@@ -371,6 +513,21 @@ async def list_execution_audits(
     return scan_repository.list_execution_audits(
         limit=limit,
         lifecycle_status=lifecycle_status,
+    )
+
+
+@protected_router.get("/system/readiness", response_model=SystemReadinessResponse)
+async def get_system_readiness(
+    request: Request,
+    scheduler_service: SchedulerService = Depends(get_scheduler_service),
+    scan_repository: ScanRepository = Depends(get_scan_repository),
+    automation_service: AutomationService = Depends(get_automation_service),
+) -> SystemReadinessResponse:
+    return _build_system_readiness_response(
+        request,
+        scheduler_service=scheduler_service,
+        scan_repository=scan_repository,
+        automation_service=automation_service,
     )
 
 
@@ -401,129 +558,64 @@ async def get_paper_ledger(
 async def get_paper_ledger_summary(
     scan_repository: ScanRepository = Depends(get_scan_repository),
 ) -> PaperLedgerSummaryResponse:
-    return scan_repository.get_paper_ledger_summary()
+    latest = scan_repository.get_latest_run()
+    mark_prices = {row.ticker: float(row.price) for row in (latest.results if latest else [])}
+    return scan_repository.get_paper_ledger_summary(
+        mark_prices=mark_prices or None,
+    )
 
 
-@protected_router.get("/journal/analytics", response_model=JournalAnalyticsResponse)
-async def get_journal_analytics(
-    journal_repository: JournalRepository = Depends(get_journal_repository),
-) -> JournalAnalyticsResponse:
-    return journal_repository.get_analytics()
-
-
-VOLATILITY_DECAY_FACTOR = 0.85
-TRADING_DAYS_PER_WEEK = 5
-PROJECTION_WEEKS = 4
-BASE_AMOUNT = 100.0
-
-
-def _compute_confidence_grade(
-    sample_count: int, *, in_band: bool, regime_data: bool
-) -> str:
-    if sample_count < 10:
-        return "D"
-    if not in_band:
-        return "C"
-    if sample_count >= 30 and regime_data:
-        return "A"
-    return "B"
-
-
-def _project_weeks(
-    *,
-    median_pct: float,
-    p25_pct: float,
-    p75_pct: float,
-) -> list[ProjectionWeek]:
-    weeks: list[ProjectionWeek] = []
-    med_val = BASE_AMOUNT
-    opt_val = BASE_AMOUNT
-    pes_val = BASE_AMOUNT
-
-    for week in range(1, PROJECTION_WEEKS + 1):
-        decay = VOLATILITY_DECAY_FACTOR ** (week - 1)
-        med_daily = 1 + (median_pct / 100) * decay
-        opt_daily = 1 + (p75_pct / 100) * decay
-        pes_daily = 1 + (p25_pct / 100) * decay
-
-        for _ in range(TRADING_DAYS_PER_WEEK):
-            med_val *= med_daily
-            opt_val *= opt_daily
-            pes_val *= pes_daily
-
-        weeks.append(
-            ProjectionWeek(
-                week=week,
-                median=round(med_val, 2),
-                optimistic_p75=round(opt_val, 2),
-                pessimistic_p25=round(pes_val, 2),
-            )
-        )
-
-    return weeks
-
-
-@protected_router.get(
-    "/scan/projection/{ticker:path}",
-    response_model=ProjectionResponse,
-)
-async def get_signal_projection(
-    ticker: str,
-    signal: str = Query(default="BUY", pattern="^(BUY|SELL)$"),
-    score_band: str = Query(default="0-59"),
+@protected_router.get("/proof/summary", response_model=ProofSummaryResponse)
+async def get_proof_summary(
     scan_repository: ScanRepository = Depends(get_scan_repository),
-    scanner_service: ScannerService = Depends(get_scanner_service),
-) -> ProjectionResponse:
-    ticker_upper = ticker.strip().upper()
-    if not ticker_upper:
-        raise HTTPException(status_code=422, detail="ticker is required")
-
-    latest = scanner_service.latest()
-    current_regime = latest.market_status if latest else None
-
-    stats = scan_repository.get_projection_outcome_stats(
-        signal=signal,
-        score_band=score_band,
-        current_regime=current_regime,
+    walk_forward_repository: WalkForwardRepository = Depends(get_walk_forward_repository),
+) -> ProofSummaryResponse:
+    settings = get_settings()
+    latest = scan_repository.get_latest_run()
+    mark_prices = {row.ticker: float(row.price) for row in (latest.results if latest else [])}
+    ledger_data = scan_repository.get_paper_ledger_summary(mark_prices=mark_prices or None)
+    ledger = (
+        ledger_data
+        if isinstance(ledger_data, PaperLedgerSummaryResponse)
+        else PaperLedgerSummaryResponse.model_validate(ledger_data)
     )
-
-    in_band = not stats.low_sample_size
-    grade = _compute_confidence_grade(
-        stats.sample_count, in_band=in_band, regime_data=stats.regime_data_available
+    audits = scan_repository.list_execution_audits(limit=200)
+    dry_runs = sum(1 for audit in audits if audit.lifecycle_status == "dry_run")
+    previewed = sum(1 for audit in audits if audit.lifecycle_status == "previewed")
+    blocked = sum(
+        1
+        for audit in audits
+        if audit.trade_gate_allowed is False or audit.lifecycle_status == "blocked"
     )
-
-    if grade == "D" or stats.median_daily_return_pct is None:
-        return ProjectionResponse(
-            base_amount=BASE_AMOUNT,
-            ticker=ticker_upper,
-            signal=signal,
-            score_band=score_band,
-            sample_count=stats.sample_count,
-            low_sample_size=stats.low_sample_size,
-            regime=current_regime,
-            regime_adjusted=False,
-            projections=[],
-            confidence_grade="D",
-        )
-
-    med = stats.median_daily_return_pct
-    p25 = stats.p25_daily_return_pct or med
-    p75 = stats.p75_daily_return_pct or med
-
-    if stats.regime_shift_pct is not None:
-        med += stats.regime_shift_pct
-        p25 += stats.regime_shift_pct
-        p75 += stats.regime_shift_pct
-
-    return ProjectionResponse(
-        base_amount=BASE_AMOUNT,
-        ticker=ticker_upper,
-        signal=signal,
-        score_band=score_band,
-        sample_count=stats.sample_count,
-        low_sample_size=stats.low_sample_size,
-        regime=current_regime,
-        regime_adjusted=stats.regime_data_available,
-        projections=_project_weeks(median_pct=med, p25_pct=p25, p75_pct=p75),
-        confidence_grade=grade,
+    last_scan_at = scan_repository.get_latest_run_timestamp()
+    _, scan_fresh = compute_scan_freshness_fields(
+        last_scan_at=last_scan_at,
+        health_max_stale_minutes=settings.health_max_stale_minutes,
+    )
+    return ProofSummaryResponse(
+        generated_at=datetime.now(timezone.utc),
+        ledger=ledger,
+        loop_metrics=ProofLoopMetrics(
+            recent_dry_runs=dry_runs,
+            recent_previewed=previewed,
+            recent_blocked=blocked,
+            total_audits=len(audits),
+        ),
+        prediction_accuracy=scan_repository.get_prediction_accuracy_summary(),
+        confidence_performance=scan_repository.get_confidence_performance(),
+        exit_window_accuracy=scan_repository.get_exit_window_accuracy_summary(),
+        weekly_evidence=scan_repository.get_weekly_evidence_progress(),
+        walk_forward=walk_forward_repository.get_latest_run_summary(),
+        live_forward=scan_repository.get_live_forward_progress(),
+        evidence_contract=[
+            EvidenceTrackDescriptor(**track) for track in evidence_track_manifest()
+        ],
+        last_scan_at=last_scan_at,
+        scan_fresh=scan_fresh,
+        mark_prices_source="latest_scan",
+        note=(
+            "Unrealized P/L uses latest scan prices. Horizon closes use live market prices."
+            if ledger.open_positions
+            else None
+        ),
     )

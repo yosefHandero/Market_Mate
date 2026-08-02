@@ -18,8 +18,14 @@ import app.services.execution as execution_module
 import app.services.readiness as readiness_module
 from app.db import SchemaStatus
 from app.dependencies import (
+    coinbase_market_data_service,
     execution_service as global_execution_service,
     scheduler_service as global_scheduler_service,
+)
+from app.schemas import (
+    OrderPlaceResponse,
+    ScanResult,
+    ScanRun,
 )
 
 
@@ -50,6 +56,7 @@ class MainRouteTests(unittest.TestCase):
             pending_due_15m_count=0,
             pending_due_1h_count=0,
             pending_due_1d_count=0,
+            pending_due_1w_count=0,
         )
 
     def setUp(self) -> None:
@@ -70,7 +77,11 @@ class MainRouteTests(unittest.TestCase):
             return_value=types.SimpleNamespace(
                 enabled=False,
                 running=False,
+                worker_alive=False,
                 interval_seconds=300,
+                lease_owner=None,
+                lease_expires_at=None,
+                worker_heartbeat_at=None,
                 next_run_at=None,
                 last_run_started_at=None,
                 last_run_finished_at=None,
@@ -78,7 +89,7 @@ class MainRouteTests(unittest.TestCase):
             )
         )
         fresh_scan = datetime.now(timezone.utc) - timedelta(minutes=5)
-        coinbase_settings = main_module.coinbase_market_data_service.settings
+        coinbase_settings = coinbase_market_data_service.settings
         original_coinbase_ws_enabled = coinbase_settings.coinbase_ws_enabled
         coinbase_settings.coinbase_ws_enabled = False
         self.addCleanup(
@@ -156,12 +167,14 @@ class MainRouteTests(unittest.TestCase):
         metrics_15m = {**metrics, "horizon": "15m"}
         metrics_1h = dict(metrics)
         metrics_1d = {**metrics, "horizon": "1d"}
+        metrics_1w = {**metrics, "horizon": "1w"}
         slice_summary = {
             "key": "overall",
             "total_signals": 1,
             "metrics_15m": metrics_15m,
             "metrics_1h": metrics_1h,
             "metrics_1d": metrics_1d,
+            "metrics_1w": metrics_1w,
         }
         return {
             "generated_at_field": "generated_at",
@@ -194,6 +207,55 @@ class MainRouteTests(unittest.TestCase):
                 ],
             },
         }
+
+    def _sample_scan_result(self, *, ticker: str = "AAPL") -> ScanResult:
+        return ScanResult(
+            ticker=ticker,
+            score=72.0,
+            raw_score=72.0,
+            calibrated_confidence=72.0,
+            decision_signal="BUY",
+            explanation="Momentum is expanding.",
+            price=100.0,
+            price_change_pct=1.2,
+            relative_volume=1.5,
+            sentiment_score=0.2,
+            filing_flag=False,
+            breakout_flag=True,
+            market_status="bullish",
+            sector_strength_score=0.4,
+            gate_passed=True,
+            gate_reason="Passed",
+            provider_status="ok",
+            bar_age_minutes=5,
+            created_at=datetime(2026, 3, 1, 12, 0),
+        )
+
+    def _sample_scan_run(self, results: list[ScanResult] | None = None) -> ScanRun:
+        rows = results if results is not None else [self._sample_scan_result()]
+        return ScanRun(
+            run_id="run-1",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            market_status="bullish",
+            scan_count=len(rows),
+            watchlist_size=len(rows),
+            alerts_sent=0,
+            fear_greed_value=None,
+            fear_greed_label=None,
+            results=rows,
+        )
+
+    def _sample_automation_status(self, **overrides):
+        status = types.SimpleNamespace(
+            enabled=False,
+            phase="disabled",
+            dry_run_only=True,
+            kill_switch_enabled=False,
+            breaker=types.SimpleNamespace(state="closed"),
+        )
+        for key, value in overrides.items():
+            setattr(status, key, value)
+        return status
 
     def test_health_response_does_not_expose_database_path(self) -> None:
         response = self.client.get("/health")
@@ -241,6 +303,43 @@ class MainRouteTests(unittest.TestCase):
 
         self.startup_maintenance_mock.assert_awaited_once()
 
+    def _assert_settings_reject_live_flags(
+        self,
+        *,
+        execution_enabled: bool,
+        allow_live_trading: bool,
+    ) -> None:
+        # Paper-only enforcement now lives in Settings.forbid_live_execution, so
+        # any process that loads settings with a live flag set fails fast at
+        # construction rather than relying on a single API startup assertion.
+        from pydantic import ValidationError
+
+        from app.config import Settings
+
+        with self.assertRaisesRegex(ValidationError, "Paper-only build enforcement"):
+            Settings(
+                execution_enabled=execution_enabled,
+                allow_live_trading=allow_live_trading,
+            )
+
+    def test_settings_reject_execution_enabled_true(self) -> None:
+        self._assert_settings_reject_live_flags(
+            execution_enabled=True,
+            allow_live_trading=False,
+        )
+
+    def test_settings_reject_allow_live_trading_true(self) -> None:
+        self._assert_settings_reject_live_flags(
+            execution_enabled=False,
+            allow_live_trading=True,
+        )
+
+    def test_settings_reject_both_live_flags_true(self) -> None:
+        self._assert_settings_reject_live_flags(
+            execution_enabled=True,
+            allow_live_trading=True,
+        )
+
     def test_readyz_reports_stale_scan_as_not_ready(self) -> None:
         with patch.object(
             main_module.scan_repository,
@@ -267,6 +366,51 @@ class MainRouteTests(unittest.TestCase):
         self.assertFalse(body["ready"])
         self.assertFalse(body["scan_fresh"])
         self.assertIsNone(body["last_scan_at"])
+
+    def test_scan_latest_returns_503_when_schema_missing_items(self) -> None:
+        missing_status = SchemaStatus(
+            ok=False,
+            applied_changes=[],
+            missing_items=["scan_results.bar_as_of"],
+        )
+        self.public_schema_status_mock.return_value = missing_status
+
+        with patch.object(
+            main_module.scanner_service,
+            "latest",
+            Mock(side_effect=AssertionError("schema-missing scan/latest should short-circuit")),
+        ):
+            response = self.client.get("/scan/latest")
+
+        self.assertEqual(response.status_code, 503)
+        body = response.json()
+        details = body.get("error", {}).get("details", {})
+        self.assertIn("missing_schema_items", details)
+        self.assertEqual(["scan_results.bar_as_of"], details["missing_schema_items"])
+
+    def test_livez_short_circuits_when_schema_missing_items(self) -> None:
+        missing_status = SchemaStatus(
+            ok=False,
+            applied_changes=[],
+            missing_items=["scan_results.bar_as_of"],
+        )
+        self.public_schema_status_mock.return_value = missing_status
+
+        with patch.object(
+            main_module.scan_repository,
+            "get_latest_run_timestamp",
+            Mock(side_effect=AssertionError("schema-missing livez should short-circuit")),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_trust_readiness_snapshot",
+            Mock(side_effect=AssertionError("schema-missing livez should short-circuit")),
+        ):
+            response = self.client.get("/livez")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["schema_ok"])
+        self.assertEqual(["scan_results.bar_as_of"], body["missing_schema_items"])
 
     def test_readyz_returns_503_when_schema_missing_items(self) -> None:
         missing_status = SchemaStatus(
@@ -382,9 +526,47 @@ class MainRouteTests(unittest.TestCase):
         latest_mock.assert_called_once()
 
     def test_removed_non_core_read_routes_return_404(self) -> None:
-        for path in ("/signals/outcomes", "/signals/outcomes/summary", "/metrics"):
+        for path in (
+            "/scan/history",
+            "/scan/history/AAPL",
+            "/signals/validation/summary",
+            "/signals/validation/threshold-sweep",
+            "/signals/validation/execution-alignment",
+            "/signals/outcomes",
+            "/signals/outcomes/summary",
+            "/signals/outcomes/AAPL",
+            "/scan/projection/AAPL",
+            "/journal/entries",
+            "/journal/analytics",
+            "/metrics",
+        ):
             response = self.client.get(path)
             self.assertEqual(response.status_code, 404, path)
+
+    def test_removed_non_core_admin_journal_routes_return_404(self) -> None:
+        original_admin_token = main_module.settings.admin_api_token
+        main_module.settings.admin_api_token = "secret-token"
+        self.addCleanup(setattr, main_module.settings, "admin_api_token", original_admin_token)
+
+        create_response = self.client.post(
+            "/journal/entries",
+            headers={"Authorization": "Bearer secret-token"},
+            json={
+                "ticker": "AAPL",
+                "run_id": "run-1",
+                "decision": "watching",
+                "entry_price": 180.0,
+                "notes": "removed product route",
+            },
+        )
+        update_response = self.client.patch(
+            "/journal/entries/99",
+            headers={"Authorization": "Bearer secret-token"},
+            json={"notes": "removed product route"},
+        )
+
+        self.assertEqual(create_response.status_code, 404)
+        self.assertEqual(update_response.status_code, 404)
 
     def test_orders_preview_returns_503_when_scanner_not_ready(self) -> None:
         original_admin = main_module.settings.admin_api_token
@@ -436,9 +618,68 @@ class MainRouteTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"]["code"], "dry_run_required")
+        # Paper-only build: dry_run=false is rejected at the schema boundary (422)
+        # before the handler runs.
+        self.assertEqual(response.status_code, 422)
         place_mock.assert_not_awaited()
+
+    def test_orders_place_rejects_live_and_unknown_modes_at_boundary(self) -> None:
+        original_admin = main_module.settings.admin_api_token
+        main_module.settings.admin_api_token = "preview-admin"
+        self.addCleanup(setattr, main_module.settings, "admin_api_token", original_admin)
+
+        for mode in ("live", "real", "production", "paperish"):
+            with self.subTest(mode=mode):
+                with patch.object(main_module.execution_service, "place", AsyncMock()) as place_mock:
+                    response = self.client.post(
+                        "/orders/place",
+                        headers={"Authorization": "Bearer preview-admin"},
+                        json={
+                            "ticker": "AAPL",
+                            "side": "buy",
+                            "qty": 1,
+                            "order_type": "market",
+                            "mode": mode,
+                            "dry_run": True,
+                        },
+                    )
+
+                # Only mode omitted or "dry_run" is accepted; anything else is a
+                # 422 schema rejection.
+                self.assertEqual(response.status_code, 422)
+                place_mock.assert_not_awaited()
+
+    def test_orders_place_defaults_omitted_dry_run_to_paper(self) -> None:
+        original_admin = main_module.settings.admin_api_token
+        main_module.settings.admin_api_token = "preview-admin"
+        self.addCleanup(setattr, main_module.settings, "admin_api_token", original_admin)
+        place_response = OrderPlaceResponse(
+            ok=True,
+            submitted=False,
+            dry_run=True,
+            message="Dry-run paper order recorded. No broker order request was made.",
+        )
+
+        with patch.object(
+            main_module.execution_service,
+            "place",
+            AsyncMock(return_value=place_response),
+        ) as place_mock:
+            response = self.client.post(
+                "/orders/place",
+                headers={"Authorization": "Bearer preview-admin"},
+                json={
+                    "ticker": "AAPL",
+                    "side": "buy",
+                    "qty": 1,
+                    "order_type": "market",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        request = place_mock.await_args.args[0]
+        self.assertTrue(request.dry_run)
+        self.assertIsNone(request.mode)
 
     def test_read_route_accepts_admin_token_when_read_token_is_configured(self) -> None:
         original_public = main_module.settings.public_read_access_enabled
@@ -601,6 +842,71 @@ class MainRouteTests(unittest.TestCase):
         self.assertEqual(body["budget"]["hourly_limit"], 6)
         status_mock.assert_called_once()
 
+    def test_system_readiness_route_returns_pass_with_automation_separate(self) -> None:
+        with patch.object(
+            public_module,
+            "check_database_connection",
+            Mock(return_value=True),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_latest_run",
+            Mock(return_value=self._sample_scan_run()),
+        ), patch.object(
+            main_module.automation_service,
+            "status",
+            Mock(return_value=self._sample_automation_status()),
+        ):
+            response = self.client.get("/system/readiness")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "PASS")
+        self.assertIn("Core safety and data checks pass", body["reasons"])
+        self.assertFalse(body["automation"]["automation_ready"])
+        self.assertFalse(body["automation"]["scheduler_enabled"])
+        self.assertEqual(body["provider"]["worst_status"], "ok")
+        self.assertEqual(body["freshness"]["total_count"], 1)
+        self.assertTrue(body["freshness"]["scan_fresh"])
+
+    def test_system_readiness_route_fails_for_safety_and_global_data_blockers(self) -> None:
+        breaker = types.SimpleNamespace(state="open")
+        critical_row = self._sample_scan_result(ticker="AAPL")
+        critical_row.provider_status = "critical"
+        critical_row.bar_age_minutes = 400
+        stale_row = self._sample_scan_result(ticker="TSLA")
+        stale_row.provider_status = "critical"
+        stale_row.bar_age_minutes = 500
+
+        with patch.object(
+            public_module,
+            "check_database_connection",
+            Mock(return_value=True),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_latest_run",
+            Mock(return_value=self._sample_scan_run([critical_row, stale_row])),
+        ), patch.object(
+            main_module.automation_service,
+            "status",
+            Mock(
+                return_value=self._sample_automation_status(
+                    kill_switch_enabled=True,
+                    breaker=breaker,
+                )
+            ),
+        ):
+            response = self.client.get("/system/readiness")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "FAIL")
+        self.assertIn("Kill switch on", body["safety_blockers"])
+        self.assertIn("Circuit breaker open", body["safety_blockers"])
+        self.assertIn("Severe global freshness failure", body["reasons"])
+        self.assertIn("Provider critical with unusable/stale data", body["reasons"])
+        self.assertTrue(body["automation"]["kill_switch_enabled"])
+        self.assertEqual(body["automation"]["breaker_state"], "open")
+
     def test_paper_ledger_summary_route_returns_backend_summary(self) -> None:
         with patch.object(
             main_module.scan_repository,
@@ -623,6 +929,85 @@ class MainRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["open_positions"], 1)
+        summary_mock.assert_called_once()
+
+    def test_proof_summary_route_returns_ledger_and_loop_metrics(self) -> None:
+        ledger = {
+            "open_positions": 1,
+            "closed_positions": 2,
+            "total_notional_usd": 120.0,
+            "total_realized_pnl": 14.5,
+            "total_closed_notional_usd": 210.0,
+            "long_positions": 1,
+            "short_positions": 0,
+            "last_opened_at": datetime(2026, 4, 1, 12, 0),
+            "last_closed_at": datetime(2026, 4, 1, 13, 0),
+            "total_count": 3,
+            "win_rate_pct": 50.0,
+            "gross_pnl_usd": 14.5,
+            "max_drawdown_usd": 3.0,
+            "total_unrealized_pnl": 8.25,
+        }
+        audits = [
+            Mock(lifecycle_status="dry_run", trade_gate_allowed=True),
+            Mock(lifecycle_status="previewed", trade_gate_allowed=True),
+            Mock(lifecycle_status="blocked", trade_gate_allowed=False),
+        ]
+        with patch.object(
+            main_module.scan_repository,
+            "get_latest_run",
+            Mock(return_value=None),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_paper_ledger_summary",
+            Mock(return_value=ledger),
+        ) as summary_mock, patch.object(
+            main_module.scan_repository,
+            "list_execution_audits",
+            Mock(return_value=audits),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_latest_run_timestamp",
+            Mock(return_value=datetime(2026, 4, 1, 12, 0)),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_prediction_accuracy_summary",
+            Mock(
+                return_value={
+                    "evaluated_count": 5,
+                    "pending_count": 2,
+                    "in_range_count": 3,
+                    "in_range_rate_pct": 60.0,
+                    "below_range_count": 1,
+                    "above_range_count": 1,
+                    "missed_count": 0,
+                    "note": "Low sample",
+                }
+            ),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_confidence_performance",
+            Mock(return_value={"ranking": {"buckets": [], "monotonic_by_group": None, "note": None}, "calibration": {"buckets": [], "mean_abs_reliability_gap_pct": None, "note": None}}),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_exit_window_accuracy_summary",
+            Mock(return_value={"evaluated_count": 0, "pending_count": 0, "helped_count": 0, "helped_rate_pct": None, "by_asset_type": [], "note": None}),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_weekly_evidence_progress",
+            Mock(return_value={"live_forward_samples": 0, "out_of_sample_samples": 0, "historical_samples": 0, "backfilled_replay_samples": 0, "min_live_forward_samples": 20, "min_out_of_sample_samples": 10, "min_historical_samples": 30, "min_backfilled_replay_samples": 20, "trust_sample_gate_met": False, "calibration_sample_gate_met": False}),
+        ):
+            response = self.client.get("/proof/summary")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["ledger"]["total_unrealized_pnl"], 8.25)
+        self.assertEqual(body["loop_metrics"]["recent_dry_runs"], 1)
+        self.assertEqual(body["loop_metrics"]["recent_previewed"], 1)
+        self.assertEqual(body["loop_metrics"]["recent_blocked"], 1)
+        self.assertEqual(body["loop_metrics"]["total_audits"], 3)
+        self.assertEqual(body["mark_prices_source"], "latest_scan")
+        self.assertEqual(body["prediction_accuracy"]["in_range_rate_pct"], 60.0)
         summary_mock.assert_called_once()
 
     def test_admin_paper_routes_return_promotion_and_reconciliation_reports(self) -> None:
@@ -670,76 +1055,6 @@ class MainRouteTests(unittest.TestCase):
         self.assertTrue(reconcile_response.json()["ok"])
         promotion_mock.assert_called_once()
         reconcile_mock.assert_called_once()
-
-    def test_create_journal_entry_normalizes_payload_for_authorized_admin(self) -> None:
-        original_admin_token = main_module.settings.admin_api_token
-        main_module.settings.admin_api_token = "secret-token"
-        self.addCleanup(setattr, main_module.settings, "admin_api_token", original_admin_token)
-
-        created_entry = {
-            "id": 7,
-            "ticker": "AAPL",
-            "run_id": "run-1",
-            "decision": "watching",
-            "entry_price": 180.0,
-            "exit_price": None,
-            "pnl_pct": None,
-            "notes": "trimmed note",
-            "created_at": datetime(2026, 3, 1, 12, 0),
-            "signal_label": None,
-            "score": None,
-            "news_source": None,
-        }
-
-        with patch.object(
-            main_module.journal_repository,
-            "create_entry",
-            Mock(return_value=created_entry),
-        ) as create_mock:
-            response = self.client.post(
-                "/journal/entries",
-                headers={"Authorization": "Bearer secret-token"},
-                json={
-                    "ticker": " aapl ",
-                    "run_id": " run-1 ",
-                    "decision": "watching",
-                    "entry_price": 180.0,
-                    "exit_price": None,
-                    "pnl_pct": None,
-                    "notes": "  trimmed note  ",
-                    "signal_label": None,
-                    "score": None,
-                    "news_source": None,
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        payload = create_mock.call_args.args[0]
-        self.assertEqual(payload.ticker, "AAPL")
-        self.assertEqual(payload.run_id, "run-1")
-        self.assertEqual(payload.notes, "trimmed note")
-        self.assertEqual(response.json()["ticker"], "AAPL")
-
-    def test_update_journal_entry_returns_404_when_missing(self) -> None:
-        original_admin_token = main_module.settings.admin_api_token
-        main_module.settings.admin_api_token = "secret-token"
-        self.addCleanup(setattr, main_module.settings, "admin_api_token", original_admin_token)
-
-        with patch.object(
-            main_module.journal_repository,
-            "update_entry",
-            Mock(return_value=None),
-        ) as update_mock:
-            response = self.client.patch(
-                "/journal/entries/99",
-                headers={"Authorization": "Bearer secret-token"},
-                json={"notes": "still missing"},
-            )
-
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json()["detail"], "Journal entry not found")
-        update_mock.assert_called_once()
-
 
 if __name__ == "__main__":
     unittest.main()

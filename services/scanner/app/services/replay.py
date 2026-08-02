@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from uuid import uuid4
+
 from app.clients.alpaca import AlpacaClient
 from app.config import get_settings
 from app.core.legacy_signals import compute_legacy_signal
@@ -24,6 +26,10 @@ from app.schemas import (
     ReplaySummary,
     VariantComparison,
 )
+from app.core.weekly_backtest import walk_forward_pattern_samples
+from app.core.weekly_patterns import detect_weekly_pattern, project_weekly_range
+from app.core.weekly_bar_utils import bars_as_of, close_price, sorted_bars
+from app.services.daily_bar_service import DailyBarService
 from app.services.repository import ScanRepository
 from app.services.scanner import ScannerService
 
@@ -72,14 +78,147 @@ class ReplayService:
         return self._build_item(symbol, usable_rows, len(usable_rows) - 1)
 
     def _future_price(self, rows: list[dict], *, observed_at: datetime, horizon: str) -> float | None:
-        target = observed_at + {"15m": timedelta(minutes=15), "1h": timedelta(hours=1), "1d": timedelta(days=1)}[horizon]
+        target = observed_at + {
+            "15m": timedelta(minutes=15),
+            "1h": timedelta(hours=1),
+            "1d": timedelta(days=1),
+            "1w": timedelta(days=7),
+        }[horizon]
         for row in rows:
             timestamp = self.alpaca._parse_bar_timestamp(row.get("t"))
             if timestamp >= target:
                 return float(row.get("c", 0) or 0) or None
         return None
 
+    async def _replay_weekly(self, request: ReplayRequest) -> ReplayResponse:
+        strategy_variant = request.strategy_variant or self.settings.scanner_strategy_variant or "layered-v4"
+        daily_bars = DailyBarService(alpaca=self.alpaca, settings=self.settings)
+        output_rows: list[ReplaySignalRow] = []
+        backfill_payloads: list[dict] = []
+        run_id = str(uuid4())
+
+        for symbol in request.symbols:
+            asset_type = self._asset_type_for_symbol(symbol)
+            bars, _ = await daily_bars.get_daily_bars(symbol, asset_type=asset_type, force_refresh=True)
+            samples = walk_forward_pattern_samples(
+                bars,
+                sample_source=request.sample_source,
+                warmup_bars=max(self.settings.weekly_daily_lookback_bars_min // 4, 60),
+                forward_days=self.settings.weekly_forward_days,
+                tolerance_days=self.settings.weekly_forward_tolerance_days,
+            )
+            for sample in samples:
+                if sample.as_of < request.start or sample.as_of > request.end:
+                    continue
+                pattern = detect_weekly_pattern(bars, as_of=sample.as_of)
+                if pattern is None:
+                    continue
+                usable = bars_as_of(bars, sample.as_of)
+                closes = [close_price(bar) for bar in sorted_bars(usable) if close_price(bar) > 0]
+                range_low, range_high = project_weekly_range(
+                    price=sample.entry_price,
+                    pattern=pattern,
+                    closes=closes,
+                )
+                output_rows.append(
+                    ReplaySignalRow(
+                        symbol=symbol,
+                        asset_type=asset_type,
+                        observed_at=sample.as_of,
+                        strategy_variant=strategy_variant,
+                        signal=pattern.decision_signal,
+                        raw_score=pattern.strength,
+                        calibrated_confidence=pattern.strength,
+                        evidence_quality="moderate",
+                        execution_eligibility="review",
+                        strategy_version=STRATEGY_VERSION,
+                        market_status="neutral",
+                        provider_status="ok",
+                        entry_price=round(sample.entry_price, 4),
+                        future_price=round(sample.future_price, 4),
+                        raw_return_pct=sample.return_pct,
+                        friction_adjusted_return_pct=(
+                            self.repo._apply_friction_to_return(sample.return_pct, asset_type=asset_type)
+                            if request.apply_friction
+                            else sample.return_pct
+                        ),
+                        horizon="1w",
+                    )
+                )
+                if request.persist_outcomes:
+                    backfill_payloads.append(
+                        {
+                            "run_id": run_id,
+                            "ticker": symbol,
+                            "asset_type": asset_type,
+                            "strategy_variant": strategy_variant,
+                            "signal": pattern.decision_signal,
+                            "confidence": pattern.strength,
+                            "calibrated_confidence": pattern.strength,
+                            "raw_score": pattern.strength,
+                            "entry_price": sample.entry_price,
+                            "generated_at": sample.as_of,
+                            "price_after_1w": sample.future_price,
+                            "return_after_1w": sample.return_pct,
+                            "evaluated_at_1w": sample.as_of + timedelta(days=self.settings.weekly_forward_days),
+                            "status_1w": "resolved",
+                            "sample_source": request.sample_source,
+                            "pattern_name": pattern.pattern_name,
+                            "gate_passed": False,
+                            "gate_reason": "Backfilled replay sample for calibration only.",
+                            "data_grade": "research",
+                        }
+                    )
+
+        if request.persist_outcomes and backfill_payloads:
+            self.repo.persist_weekly_backfill_outcomes(outcomes=backfill_payloads)
+
+        actionable_rows = [row for row in output_rows if row.signal in {"BUY", "SELL"}]
+        raw_returns = [row.raw_return_pct for row in actionable_rows if row.raw_return_pct is not None]
+        adjusted_returns = [
+            row.friction_adjusted_return_pct for row in actionable_rows if row.friction_adjusted_return_pct is not None
+        ]
+        win_rate = None
+        if raw_returns:
+            wins = sum(1 for value in raw_returns if value > 0)
+            win_rate = round((wins / len(raw_returns)) * 100, 2)
+        avg_return = round(sum(raw_returns) / len(raw_returns), 4) if raw_returns else None
+        avg_return_after_friction = round(sum(adjusted_returns) / len(adjusted_returns), 4) if adjusted_returns else None
+
+        return ReplayResponse(
+            strategy_id=STRATEGY_ID,
+            strategy_version=STRATEGY_VERSION,
+            strategy_variant=strategy_variant,
+            compare_strategy_variant=request.compare_strategy_variant,
+            start=request.start,
+            end=request.end,
+            interval_minutes=request.interval_minutes,
+            warmup_bars=request.warmup_bars,
+            apply_friction=request.apply_friction,
+            friction=self._friction(),
+            assumptions=[
+                ENTRY_ASSUMPTION,
+                EXIT_ASSUMPTION,
+                "Weekly replay uses only daily bars available as of each generated_at timestamp.",
+                "Backfilled replay samples support calibration only and do not satisfy real-money trust.",
+            ],
+            summary=ReplaySummary(
+                total_snapshots=len(output_rows),
+                actionable_signals=len(actionable_rows),
+                eligible_signals=0,
+                blocked_signals=len(actionable_rows),
+                win_rate=win_rate,
+                avg_return=avg_return,
+                avg_return_after_friction=avg_return_after_friction,
+                expectancy=avg_return,
+                expectancy_after_friction=avg_return_after_friction,
+            ),
+            rows=output_rows,
+        )
+
     async def replay(self, request: ReplayRequest) -> ReplayResponse:
+        if request.replay_mode == "weekly":
+            return await self._replay_weekly(request)
         strategy_variant = request.strategy_variant or self.settings.scanner_strategy_variant or "layered-v4"
         compare_strategy_variant = request.compare_strategy_variant
         symbols = request.symbols
@@ -363,3 +502,15 @@ class ReplayService:
             ),
             rows=output_rows,
         )
+
+    async def replay_and_persist(self, request: ReplayRequest) -> ReplayResponse:
+        response = await self.replay(request)
+        replay_id = str(uuid4())
+        self.repo.persist_strategy_replay_run(
+            replay_id=replay_id,
+            request_payload=request.model_dump(mode="json"),
+            response_payload=response.model_dump(mode="json"),
+            symbol_count=len(request.symbols),
+            snapshot_count=response.summary.total_snapshots,
+        )
+        return response

@@ -7,19 +7,16 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from app.auth import require_admin_access
 from app.dependencies import (
     get_execution_service,
-    get_journal_repository,
     get_promotion_service,
     get_replay_service,
     get_risk_service,
     get_scan_repository,
     get_scheduler_service,
     get_scanner_service,
+    get_walk_forward_proof_service,
 )
 from app.errors import AppError
 from app.schemas import (
-    JournalEntryCreateRequest,
-    JournalEntryResponse,
-    JournalEntryUpdateRequest,
     OrderPlaceRequest,
     OrderPlaceResponse,
     OrderPreviewRequest,
@@ -31,15 +28,18 @@ from app.schemas import (
     ScanRun,
     SignalOutcomePerformanceReportResponse,
     TradeEligibilityResponse,
+    WalkForwardProofRequest,
+    WalkForwardProofRunResponse,
+    WalkForwardRunSummary,
 )
 from app.services.execution import ExecutionService
-from app.services.journal_repository import JournalRepository
 from app.services.promotion import PromotionService
 from app.services.replay import ReplayService
 from app.services.repository import ScanRepository
 from app.services.risk import RiskService
 from app.services.scheduler import SchedulerService
 from app.services.scanner import ScannerService
+from app.services.walk_forward_proof import WalkForwardProofService
 
 router = APIRouter(dependencies=[Depends(require_admin_access)])
 
@@ -55,8 +55,31 @@ async def run_scan(
 async def replay_strategy(
     request: ReplayRequest,
     replay_service: ReplayService = Depends(get_replay_service),
+    persist: bool = Query(default=True),
 ) -> ReplayResponse:
+    if persist:
+        return await replay_service.replay_and_persist(request)
     return await replay_service.replay(request)
+
+
+@router.post("/proof/walkforward/run", response_model=WalkForwardProofRunResponse)
+async def run_walkforward_proof(
+    request: WalkForwardProofRequest,
+    proof_service: WalkForwardProofService = Depends(get_walk_forward_proof_service),
+    persist: bool = Query(default=True),
+) -> WalkForwardProofRunResponse:
+    run_id, summary = await proof_service.run(
+        symbols=request.symbols,
+        years=request.years,
+        step_days=request.step_days,
+        top_n_per_asset=request.top_n_per_asset,
+        force_refresh=request.force_refresh,
+        persist=persist,
+    )
+    return WalkForwardProofRunResponse(
+        run_id=run_id,
+        summary=WalkForwardRunSummary.model_validate(summary),
+    )
 
 
 @router.post("/scan/scheduler/start")
@@ -70,7 +93,8 @@ async def start_scheduler(
 async def stop_scheduler(
     scheduler_service: SchedulerService = Depends(get_scheduler_service),
 ) -> dict[str, bool]:
-    return {"stopped": scheduler_service.stop()}
+    scheduler_service.stop()
+    return {"stopped": True}
 
 
 @router.get(
@@ -111,6 +135,84 @@ async def get_paper_reconciliation(
     scan_repository: ScanRepository = Depends(get_scan_repository),
 ) -> ReconciliationReportResponse:
     return scan_repository.reconcile_paper_loop()
+
+
+@router.post("/paper/reconcile/repair", response_model=ReconciliationReportResponse)
+async def repair_paper_reconciliation(
+    scan_repository: ScanRepository = Depends(get_scan_repository),
+) -> ReconciliationReportResponse:
+    return scan_repository.repair_paper_reconcile_safe()
+
+
+@router.post("/signals/outcomes/backfill")
+async def backfill_signal_outcomes(
+    scanner_service: ScannerService = Depends(get_scanner_service),
+) -> dict[str, int | str]:
+    refreshed = await scanner_service.refresh_due_signal_outcomes()
+    closed = await scanner_service.close_open_positions_past_horizon()
+    predictions = await scanner_service.refresh_due_prediction_snapshots()
+    return {
+        "refreshed_outcomes": refreshed,
+        "refreshed_predictions": predictions,
+        "closed_positions": closed,
+        "status": "ok",
+    }
+
+
+async def _run_db_integrity_check() -> dict[str, object]:
+    from app.db import SessionLocal, engine
+    from app.services.db_integrity import run_db_integrity_check
+
+    with SessionLocal() as session:
+        report = run_db_integrity_check(session, engine=engine)
+    return report.as_dict()
+
+
+@router.get("/system/db/check")
+async def check_database_integrity_get() -> dict[str, object]:
+    """PRAGMA quick_check + immutable-record hash verification for the local DB."""
+    return await _run_db_integrity_check()
+
+
+@router.post("/system/db/check")
+async def check_database_integrity_post() -> dict[str, object]:
+    """Same integrity check as GET; POST is the canonical ops entrypoint."""
+    return await _run_db_integrity_check()
+
+
+def _campaigns_payload() -> dict[str, object]:
+    from app.services.evidence_campaign import EvidenceCampaignService
+
+    service = EvidenceCampaignService()
+    active = service.get_active_campaign()
+    return {
+        "active": active.as_dict() if active else None,
+        "campaigns": [campaign.as_dict() for campaign in service.list_campaigns()],
+    }
+
+
+@router.get("/evidence/campaigns")
+async def list_evidence_campaigns() -> dict[str, object]:
+    return _campaigns_payload()
+
+
+@router.get("/proof/campaigns")
+async def list_proof_campaigns() -> dict[str, object]:
+    """Canonical path for evidence campaigns (alias of /evidence/campaigns)."""
+    return _campaigns_payload()
+
+
+@router.get("/scan/windows")
+async def list_scan_windows(limit: int = 30) -> dict[str, object]:
+    from app.services.scan_windows import ScanWindowService
+
+    service = ScanWindowService()
+    service.ensure_and_sweep()
+    windows = service.list_recent(limit=limit)
+    return {
+        "missed_count_14d": service.missed_count(lookback_days=14),
+        "windows": [window.as_dict() for window in windows],
+    }
 
 
 @router.get("/risk/trade-eligibility", response_model=TradeEligibilityResponse)
@@ -155,33 +257,12 @@ async def place_order(
     x_idempotency_key: str | None = Header(default=None),
     execution_service: ExecutionService = Depends(get_execution_service),
 ) -> OrderPlaceResponse:
-    if request.mode != "dry_run" and not request.dry_run:
+    if request.mode not in (None, "dry_run") or request.dry_run is not True:
         raise AppError(
             message="Only dry-run paper orders are accepted by this endpoint.",
             status_code=400,
             code="dry_run_required",
         )
-    request.dry_run = True
     if request.idempotency_key is None and x_idempotency_key:
         request.idempotency_key = x_idempotency_key
     return await execution_service.place(request)
-
-
-@router.post("/journal/entries", response_model=JournalEntryResponse)
-async def create_journal_entry(
-    request: JournalEntryCreateRequest,
-    journal_repository: JournalRepository = Depends(get_journal_repository),
-) -> JournalEntryResponse:
-    return journal_repository.create_entry(request)
-
-
-@router.patch("/journal/entries/{entry_id}", response_model=JournalEntryResponse)
-async def update_journal_entry(
-    entry_id: int,
-    request: JournalEntryUpdateRequest,
-    journal_repository: JournalRepository = Depends(get_journal_repository),
-) -> JournalEntryResponse:
-    updated = journal_repository.update_entry(entry_id, request)
-    if not updated:
-        raise HTTPException(status_code=404, detail="Journal entry not found")
-    return updated

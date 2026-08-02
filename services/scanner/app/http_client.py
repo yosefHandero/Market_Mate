@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import random
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Awaitable, Callable
@@ -9,6 +11,10 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+RETRY_JITTER_RATIO = 0.2
 
 
 class ProviderRequestError(RuntimeError):
@@ -28,6 +34,12 @@ class ProviderRequestError(RuntimeError):
         self.retryable = retryable
         self.retry_after_seconds = retry_after_seconds
         self.status_code = status_code
+
+
+def _apply_retry_jitter(delay_seconds: float) -> float:
+    if delay_seconds <= 0:
+        return 0.0
+    return delay_seconds * (1.0 + random.uniform(0.0, RETRY_JITTER_RATIO))
 
 
 def _body_preview(response: httpx.Response) -> str:
@@ -154,25 +166,55 @@ async def request_json(
     method: str,
     url: str,
     provider: str = "external_provider",
-    on_backoff: Callable[[float], Awaitable[None] | None] | None = None,
+    on_backoff: Callable[..., Awaitable[None] | None] | None = None,
     **kwargs: Any,
 ) -> Any:
     settings = get_settings()
     last_error: Exception | None = None
-    for attempt in range(1, settings.provider_retry_attempts + 2):
+    max_attempts = settings.provider_retry_attempts + 1
+    for attempt in range(1, max_attempts + 2):
         try:
             response = await client.request(method, url, **kwargs)
             return parse_json_response(response, provider=provider, url=url)
         except ProviderRequestError as exc:
             last_error = exc
+            if exc.status_code == 429:
+                logger.warning(
+                    "provider rate limited",
+                    extra={
+                        "event": "provider_rate_limited",
+                        "provider": provider,
+                        "url": url,
+                        "status_code": exc.status_code,
+                        "retry_after_seconds": exc.retry_after_seconds,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                    },
+                )
             if not exc.retryable or attempt > settings.provider_retry_attempts:
                 raise
-            delay_seconds = max(
-                settings.provider_retry_backoff_seconds * attempt,
-                float(exc.retry_after_seconds or 0.0),
+            delay_seconds = _apply_retry_jitter(
+                max(
+                    settings.provider_retry_backoff_seconds * attempt,
+                    float(exc.retry_after_seconds or 0.0),
+                )
+            )
+            logger.info(
+                "provider retry scheduled",
+                extra={
+                    "event": "provider_retry",
+                    "provider": provider,
+                    "url": url,
+                    "attempt": attempt,
+                    "delay_seconds": round(delay_seconds, 3),
+                    "status_code": exc.status_code,
+                },
             )
             if on_backoff is not None:
-                maybe_result = on_backoff(delay_seconds)
+                maybe_result = on_backoff(
+                    delay_seconds,
+                    rate_limited=exc.status_code == 429,
+                )
                 if asyncio.iscoroutine(maybe_result):
                     await maybe_result
             await asyncio.sleep(delay_seconds)
@@ -180,9 +222,20 @@ async def request_json(
             last_error = exc
             if attempt > settings.provider_retry_attempts:
                 raise
-            delay_seconds = settings.provider_retry_backoff_seconds * attempt
+            delay_seconds = _apply_retry_jitter(settings.provider_retry_backoff_seconds * attempt)
+            logger.warning(
+                "provider request timeout or transport error",
+                extra={
+                    "event": "provider_timeout",
+                    "provider": provider,
+                    "url": url,
+                    "attempt": attempt,
+                    "delay_seconds": round(delay_seconds, 3),
+                    "error_type": type(exc).__name__,
+                },
+            )
             if on_backoff is not None:
-                maybe_result = on_backoff(delay_seconds)
+                maybe_result = on_backoff(delay_seconds, rate_limited=False)
                 if asyncio.iscoroutine(maybe_result):
                     await maybe_result
             await asyncio.sleep(delay_seconds)

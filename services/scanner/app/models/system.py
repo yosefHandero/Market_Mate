@@ -18,6 +18,7 @@ class SchedulerStateORM(Base):
     last_run_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_run_finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    worker_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 

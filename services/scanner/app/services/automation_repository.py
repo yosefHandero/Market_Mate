@@ -333,9 +333,43 @@ class AutomationRepository:
                 open_quantity = float(open_position.quantity or 0.0)
                 if open_quantity <= 0:
                     return None
+                sell_quantity = min(qty, open_quantity)
                 open_basis = float(open_position.cost_basis_usd or open_position.notional_usd or 0.0)
-                proceeds = round(open_quantity * simulated_fill_price, 2)
-                realized_pnl = round(proceeds - open_basis, 2)
+                basis_per_unit = open_basis / open_quantity if open_quantity > 0 else 0.0
+                closed_basis = round(basis_per_unit * sell_quantity, 2)
+                proceeds = round(sell_quantity * simulated_fill_price, 2)
+                realized_pnl = round(proceeds - closed_basis, 2)
+                if sell_quantity < open_quantity - 1e-9:
+                    remaining_quantity = round(open_quantity - sell_quantity, 6)
+                    remaining_basis = round(basis_per_unit * remaining_quantity, 2)
+                    closed_position = PaperPositionORM(
+                        created_at=filled_time,
+                        updated_at=filled_time,
+                        intent_key=f"{intent_key}:partial:{audit.id}",
+                        execution_audit_id=audit.id,
+                        ticker=audit.ticker,
+                        asset_type=audit.asset_type,
+                        side="buy",
+                        quantity=sell_quantity,
+                        simulated_fill_price=float(open_position.simulated_fill_price or simulated_fill_price),
+                        notional_usd=closed_basis,
+                        cost_basis_usd=closed_basis,
+                        close_price=simulated_fill_price,
+                        realized_pnl=realized_pnl,
+                        status="closed",
+                        opened_at=open_position.opened_at,
+                        closed_at=filled_time,
+                        strategy_version=open_position.strategy_version,
+                        confidence=open_position.confidence,
+                    )
+                    session.add(closed_position)
+                    open_position.quantity = remaining_quantity
+                    open_position.cost_basis_usd = remaining_basis
+                    open_position.notional_usd = remaining_basis
+                    open_position.updated_at = filled_time
+                    session.commit()
+                    session.refresh(closed_position)
+                    return closed_position.id
                 open_position.close_price = simulated_fill_price
                 open_position.realized_pnl = realized_pnl
                 open_position.closed_at = filled_time

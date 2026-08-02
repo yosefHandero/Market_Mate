@@ -179,47 +179,28 @@ class ExecutionService:
             session.commit()
 
     def _enforce_execution_safeguards(self) -> None:
-        if (
-            self.settings.execution_enabled
-            and "paper-api" not in self.settings.alpaca_base_url
-            and not self.settings.allow_live_trading
-        ):
+        if self.settings.execution_enabled or self.settings.allow_live_trading:
             raise AppError(
-                message="Live trading is disabled. Set ALLOW_LIVE_TRADING=true to use a non-paper broker URL.",
+                message=(
+                    "Paper-only build forbids EXECUTION_ENABLED=true or ALLOW_LIVE_TRADING=true; "
+                    "broker order submission cannot be enabled."
+                ),
                 status_code=409,
-                code="live_trading_disabled",
+                code="paper_only_execution_forbidden",
             )
 
-    def _enforce_live_rollout_caps(self, *, request: OrderPlaceRequest, preview: OrderPreviewResponse) -> None:
-        is_live_route = "paper-api" not in self.settings.alpaca_base_url
-        if not is_live_route:
-            return
-        if request.qty > self.settings.live_trading_max_qty:
+    def _enforce_paper_only_request(self, request: OrderPreviewRequest, *, placement: bool) -> None:
+        if request.mode not in (None, "dry_run"):
             raise AppError(
-                message=(
-                    f"Live rollout qty {request.qty} exceeds conservative max qty "
-                    f"{self.settings.live_trading_max_qty}."
-                ),
-                status_code=409,
-                code="live_rollout_qty_exceeded",
+                message='Only dry-run paper orders are accepted; mode must be omitted or "dry_run".',
+                status_code=400,
+                code="dry_run_required",
             )
-        if preview.notional_estimate > self.settings.live_trading_max_notional:
+        if placement and getattr(request, "dry_run", True) is not True:
             raise AppError(
-                message=(
-                    f"Live rollout notional ${preview.notional_estimate:.2f} exceeds conservative max "
-                    f"${self.settings.live_trading_max_notional:.2f}."
-                ),
-                status_code=409,
-                code="live_rollout_notional_exceeded",
-            )
-        if preview.trade_gate and preview.trade_gate.execution_eligibility != "eligible":
-            raise AppError(
-                message=(
-                    "Live rollout only allows trades with explicit execution eligibility "
-                    f"'eligible'; got {preview.trade_gate.execution_eligibility}."
-                ),
-                status_code=409,
-                code="live_rollout_requires_explicit_eligibility",
+                message="Only dry-run paper orders are accepted; dry_run=false is forbidden.",
+                status_code=400,
+                code="dry_run_required",
             )
 
     def _response_from_existing_audit(self, row: ExecutionAuditORM) -> OrderPlaceResponse:
@@ -262,6 +243,8 @@ class ExecutionService:
         return round((target_price - entry_price) * qty * direction, 2)
 
     async def preview(self, request: OrderPreviewRequest) -> OrderPreviewResponse:
+        self._enforce_paper_only_request(request, placement=False)
+        self._enforce_execution_safeguards()
         self._enforce_operational_readiness()
         self._enforce_kill_switch()
         ticker = request.ticker.upper()
@@ -271,8 +254,7 @@ class ExecutionService:
             latest_price = await self.alpaca.get_latest_price(ticker)
         price_for_estimate = request.limit_price or latest_price
         warnings: list[str] = []
-        if not self.settings.execution_enabled:
-            warnings.append("Execution is disabled. Preview only until EXECUTION_ENABLED=true.")
+        warnings.append("Paper-only build: broker submission is permanently disabled.")
         trade_gate = self.risk.evaluate_trade(
             ticker=ticker,
             side=request.side,
@@ -325,13 +307,7 @@ class ExecutionService:
         return preview
 
     async def place(self, request: OrderPlaceRequest) -> OrderPlaceResponse:
-        if request.mode != "dry_run" and not request.dry_run:
-            raise AppError(
-                message="Only dry-run paper orders are accepted by this service.",
-                status_code=400,
-                code="dry_run_required",
-            )
-        request.dry_run = True
+        self._enforce_paper_only_request(request, placement=True)
         self._enforce_kill_switch()
         self._enforce_execution_safeguards()
         existing = self._find_existing_idempotent_result(request.idempotency_key)
@@ -349,6 +325,7 @@ class ExecutionService:
                     status_code=409,
                     code="idempotency_payload_mismatch",
                 )
+            self._enforce_operational_readiness()
             return self._response_from_existing_audit(existing)
 
         preview = await self.preview(request)
@@ -372,88 +349,44 @@ class ExecutionService:
                 execution_audit_id=preview.execution_audit_id,
                 recommended_action_snapshot=request.recommended_action_snapshot,
             )
-        if request.dry_run or not self.settings.execution_enabled:
-            self._update_audit(
-                audit_id=preview.execution_audit_id,
-                submitted=False,
-                lifecycle_status="dry_run",
-                broker_status="dry_run",
-                broker_payload=preview.model_dump(mode="json"),
-            )
-            if (
-                request.dry_run
-                and preview.execution_audit_id is not None
-                and preview.trade_gate is not None
-                and preview.trade_gate.allowed
-                and preview.latest_price > 0
-            ):
-                try:
-                    ledger_id = self._scan_repository.record_paper_position_from_audit(
-                        audit_id=preview.execution_audit_id,
-                        simulated_fill_price=float(preview.latest_price),
-                    )
-                except Exception:
-                    ledger_id = None
-                    logger.exception(
-                        "Failed to persist manual dry-run paper position for audit %s.",
-                        preview.execution_audit_id,
-                    )
-            else:
-                ledger_id = None
-            return OrderPlaceResponse(
-                ok=True,
-                submitted=False,
-                dry_run=True,
-                message="Dry run only. Order was not sent to Alpaca.",
-                idempotency_key=request.idempotency_key,
-                raw=preview.model_dump(),
-                trade_gate=preview.trade_gate,
-                execution_audit_id=preview.execution_audit_id,
-                ledger_id=ledger_id,
-                fill_price=preview.latest_price,
-                filled_qty=preview.qty,
-                slippage_assumption_bps=0.0,
-                recommended_action_snapshot=request.recommended_action_snapshot,
-            )
-
-        self._enforce_live_rollout_caps(request=request, preview=preview)
-
-        try:
-            raw = await self.alpaca.submit_order(
-                symbol=request.ticker.upper(),
-                side=request.side,
-                qty=request.qty,
-                order_type=request.order_type,
-                limit_price=request.limit_price,
-                idempotency_key=request.idempotency_key,
-            )
-        except Exception as exc:
-            self._update_audit(
-                audit_id=preview.execution_audit_id,
-                submitted=False,
-                lifecycle_status="failed",
-                broker_status="failed",
-                broker_payload={},
-                error_message=str(exc),
-            )
-            raise
         self._update_audit(
             audit_id=preview.execution_audit_id,
-            submitted=True,
-            lifecycle_status="submitted",
-            broker_status=str(raw.get("status") or "submitted"),
-            broker_order_id=raw.get("id"),
-            broker_payload=raw,
+            submitted=False,
+            lifecycle_status="dry_run",
+            broker_status="dry_run",
+            broker_payload=preview.model_dump(mode="json"),
         )
+        if (
+            preview.execution_audit_id is not None
+            and preview.trade_gate is not None
+            and preview.trade_gate.allowed
+            and preview.latest_price > 0
+        ):
+            try:
+                ledger_id = self._scan_repository.record_paper_position_from_audit(
+                    audit_id=preview.execution_audit_id,
+                    simulated_fill_price=float(preview.latest_price),
+                )
+            except Exception:
+                ledger_id = None
+                logger.exception(
+                    "Failed to persist manual dry-run paper position for audit %s.",
+                    preview.execution_audit_id,
+                )
+        else:
+            ledger_id = None
         return OrderPlaceResponse(
             ok=True,
-            submitted=True,
-            dry_run=False,
-            message="Order submitted to Alpaca.",
+            submitted=False,
+            dry_run=True,
+            message="Dry-run paper order recorded. No broker order request was made.",
             idempotency_key=request.idempotency_key,
-            order_id=raw.get("id"),
-            status=raw.get("status"),
-            raw=raw,
+            raw=preview.model_dump(),
             trade_gate=preview.trade_gate,
             execution_audit_id=preview.execution_audit_id,
+            ledger_id=ledger_id,
+            fill_price=preview.latest_price,
+            filled_qty=preview.qty,
+            slippage_assumption_bps=0.0,
+            recommended_action_snapshot=request.recommended_action_snapshot,
         )

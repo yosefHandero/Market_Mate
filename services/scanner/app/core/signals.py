@@ -22,6 +22,9 @@ class SignalComputation:
 
 def compute_signal_and_explanation(
     *,
+    buy_threshold: float = 52.0,
+    sell_threshold: float = 52.0,
+    signal_margin: float = 6.0,
     ticker: str,
     price: float,
     price_change_pct: float,
@@ -46,6 +49,10 @@ def compute_signal_and_explanation(
     trend_strength_pct: float = 0.0,
 ) -> SignalComputation:
     directional = compute_directional_scores(
+        asset_type=asset_type,
+        buy_threshold=buy_threshold,
+        sell_threshold=sell_threshold,
+        signal_margin=signal_margin,
         relative_volume=relative_volume,
         price_change_pct=price_change_pct,
         breakout_flag=breakout_flag,

@@ -36,9 +36,23 @@ yarn-error.log*
 codex-changes.diff
 **/codex-changes.diff
 **/codex-changes.diff~
+diff.txt
+**/diff.txt
 latest-*-diff.txt
 latest-safe-diff.txt
 latest-full-diff.txt
 latest-ui-polish-diff.txt
 services/scanner/*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
 services/scanner/backups/
+# Local DB backup copies (never committed)
+*.bak
+*.db.bak-*
+
+# Graphify generated knowledge graph
+graphify-out/
