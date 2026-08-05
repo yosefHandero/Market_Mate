@@ -135,6 +135,49 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         self.assertEqual(run.alerts_sent, 0)
         service.repo.save_run.assert_called_once()
 
+    def test_daily_bar_service_shares_provider_clients(self) -> None:
+        service = ScannerService()
+        self.assertIs(service.daily_bar_service.alpaca, service.alpaca)
+        self.assertIs(service.daily_bar_service.polygon, service.polygon)
+
+    def test_run_scan_bounds_daily_bar_fetch_with_concurrency_limit(self) -> None:
+        service = ScannerService()
+        stocks = ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA"]
+        original_watchlist = service.settings.watchlist
+        original_crypto_watchlist = service.settings.crypto_watchlist
+        service.settings.watchlist = ",".join(stocks)
+        service.settings.crypto_watchlist = ""
+        self.addCleanup(setattr, service.settings, "watchlist", original_watchlist)
+        self.addCleanup(setattr, service.settings, "crypto_watchlist", original_crypto_watchlist)
+
+        limit = 2
+        service._analyze_semaphore = asyncio.Semaphore(limit)
+
+        concurrency = {"cur": 0, "max": 0, "calls": 0}
+
+        async def _tracked_get_daily_bars(symbol, *, asset_type=None, force_refresh=False):
+            concurrency["calls"] += 1
+            concurrency["cur"] += 1
+            concurrency["max"] = max(concurrency["max"], concurrency["cur"])
+            await asyncio.sleep(0.01)
+            concurrency["cur"] -= 1
+            return ([], "cache")
+
+        service.daily_bar_service.get_daily_bars = _tracked_get_daily_bars
+        service._refresh_due_signal_outcomes = AsyncMock(return_value=0)
+        service._refresh_due_prediction_snapshots = AsyncMock(return_value=0)
+        service.alpaca.get_latest_bars = AsyncMock(return_value={ticker: {} for ticker in stocks})
+        service.fear_greed.get_index = AsyncMock(return_value=(50, "neutral"))
+        service._compute_market_status = MagicMock(return_value=("neutral", 0.0, 0.0))
+        service._analyze_ticker = AsyncMock(return_value=None)
+        service.alerts.dispatch_for_run = AsyncMock(return_value=0)
+        service.repo.save_run = MagicMock()
+
+        asyncio.run(service.run_scan())
+
+        self.assertGreaterEqual(concurrency["calls"], len(stocks))
+        self.assertLessEqual(concurrency["max"], limit)
+
     def test_provider_health_marks_placeholder_sec_user_agent_as_degraded(self) -> None:
         service = ScannerService()
         original_user_agent = service.settings.sec_user_agent

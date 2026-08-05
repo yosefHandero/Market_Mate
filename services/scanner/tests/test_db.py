@@ -2,8 +2,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import tempfile
-from threading import Thread
-import time
+from threading import Event, Thread
 import unittest
 
 from alembic import command
@@ -102,6 +101,8 @@ class SchemaMigrationTests(unittest.TestCase):
     def test_scan_save_retries_after_real_transient_sqlite_write_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"
+            # Short busy timeout so the first blocked write fails quickly and
+            # save_run's retry loop is exercised instead of waiting on SQLite.
             engine = db_module.create_scanner_engine(
                 f"sqlite:///{database_path.as_posix()}",
                 busy_timeout_ms=25,
@@ -115,6 +116,7 @@ class SchemaMigrationTests(unittest.TestCase):
             )
             db_module.Base.metadata.create_all(engine)
             locker = engine.raw_connection()
+            first_lock_failure = Event()
             result: dict[str, object] = {}
             try:
                 locker.execute("BEGIN IMMEDIATE")
@@ -123,7 +125,22 @@ class SchemaMigrationTests(unittest.TestCase):
                     try:
                         repo = ScanRepository()
                         with patch.object(repository_module, "SessionLocal", SessionLocal):
-                            with patch.object(repo, "_save_run_once", wraps=repo._save_run_once) as save_once:
+                            original_save_once = repo._save_run_once
+
+                            def _tracked_save_once(run: ScanRun) -> None:
+                                try:
+                                    original_save_once(run)
+                                except OperationalError as exc:
+                                    # Publish only after a real lock failure so
+                                    # the main thread cannot release early and
+                                    # let the first attempt succeed (flaky under load).
+                                    if repository_module._is_transient_sqlite_lock(exc):
+                                        first_lock_failure.set()
+                                    raise
+
+                            with patch.object(
+                                repo, "_save_run_once", side_effect=_tracked_save_once
+                            ) as save_once:
                                 repo.save_run(_scan_run("locked-run"))
                                 result["attempts"] = save_once.call_count
                         result["ok"] = True
@@ -132,9 +149,12 @@ class SchemaMigrationTests(unittest.TestCase):
 
                 thread = Thread(target=save_run)
                 thread.start()
-                time.sleep(0.4)
+                self.assertTrue(
+                    first_lock_failure.wait(timeout=2.0),
+                    "save_run never hit a sqlite write lock while BEGIN IMMEDIATE was held",
+                )
                 locker.commit()
-                thread.join(timeout=3)
+                thread.join(timeout=5)
 
                 self.assertFalse(thread.is_alive())
                 error = result.get("error")

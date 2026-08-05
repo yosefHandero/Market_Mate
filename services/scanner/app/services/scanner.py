@@ -88,7 +88,7 @@ class ScannerService:
         self.alerts = AlertService()
         self.repo = ScanRepository()
         self.market_data_service = market_data_service or CoinbaseMarketDataService()
-        self.daily_bar_service = DailyBarService()
+        self.daily_bar_service = DailyBarService(alpaca=self.alpaca, polygon=self.polygon)
         self.weekly_prediction_service = WeeklyPredictionService(
             daily_bars=self.daily_bar_service,
             repository=self.repo,
@@ -1545,14 +1545,15 @@ class ScannerService:
         stock_market_daily_bars: list[dict] | None = None
         crypto_market_daily_bars: list[dict] | None = None
         if self.settings.weekly_primary_horizon_enabled:
-            daily_fetch_pairs = await asyncio.gather(
-                *[
-                    self.daily_bar_service.get_daily_bars(
+            async def _fetch_daily_bounded(ticker: str) -> tuple[list[dict], str]:
+                async with self._analyze_semaphore:
+                    return await self.daily_bar_service.get_daily_bars(
                         ticker,
                         asset_type="stock" if ticker not in crypto_watchlist else "crypto",
                     )
-                    for ticker in watchlist
-                ]
+
+            daily_fetch_pairs = await asyncio.gather(
+                *[_fetch_daily_bounded(ticker) for ticker in watchlist]
             )
             for ticker, (bars, _) in zip(watchlist, daily_fetch_pairs):
                 daily_bars_by_symbol[ticker] = bars

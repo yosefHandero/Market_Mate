@@ -15,6 +15,10 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 RETRY_JITTER_RATIO = 0.2
+# Cap provider-dictated Retry-After / backoff sleeps. A single 429 carrying a
+# large Retry-After must not freeze a scan for minutes while the provider guard
+# holds its pace lock. Matches RATE_LIMIT_COOLDOWN_SECONDS in provider_resilience.
+MAX_RETRY_BACKOFF_SECONDS = 60.0
 
 
 class ProviderRequestError(RuntimeError):
@@ -194,9 +198,12 @@ async def request_json(
             if not exc.retryable or attempt > settings.provider_retry_attempts:
                 raise
             delay_seconds = _apply_retry_jitter(
-                max(
-                    settings.provider_retry_backoff_seconds * attempt,
-                    float(exc.retry_after_seconds or 0.0),
+                min(
+                    max(
+                        settings.provider_retry_backoff_seconds * attempt,
+                        float(exc.retry_after_seconds or 0.0),
+                    ),
+                    MAX_RETRY_BACKOFF_SECONDS,
                 )
             )
             logger.info(
