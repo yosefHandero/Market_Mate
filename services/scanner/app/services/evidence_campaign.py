@@ -30,9 +30,18 @@ from app.services.walk_forward_proof import code_commit
 
 
 # Evidence-relevant settings whose change should start a new campaign.
+# Membership is live-scan identity: watchlists, thresholds, weekly prediction,
+# candidate filters, calibration, selection, friction, evidence classification,
+# shared proof_* quality knobs the live weekly path reads, and provider-overlay
+# toggles that can change stored signal/score/confidence/ranking/selection.
+# Excluded on purpose: walk-forward-admin-only proof window/pilot keys, auth,
+# scheduler, cache TTLs, paper-loop/portfolio sizing, and other operational
+# knobs that cannot change prediction results under unchanged market inputs.
 _FINGERPRINT_SETTING_KEYS = (
+    # Watchlists / universe
     "watchlist",
     "crypto_watchlist",
+    # Trade-gate evidence thresholds (also used by risk path)
     "trade_gate_enabled",
     "trade_gate_horizon",
     "trade_gate_min_evaluated_count",
@@ -40,12 +49,14 @@ _FINGERPRINT_SETTING_KEYS = (
     "trade_gate_min_avg_return",
     "trade_gate_crypto_buy_min_evaluated_count",
     "trade_gate_allowed_signals",
+    # Intraday signal thresholds
     "signal_buy_threshold",
     "signal_sell_threshold",
     "signal_margin",
     "signal_crypto_buy_threshold",
     "signal_crypto_sell_threshold",
     "signal_crypto_margin",
+    # Weekly horizon / friction
     "weekly_forward_days",
     "weekly_primary_horizon_enabled",
     "stock_slippage_bps",
@@ -54,6 +65,56 @@ _FINGERPRINT_SETTING_KEYS = (
     "crypto_slippage_bps",
     "crypto_spread_bps",
     "crypto_fee_bps",
+    # Strategy identity + top-pick selection
+    "scanner_strategy_variant",
+    "top_pick_limit",
+    "upside_prob_shrinkage_k",
+    "health_max_stale_minutes",
+    "provider_max_bar_age_minutes",
+    # Live weekly prediction / calibration / filters
+    "weekly_apply_calibration_map",
+    "weekly_apply_proof_candidate_filters",
+    "weekly_forward_tolerance_days",
+    "weekly_hold_return_tolerance_pct",
+    "weekly_daily_lookback_bars_min",
+    "weekly_daily_lookback_bars_preferred",
+    "weekly_daily_lookback_bars_max",
+    "weekly_daily_bar_max_age_days_stock",
+    "weekly_daily_bar_max_age_days_crypto",
+    "weekly_trust_window_days",
+    "trust_recent_window_days",
+    "calibration_min_signal_samples",
+    "calibration_min_score_band_samples",
+    "validation_win_threshold_pct",
+    "validation_false_positive_threshold_pct",
+    # Evidence classification / pattern trust gates
+    "weekly_out_of_sample_holdout_ratio",
+    "track_hold_outcomes",
+    "weekly_pattern_gate_min_historical_samples",
+    "weekly_pattern_gate_min_backfilled_samples",
+    "weekly_pattern_gate_min_live_forward_samples",
+    "weekly_pattern_gate_min_out_of_sample_samples",
+    "weekly_pattern_gate_min_win_rate",
+    "weekly_pattern_gate_min_avg_return",
+    # Shared proof_* knobs read by the live weekly prediction path
+    "proof_step_days",
+    "proof_momentum_lookback_days",
+    "proof_min_expected_value_pct",
+    "proof_rsi_overbought",
+    "proof_min_pattern_samples",
+    "proof_min_pattern_edge_pct",
+    "proof_require_buy_hold_baseline",
+    "proof_volume_lookback_days",
+    "proof_min_volume_median_ratio",
+    # Provider overlays that can change score, confidence, eligibility, or ranking
+    "news_trigger_abs_move_pct",
+    "sec_enhanced_enabled",
+    "marketdata_options_enabled",
+    "binance_enabled",
+    "deribit_enabled",
+    "fred_enabled",
+    "internal_breadth_enabled",
+    "defillama_enabled",
 )
 
 
