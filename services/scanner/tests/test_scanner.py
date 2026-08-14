@@ -178,6 +178,32 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         self.assertGreaterEqual(concurrency["calls"], len(stocks))
         self.assertLessEqual(concurrency["max"], limit)
 
+    def test_run_scan_caps_inline_outcome_refresh(self) -> None:
+        service = ScannerService()
+        original_watchlist = service.settings.watchlist
+        original_crypto_watchlist = service.settings.crypto_watchlist
+        service.settings.watchlist = "AAPL"
+        service.settings.crypto_watchlist = ""
+        self.addCleanup(setattr, service.settings, "watchlist", original_watchlist)
+        self.addCleanup(setattr, service.settings, "crypto_watchlist", original_crypto_watchlist)
+
+        service._refresh_due_signal_outcomes = AsyncMock(return_value=0)
+        service._refresh_due_prediction_snapshots = AsyncMock(return_value=0)
+        service.daily_bar_service.get_daily_bars = AsyncMock(return_value=([], "cache"))
+        service.alpaca.get_latest_bars = AsyncMock(return_value={"AAPL": {}})
+        service.fear_greed.get_index = AsyncMock(return_value=(50, "neutral"))
+        service._compute_market_status = MagicMock(return_value=("neutral", 0.0, 0.0))
+        service._analyze_ticker = AsyncMock(return_value=None)
+        service.alerts.dispatch_for_run = AsyncMock(return_value=0)
+        service.repo.save_run = MagicMock()
+
+        asyncio.run(service.run_scan())
+
+        signal_kwargs = service._refresh_due_signal_outcomes.await_args.kwargs
+        prediction_kwargs = service._refresh_due_prediction_snapshots.await_args.kwargs
+        self.assertEqual(signal_kwargs.get("limit"), service._SCAN_INLINE_REFRESH_LIMIT)
+        self.assertEqual(prediction_kwargs.get("limit"), service._SCAN_INLINE_REFRESH_LIMIT)
+
     def test_provider_health_marks_placeholder_sec_user_agent_as_degraded(self) -> None:
         service = ScannerService()
         original_user_agent = service.settings.sec_user_agent

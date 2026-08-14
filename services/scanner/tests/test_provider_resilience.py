@@ -146,6 +146,24 @@ class HttpClientResilienceTests(unittest.TestCase):
         self.assertEqual(client.request.await_count, 2)
 
 
+class ProviderGuardThrottleTests(unittest.TestCase):
+    def test_throttle_sleeps_outside_pace_lock(self) -> None:
+        """Concurrent waiters must not serialize behind a held pace lock."""
+        guard = AsyncProviderGuard("test", pace_seconds=0.02)
+
+        async def run() -> float:
+            loop = asyncio.get_running_loop()
+            guard._next_allowed_at = loop.time() + 0.25
+            started = loop.time()
+            await asyncio.gather(*(guard.throttle() for _ in range(5)))
+            return loop.time() - started
+
+        elapsed = asyncio.run(run())
+        # Old bug slept inside the lock (~5 * 0.25s). Fixed path sleeps in parallel.
+        self.assertLess(elapsed, 0.7)
+        self.assertGreaterEqual(elapsed, 0.25)
+
+
 class ProviderCacheTests(unittest.TestCase):
     def test_stale_cache_serve_is_observable_via_last_served_stale_for(self) -> None:
         guard = AsyncProviderGuard("test")

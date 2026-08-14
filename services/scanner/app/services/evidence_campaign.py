@@ -1,14 +1,16 @@
 """Evidence campaigns: frozen strategy+config windows for live-forward collection.
 
 A campaign is opened the first time a scan runs and stays active until a
-meaningful strategy or evidence-relevant configuration change alters the config
-fingerprint. On such a change the active campaign is closed
-(``close_reason="config_change"``) and a new one opened, so incompatible results
+meaningful strategy/evidence-relevant configuration change alters the config
+fingerprint, or until the running code commit changes. On such a change the
+active campaign is closed (``close_reason="config_change"`` or
+``close_reason="code_change"``) and a new one opened, so incompatible results
 never mix in the same qualifying sample.
 
 The fingerprint intentionally covers only evidence-relevant settings (not every
 knob), documented in ``_FINGERPRINT_SETTING_KEYS``; trivial, non-evidence tweaks
-do not churn campaigns.
+do not churn campaigns. Code-commit rotation keeps live-forward evidence pinned
+to the exact software that produced it.
 """
 
 from __future__ import annotations
@@ -181,6 +183,7 @@ class EvidenceCampaignService:
     ) -> CampaignProvenance:
         now = now or datetime.now(timezone.utc)
         fingerprint = campaign_config_fingerprint(self.settings)
+        current_commit = code_commit()
         with self._session_factory() as session:
             active = session.execute(
                 select(EvidenceCampaignORM)
@@ -188,15 +191,24 @@ class EvidenceCampaignService:
                 .order_by(EvidenceCampaignORM.started_at.desc())
             ).scalars().first()
 
-            if active is not None and active.config_fingerprint == fingerprint:
-                return self._provenance(active)
-
             if active is not None:
-                # Fingerprint changed: close the stale campaign, open a fresh one so
-                # results collected under different assumptions never mix.
+                fingerprint_changed = active.config_fingerprint != fingerprint
+                # Rotate when HEAD moves so live-forward rows stay pinned to the
+                # software that produced them. Unknown/None commits do not force
+                # rotation (dev checkouts without git metadata).
+                code_changed = (
+                    current_commit is not None
+                    and active.code_commit is not None
+                    and active.code_commit != current_commit
+                )
+                if not fingerprint_changed and not code_changed:
+                    return self._provenance(active)
+
                 active.status = "closed"
                 active.ended_at = now
-                active.close_reason = "config_change"
+                active.close_reason = (
+                    "config_change" if fingerprint_changed else "code_change"
+                )
 
             campaign = EvidenceCampaignORM(
                 campaign_id=self._new_campaign_id(fingerprint, now),
@@ -207,7 +219,7 @@ class EvidenceCampaignService:
                 strategy_version=STRATEGY_VERSION,
                 feature_version=FEATURE_VERSION,
                 config_fingerprint=fingerprint,
-                code_commit=code_commit(),
+                code_commit=current_commit,
                 close_reason=None,
                 notes_json=None,
             )

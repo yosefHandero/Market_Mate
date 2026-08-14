@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, text
@@ -81,6 +81,12 @@ def record_hash_for_snapshot(values: dict[str, Any]) -> str:
 
 def _normalize(value: Any) -> Any:
     if isinstance(value, datetime):
+        # SQLite often returns naive timestamps; write-time values are UTC-aware.
+        # Normalize both to UTC ISO so verification matches the stored hash.
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
         return value.isoformat()
     if isinstance(value, float):
         return round(value, 8)

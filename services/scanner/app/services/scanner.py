@@ -65,6 +65,9 @@ class ScannerService:
         "1d": {"timeframe": "1Hour", "max_search_minutes": 7 * 24 * 60},
         "1w": {"timeframe": "1Day", "max_search_minutes": 14 * 24 * 60},
     }
+    # Keep /scan/run from drowning in the due-outcome backlog so the live-forward
+    # campaign can open. Full backlog drains via admin backfill / worker refresh.
+    _SCAN_INLINE_REFRESH_LIMIT = 32
 
     def __init__(
         self,
@@ -444,47 +447,56 @@ class ScannerService:
             return symbol.split("/", 1)[0]
         return symbol
 
-    async def _refresh_due_signal_outcomes(self, observed_at: datetime) -> int:
-        pending = self.repo.list_due_signal_outcome_evaluations(observed_at=observed_at)
+    async def _refresh_due_signal_outcomes(
+        self,
+        observed_at: datetime,
+        *,
+        limit: int | None = None,
+    ) -> int:
+        pending = self.repo.list_due_signal_outcome_evaluations(
+            observed_at=observed_at,
+            limit=limit,
+        )
         if not pending:
             return 0
 
         async def resolve(
             evaluation: PendingSignalOutcomeEvaluation,
         ) -> OutcomeEvaluationUpdate | None:
-            lookup = self._OUTCOME_LOOKUP_CONFIG[evaluation.horizon]
-            try:
-                if evaluation.asset_type == "crypto":
-                    price = await self.alpaca.get_crypto_price_on_or_after_timestamp(
-                        evaluation.ticker,
-                        evaluation.target_at,
-                        max_search_minutes=lookup["max_search_minutes"],
-                        timeframe=lookup["timeframe"],
-                    )
-                else:
-                    price = await self.alpaca.get_price_on_or_after_timestamp(
-                        evaluation.ticker,
-                        evaluation.target_at,
-                        max_search_minutes=lookup["max_search_minutes"],
-                        timeframe=lookup["timeframe"],
-                    )
-            except Exception:
-                price = None
-            comparable_observed_at = observed_at
-            comparable_expires_at = evaluation.expires_at
-            if observed_at.tzinfo is None and evaluation.expires_at.tzinfo is not None:
-                comparable_expires_at = evaluation.expires_at.replace(tzinfo=None)
-            elif observed_at.tzinfo is not None and evaluation.expires_at.tzinfo is None:
-                comparable_observed_at = observed_at.replace(tzinfo=None)
-            if price is None and comparable_observed_at < comparable_expires_at:
-                return None
-            return OutcomeEvaluationUpdate(
-                outcome_id=evaluation.outcome_id,
-                horizon=evaluation.horizon,
-                status="resolved" if price is not None else "missed",
-                price=price,
-                evaluated_at=observed_at,
-            )
+            async with self._analyze_semaphore:
+                lookup = self._OUTCOME_LOOKUP_CONFIG[evaluation.horizon]
+                try:
+                    if evaluation.asset_type == "crypto":
+                        price = await self.alpaca.get_crypto_price_on_or_after_timestamp(
+                            evaluation.ticker,
+                            evaluation.target_at,
+                            max_search_minutes=lookup["max_search_minutes"],
+                            timeframe=lookup["timeframe"],
+                        )
+                    else:
+                        price = await self.alpaca.get_price_on_or_after_timestamp(
+                            evaluation.ticker,
+                            evaluation.target_at,
+                            max_search_minutes=lookup["max_search_minutes"],
+                            timeframe=lookup["timeframe"],
+                        )
+                except Exception:
+                    price = None
+                comparable_observed_at = observed_at
+                comparable_expires_at = evaluation.expires_at
+                if observed_at.tzinfo is None and evaluation.expires_at.tzinfo is not None:
+                    comparable_expires_at = evaluation.expires_at.replace(tzinfo=None)
+                elif observed_at.tzinfo is not None and evaluation.expires_at.tzinfo is None:
+                    comparable_observed_at = observed_at.replace(tzinfo=None)
+                if price is None and comparable_observed_at < comparable_expires_at:
+                    return None
+                return OutcomeEvaluationUpdate(
+                    outcome_id=evaluation.outcome_id,
+                    horizon=evaluation.horizon,
+                    status="resolved" if price is not None else "missed",
+                    price=price,
+                    evaluated_at=observed_at,
+                )
 
         resolved = await asyncio.gather(*(resolve(item) for item in pending))
         completed = [item for item in resolved if item is not None]
@@ -622,55 +634,64 @@ class ScannerService:
             "exit_window_helped": outcome.exit_window_helped,
         }
 
-    async def _refresh_due_prediction_snapshots(self, observed_at: datetime) -> int:
-        pending = self.repo.list_due_prediction_evaluations(observed_at=observed_at)
+    async def _refresh_due_prediction_snapshots(
+        self,
+        observed_at: datetime,
+        *,
+        limit: int | None = None,
+    ) -> int:
+        pending = self.repo.list_due_prediction_evaluations(
+            observed_at=observed_at,
+            limit=limit,
+        )
         if not pending:
             return 0
 
         async def resolve(
             evaluation: PendingPredictionEvaluation,
         ) -> PredictionEvaluationUpdate | None:
-            lookup = self._OUTCOME_LOOKUP_CONFIG[evaluation.horizon]
-            try:
-                if evaluation.asset_type == "crypto":
-                    price = await self.alpaca.get_crypto_price_on_or_after_timestamp(
-                        evaluation.ticker,
-                        evaluation.target_at,
-                        max_search_minutes=lookup["max_search_minutes"],
-                        timeframe=lookup["timeframe"],
-                    )
-                else:
-                    price = await self.alpaca.get_price_on_or_after_timestamp(
-                        evaluation.ticker,
-                        evaluation.target_at,
-                        max_search_minutes=lookup["max_search_minutes"],
-                        timeframe=lookup["timeframe"],
-                    )
-            except Exception:
-                price = None
-            comparable_observed_at = observed_at
-            comparable_expires_at = evaluation.expires_at
-            if observed_at.tzinfo is None and evaluation.expires_at.tzinfo is not None:
-                comparable_expires_at = evaluation.expires_at.replace(tzinfo=None)
-            elif observed_at.tzinfo is not None and evaluation.expires_at.tzinfo is None:
-                comparable_observed_at = observed_at.replace(tzinfo=None)
-            if price is None and comparable_observed_at < comparable_expires_at:
-                return None
-            exit_fields = await self._build_exit_window_fields(evaluation, price=price)
-            return PredictionEvaluationUpdate(
-                snapshot_id=evaluation.snapshot_id,
-                status="resolved" if price is not None else "missed",
-                price=price,
-                evaluated_at=observed_at,
-                exit_window_status=str(exit_fields.get("exit_window_status"))
-                if exit_fields.get("exit_window_status") is not None
-                else None,
-                exit_hit=exit_fields.get("exit_hit") if exit_fields else None,
-                invalidation_hit=exit_fields.get("invalidation_hit") if exit_fields else None,
-                protected_return_pct=exit_fields.get("protected_return_pct") if exit_fields else None,
-                hold_return_pct=exit_fields.get("hold_return_pct") if exit_fields else None,
-                exit_window_helped=exit_fields.get("exit_window_helped") if exit_fields else None,
-            )
+            async with self._analyze_semaphore:
+                lookup = self._OUTCOME_LOOKUP_CONFIG[evaluation.horizon]
+                try:
+                    if evaluation.asset_type == "crypto":
+                        price = await self.alpaca.get_crypto_price_on_or_after_timestamp(
+                            evaluation.ticker,
+                            evaluation.target_at,
+                            max_search_minutes=lookup["max_search_minutes"],
+                            timeframe=lookup["timeframe"],
+                        )
+                    else:
+                        price = await self.alpaca.get_price_on_or_after_timestamp(
+                            evaluation.ticker,
+                            evaluation.target_at,
+                            max_search_minutes=lookup["max_search_minutes"],
+                            timeframe=lookup["timeframe"],
+                        )
+                except Exception:
+                    price = None
+                comparable_observed_at = observed_at
+                comparable_expires_at = evaluation.expires_at
+                if observed_at.tzinfo is None and evaluation.expires_at.tzinfo is not None:
+                    comparable_expires_at = evaluation.expires_at.replace(tzinfo=None)
+                elif observed_at.tzinfo is not None and evaluation.expires_at.tzinfo is None:
+                    comparable_observed_at = observed_at.replace(tzinfo=None)
+                if price is None and comparable_observed_at < comparable_expires_at:
+                    return None
+                exit_fields = await self._build_exit_window_fields(evaluation, price=price)
+                return PredictionEvaluationUpdate(
+                    snapshot_id=evaluation.snapshot_id,
+                    status="resolved" if price is not None else "missed",
+                    price=price,
+                    evaluated_at=observed_at,
+                    exit_window_status=str(exit_fields.get("exit_window_status"))
+                    if exit_fields.get("exit_window_status") is not None
+                    else None,
+                    exit_hit=exit_fields.get("exit_hit") if exit_fields else None,
+                    invalidation_hit=exit_fields.get("invalidation_hit") if exit_fields else None,
+                    protected_return_pct=exit_fields.get("protected_return_pct") if exit_fields else None,
+                    hold_return_pct=exit_fields.get("hold_return_pct") if exit_fields else None,
+                    exit_window_helped=exit_fields.get("exit_window_helped") if exit_fields else None,
+                )
 
         resolved = await asyncio.gather(*(resolve(item) for item in pending))
         completed = [item for item in resolved if item is not None]
@@ -1486,8 +1507,14 @@ class ScannerService:
         crypto_watchlist = self.settings.crypto_watchlist_items
         watchlist = stock_watchlist + crypto_watchlist
         observed_at = datetime.now(timezone.utc)
-        await self.refresh_due_signal_outcomes(observed_at=observed_at)
-        await self.refresh_due_prediction_snapshots(observed_at=observed_at)
+        await self.refresh_due_signal_outcomes(
+            observed_at=observed_at,
+            limit=self._SCAN_INLINE_REFRESH_LIMIT,
+        )
+        await self.refresh_due_prediction_snapshots(
+            observed_at=observed_at,
+            limit=self._SCAN_INLINE_REFRESH_LIMIT,
+        )
         stock_bars_task = (
             self._get_stock_bars_with_fallback(stock_watchlist)
             if stock_watchlist
@@ -1683,14 +1710,26 @@ class ScannerService:
             await self.automation_service.process_completed_run(run)
         return run
 
-    async def refresh_due_signal_outcomes(self, *, observed_at: datetime | None = None) -> int:
+    async def refresh_due_signal_outcomes(
+        self,
+        *,
+        observed_at: datetime | None = None,
+        limit: int | None = None,
+    ) -> int:
         return await self._refresh_due_signal_outcomes(
-            observed_at=observed_at or datetime.now(timezone.utc)
+            observed_at=observed_at or datetime.now(timezone.utc),
+            limit=limit,
         )
 
-    async def refresh_due_prediction_snapshots(self, *, observed_at: datetime | None = None) -> int:
+    async def refresh_due_prediction_snapshots(
+        self,
+        *,
+        observed_at: datetime | None = None,
+        limit: int | None = None,
+    ) -> int:
         return await self._refresh_due_prediction_snapshots(
-            observed_at=observed_at or datetime.now(timezone.utc)
+            observed_at=observed_at or datetime.now(timezone.utc),
+            limit=limit,
         )
 
     def latest(self) -> ScanRun | None:

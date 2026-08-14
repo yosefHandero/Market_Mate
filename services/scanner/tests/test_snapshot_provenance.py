@@ -143,6 +143,16 @@ class SnapshotProvenanceTests(unittest.TestCase):
         tampered["entry_price"] = 101.0
         self.assertNotEqual(original, record_hash_for_snapshot(tampered))
 
+    def test_record_hash_treats_naive_generated_at_as_utc(self) -> None:
+        from datetime import timezone
+
+        base = self._base_kwargs()
+        aware = dict(base)
+        aware["generated_at"] = base["generated_at"].replace(tzinfo=timezone.utc)
+        naive = dict(base)
+        naive["generated_at"] = base["generated_at"].replace(tzinfo=None)
+        self.assertEqual(record_hash_for_snapshot(aware), record_hash_for_snapshot(naive))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -167,6 +167,26 @@ class EvidenceCampaignServiceTests(unittest.TestCase):
         self.assertEqual(statuses[first.campaign_id], ("closed", "config_change"))
         self.assertEqual(statuses[rotated.campaign_id][0], "active")
 
+    def test_code_commit_change_rotates_campaign(self) -> None:
+        from unittest.mock import patch
+
+        with patch("app.services.evidence_campaign.code_commit", return_value="aaa111"):
+            first = self._service().get_or_create_active_campaign()
+
+        with patch("app.services.evidence_campaign.code_commit", return_value="bbb222"):
+            rotated = self._service().get_or_create_active_campaign()
+
+        self.assertNotEqual(first.campaign_id, rotated.campaign_id)
+        self.assertEqual(first.config_fingerprint, rotated.config_fingerprint)
+        self.assertEqual(rotated.code_commit, "bbb222")
+        self.assertEqual(self._campaign_count(), 2)
+
+        with self.SessionLocal() as session:
+            rows = session.execute(select(EvidenceCampaignORM)).scalars().all()
+            statuses = {row.campaign_id: (row.status, row.close_reason) for row in rows}
+        self.assertEqual(statuses[first.campaign_id], ("closed", "code_change"))
+        self.assertEqual(statuses[rotated.campaign_id][0], "active")
+
     def test_fingerprint_is_stable_for_same_settings(self) -> None:
         self.assertEqual(
             campaign_config_fingerprint(self.settings),

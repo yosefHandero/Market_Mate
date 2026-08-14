@@ -37,12 +37,16 @@ class AsyncProviderGuard:
         if self.pace_seconds <= 0:
             return
         loop = asyncio.get_running_loop()
-        async with self._pace_lock:
-            now = loop.time()
-            wait_seconds = max(self._next_allowed_at - now, 0.0)
-            if wait_seconds > 0:
-                await asyncio.sleep(wait_seconds)
-            self._next_allowed_at = max(self._next_allowed_at, loop.time()) + self.pace_seconds
+        # Sleep outside the pace lock so a long Retry-After / cooldown wait does
+        # not convoy every other provider caller behind one held lock.
+        while True:
+            async with self._pace_lock:
+                now = loop.time()
+                wait_seconds = max(self._next_allowed_at - now, 0.0)
+                if wait_seconds <= 0:
+                    self._next_allowed_at = max(self._next_allowed_at, now) + self.pace_seconds
+                    return
+            await asyncio.sleep(wait_seconds)
 
     async def register_backoff(
         self,
