@@ -17,6 +17,12 @@ from app.models.scan import PaperPositionORM
 
 
 class PaperHorizonCloseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repo = repository_module.ScanRepository()
+        original_horizon = self.repo.settings.trade_gate_horizon
+        self.addCleanup(setattr, self.repo.settings, "trade_gate_horizon", original_horizon)
+        self.repo.settings.trade_gate_horizon = "1h"
+
     def test_horizon_close_uses_market_price_not_entry_fill(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"
@@ -57,9 +63,8 @@ class PaperHorizonCloseTests(unittest.TestCase):
                     )
                     session.commit()
 
-                repo = repository_module.ScanRepository()
                 with patch.object(repository_module, "SessionLocal", SessionLocal):
-                    closed = repo.close_open_positions_past_horizon(
+                    closed = self.repo.close_open_positions_past_horizon(
                         observed_at=datetime.now(timezone.utc),
                         market_prices={"AAPL": 110.0},
                     )
@@ -72,7 +77,7 @@ class PaperHorizonCloseTests(unittest.TestCase):
                 self.assertEqual(position.realized_pnl, 20.0)
 
                 with patch.object(repository_module, "SessionLocal", SessionLocal):
-                    legacy = repo.close_open_positions_past_horizon(
+                    legacy = self.repo.close_open_positions_past_horizon(
                         observed_at=datetime.now(timezone.utc),
                         market_prices=None,
                     )
@@ -120,9 +125,8 @@ class PaperHorizonCloseTests(unittest.TestCase):
                     )
                     session.commit()
 
-                repo = repository_module.ScanRepository()
                 with patch.object(repository_module, "SessionLocal", SessionLocal):
-                    closed = repo.close_open_positions_past_horizon(
+                    closed = self.repo.close_open_positions_past_horizon(
                         observed_at=datetime.now(timezone.utc),
                         market_prices={},
                     )

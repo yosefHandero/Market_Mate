@@ -42,6 +42,9 @@ class PaperLoopE2ETests(unittest.TestCase):
             Base.metadata.create_all(engine)
             try:
                 repo = ScanRepository()
+                original_horizon = repo.settings.trade_gate_horizon
+                self.addCleanup(setattr, repo.settings, "trade_gate_horizon", original_horizon)
+                repo.settings.trade_gate_horizon = "1h"
                 run = ScanRun(
                     run_id="loop-run-1",
                     created_at=now,

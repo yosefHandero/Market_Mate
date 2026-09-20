@@ -25,6 +25,7 @@ class RepositoryCalibrationTests(unittest.TestCase):
             "outcome_baseline_min_mean_return_pct",
             "outcome_report_min_evaluated_per_horizon",
             "track_hold_outcomes",
+            "trade_gate_horizon",
             "validation_false_positive_threshold_pct",
             "validation_primary_horizon",
             "validation_win_threshold_pct",
@@ -34,6 +35,8 @@ class RepositoryCalibrationTests(unittest.TestCase):
             for name in mutable_setting_names
         }
         self.addCleanup(self._restore_settings, original_values)
+        self.repo.settings.trade_gate_horizon = "1h"
+        self.repo.settings.validation_primary_horizon = "1h"
 
     def _restore_settings(self, original_values: dict[str, object]) -> None:
         for name, value in original_values.items():
