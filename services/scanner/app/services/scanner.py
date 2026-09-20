@@ -26,9 +26,10 @@ from app.core.decision_presentation import (
     cap_confidence_by_data_quality,
 )
 from app.core.freshness_policy import unified_bar_freshness_max_age_minutes
-from app.core.legacy_signals import compute_legacy_signal
-from app.core.structural_prediction import evaluate_exit_window_outcome_with_disambiguation
-from app.core.ranking import display_sort_key, is_buy_candidate
+from app.brain.gates import is_buy_candidate
+from app.brain.structural_prediction import evaluate_exit_window_outcome_with_disambiguation
+from app.brain.weekly_evidence import evaluate_weekly_pattern_evidence
+from app.core.ranking import display_sort_key
 from app.core.selection import apply_top_pick_selection
 from app.core.scoring import TREND_SMA_WINDOW, market_status_from_change
 from app.core.signals import compute_signal_and_explanation
@@ -41,7 +42,7 @@ from app.provider_models import (
     FREDMacroSnapshot,
     SECCatalystSnapshot,
 )
-from app.schemas import GateCheck, OptionsFlowSnapshot, ScanRun, ScanResult, VariantComparison
+from app.schemas import GateCheck, OptionsFlowSnapshot, ScanRun, ScanResult
 from app.services.alerts import AlertService
 from app.services.coinbase_market_data import CoinbaseMarketDataService
 from app.services.repository import (
@@ -54,6 +55,8 @@ from app.services.repository import (
 from app.services.news_cache import NewsCacheService
 from app.services.weekly_prediction_service import WeeklyPredictionService
 from app.services.daily_bar_service import DailyBarService
+from app.services.brain_runtime import BrainRuntime
+from app.brain.policies import WEEKLY_POLICY_ID
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,7 @@ class ScannerService:
     # Keep /scan/run from drowning in the due-outcome backlog so the live-forward
     # campaign can open. Full backlog drains via admin backfill / worker refresh.
     _SCAN_INLINE_REFRESH_LIMIT = 32
+    _OUTCOME_RETRY_SECONDS = 300
 
     def __init__(
         self,
@@ -96,6 +100,7 @@ class ScannerService:
             daily_bars=self.daily_bar_service,
             repository=self.repo,
         )
+        self.brain = BrainRuntime(settings=self.settings, repository=self.repo)
         self.automation_service = None
         self._analyze_semaphore = asyncio.Semaphore(max(self.settings.scan_concurrency_limit, 1))
 
@@ -323,10 +328,9 @@ class ScannerService:
 
         horizon = self.settings.trade_gate_horizon
         if horizon == "1w" and pattern_name:
-            evaluation = self.repo.evaluate_weekly_pattern_gate(
+            frozen_weekly_gate = self._weekly_pattern_gate_from_learned_inputs(
                 pattern_name=pattern_name,
                 asset_type=asset_type,
-                observed_at=observed_at,
                 signal=signal.decision_signal,
             )
             calibrated_confidence, score_band, calibration_source = self.repo.calibrate_signal(
@@ -335,6 +339,21 @@ class ScannerService:
                 raw_score=signal.score,
                 horizon=horizon,
                 observed_at=observed_at,
+            )
+            if frozen_weekly_gate is not None:
+                gate_passed, gate_reason, gate_checks = frozen_weekly_gate
+                return (
+                    calibrated_confidence,
+                    calibration_source,
+                    gate_passed,
+                    gate_reason,
+                    gate_checks,
+                )
+            evaluation = self.repo.evaluate_weekly_pattern_gate(
+                pattern_name=pattern_name,
+                asset_type=asset_type,
+                observed_at=observed_at,
+                signal=signal.decision_signal,
             )
             return (
                 calibrated_confidence,
@@ -366,39 +385,43 @@ class ScannerService:
             evaluation.checks,
         )
 
-    def _primary_variant(self) -> str:
-        return self.settings.scanner_strategy_variant or "layered-v4"
-
-    def _shadow_variant(self) -> str:
-        return self.settings.scanner_shadow_variant or "layered-v4"
-
-    def _build_shadow_comparison(
+    def _weekly_pattern_gate_from_learned_inputs(
         self,
         *,
-        signal,
-        calibrated_confidence: float,
-        provider_status: str,
-        strategy_metadata,
-    ) -> VariantComparison | None:
-        if not self.settings.scanner_shadow_enabled:
+        pattern_name: str,
+        asset_type: str,
+        signal: str | None,
+    ) -> tuple[bool, str, list[GateCheck]] | None:
+        learned_inputs = getattr(self.brain, "learned_inputs", None)
+        if learned_inputs is None:
             return None
-        primary_variant = self._primary_variant()
-        comparison_variant = self._shadow_variant()
-        return VariantComparison(
-            primary_variant=primary_variant,
-            comparison_variant=comparison_variant,
-            comparison_signal=signal.decision_signal,
-            comparison_raw_score=signal.score,
-            comparison_calibrated_confidence=calibrated_confidence,
-            comparison_provider_status=provider_status,
-            comparison_evidence_quality=strategy_metadata.evidence_quality,
-            comparison_execution_eligibility=strategy_metadata.execution_eligibility,
-            changed=False,
-            summary=(
-                "Shadow mode is enabled, but this variant still mirrors the active pipeline until the "
-                "layered architecture and new providers are wired in."
+        stats_by_source = learned_inputs.stats_by_source(
+            pattern_name=pattern_name,
+            asset_type=asset_type,
+            sources=(
+                "historical",
+                "backfilled_replay",
+                "live_paper_forward",
+                "out_of_sample",
             ),
         )
+        verdict = evaluate_weekly_pattern_evidence(
+            stats_by_source=stats_by_source,  # type: ignore[arg-type]
+            settings=self.settings,
+            asset_type=asset_type,
+            signal=signal,
+        )
+        calibration_ready = (
+            verdict.pattern_has_enough_historical_samples
+            or verdict.pattern_has_enough_backfilled_replay_samples
+        )
+        reason = verdict.summary
+        if verdict.real_money_trust_blocked:
+            reason = f"{reason} Real-money trust remains blocked."
+        return calibration_ready, reason, list(verdict.checks)
+
+    def _primary_variant(self) -> str:
+        return self.settings.scanner_strategy_variant or "layered-v4"
 
     def _build_breadth_snapshot(self, *, asset_type: str, bars: dict[str, dict]) -> BreadthSnapshot:
         usable_rows = [row for row in bars.values() if row]
@@ -447,6 +470,27 @@ class ScannerService:
             return symbol.split("/", 1)[0]
         return symbol
 
+    def _deferred_outcome_ids(self, kind: str) -> set[int]:
+        retries = getattr(self, "_outcome_retries", {})
+        now = time.monotonic()
+        self._outcome_retries = {
+            key: until for key, until in retries.items() if until > now
+        }
+        return {row_id for (row_kind, row_id) in self._outcome_retries if row_kind == kind}
+
+    def _defer_outcome(self, kind: str, row_id: int) -> None:
+        if not hasattr(self, "_outcome_retries"):
+            self._outcome_retries = {}
+        self._outcome_retries[(kind, row_id)] = time.monotonic() + self._OUTCOME_RETRY_SECONDS
+
+    def _outcome_provider_failed(self, kind: str, row_id: int, ticker: str, exc: Exception) -> None:
+        self._defer_outcome(kind, row_id)
+        logger.warning(
+            "Outcome %s %s remains pending after provider %s; retry deferred",
+            kind, row_id, type(exc).__name__,
+            extra={"event": "outcome_provider_unavailable", "ticker": ticker},
+        )
+
     async def _refresh_due_signal_outcomes(
         self,
         observed_at: datetime,
@@ -456,6 +500,7 @@ class ScannerService:
         pending = self.repo.list_due_signal_outcome_evaluations(
             observed_at=observed_at,
             limit=limit,
+            exclude_ids=self._deferred_outcome_ids("signal"),
         )
         if not pending:
             return 0
@@ -480,8 +525,9 @@ class ScannerService:
                             max_search_minutes=lookup["max_search_minutes"],
                             timeframe=lookup["timeframe"],
                         )
-                except Exception:
-                    price = None
+                except Exception as exc:
+                    self._outcome_provider_failed("signal", evaluation.outcome_id, evaluation.ticker, exc)
+                    return None
                 comparable_observed_at = observed_at
                 comparable_expires_at = evaluation.expires_at
                 if observed_at.tzinfo is None and evaluation.expires_at.tzinfo is not None:
@@ -489,6 +535,7 @@ class ScannerService:
                 elif observed_at.tzinfo is not None and evaluation.expires_at.tzinfo is None:
                     comparable_observed_at = observed_at.replace(tzinfo=None)
                 if price is None and comparable_observed_at < comparable_expires_at:
+                    self._defer_outcome("signal", evaluation.outcome_id)
                     return None
                 return OutcomeEvaluationUpdate(
                     outcome_id=evaluation.outcome_id,
@@ -527,24 +574,21 @@ class ScannerService:
         end: datetime,
         timeframe: str,
     ) -> list[dict]:
-        try:
-            if evaluation.asset_type == "crypto":
-                return await self.alpaca.get_historical_crypto_bars(
-                    evaluation.ticker,
-                    start=start,
-                    end=end,
-                    timeframe=timeframe,
-                    limit=5000,
-                )
-            return await self.alpaca.get_historical_stock_bars(
+        if evaluation.asset_type == "crypto":
+            return await self.alpaca.get_historical_crypto_bars(
                 evaluation.ticker,
                 start=start,
                 end=end,
                 timeframe=timeframe,
                 limit=5000,
             )
-        except Exception:
-            return []
+        return await self.alpaca.get_historical_stock_bars(
+            evaluation.ticker,
+            start=start,
+            end=end,
+            timeframe=timeframe,
+            limit=5000,
+        )
 
     def _ambiguous_bar_indices(
         self,
@@ -643,6 +687,7 @@ class ScannerService:
         pending = self.repo.list_due_prediction_evaluations(
             observed_at=observed_at,
             limit=limit,
+            exclude_ids=self._deferred_outcome_ids("prediction"),
         )
         if not pending:
             return 0
@@ -667,8 +712,9 @@ class ScannerService:
                             max_search_minutes=lookup["max_search_minutes"],
                             timeframe=lookup["timeframe"],
                         )
-                except Exception:
-                    price = None
+                except Exception as exc:
+                    self._outcome_provider_failed("prediction", evaluation.snapshot_id, evaluation.ticker, exc)
+                    return None
                 comparable_observed_at = observed_at
                 comparable_expires_at = evaluation.expires_at
                 if observed_at.tzinfo is None and evaluation.expires_at.tzinfo is not None:
@@ -676,8 +722,13 @@ class ScannerService:
                 elif observed_at.tzinfo is not None and evaluation.expires_at.tzinfo is None:
                     comparable_observed_at = observed_at.replace(tzinfo=None)
                 if price is None and comparable_observed_at < comparable_expires_at:
+                    self._defer_outcome("prediction", evaluation.snapshot_id)
                     return None
-                exit_fields = await self._build_exit_window_fields(evaluation, price=price)
+                try:
+                    exit_fields = await self._build_exit_window_fields(evaluation, price=price)
+                except Exception as exc:
+                    self._outcome_provider_failed("prediction", evaluation.snapshot_id, evaluation.ticker, exc)
+                    return None
                 return PredictionEvaluationUpdate(
                     snapshot_id=evaluation.snapshot_id,
                     status="resolved" if price is not None else "missed",
@@ -1186,62 +1237,6 @@ class ScannerService:
         execution_eligibility = strategy_metadata.execution_eligibility
         if confidence_overlay.review_flags and execution_eligibility == "eligible":
             execution_eligibility = "review"
-        comparison = self._build_shadow_comparison(
-            signal=signal,
-            calibrated_confidence=calibrated_confidence,
-            provider_status=provider_status,
-            strategy_metadata=strategy_metadata,
-        )
-        if self.settings.scanner_shadow_enabled and self._shadow_variant() == "legacy":
-            legacy_signal = compute_legacy_signal(
-                price_change_pct=price_change_pct,
-                relative_volume=relative_volume,
-                breakout_flag=breakout_flag,
-                breakdown_flag=breakdown_flag,
-                above_vwap=above_vwap,
-                close_to_high_pct=close_to_high_pct,
-                close_to_low_pct=close_to_low_pct,
-                sentiment_score=sentiment_score,
-                catalyst_score=catalyst_score,
-                market_status=market_status,
-                relative_strength_pct=relative_strength_pct,
-                options_snapshot=options_flow_snapshot,
-                volatility_regime=volatility_regime,
-                data_quality=data_quality,
-                context_bias=context_bias,
-            )
-            legacy_confidence, legacy_source, legacy_gate_passed, _, _ = self._gate_signal(
-                asset_type=asset_type,
-                signal=legacy_signal,
-                observed_at=created_at,
-            )
-            legacy_metadata = build_strategy_evaluation_metadata(
-                signal=legacy_signal.decision_signal,
-                gate_passed=legacy_gate_passed,
-                calibration_source=legacy_source,
-                data_quality=data_quality,
-                provider_status=provider_status,
-                provider_warnings=provider_warnings,
-            )
-            comparison = VariantComparison(
-                primary_variant=self._primary_variant(),
-                comparison_variant="legacy",
-                comparison_signal=legacy_signal.decision_signal,
-                comparison_raw_score=legacy_signal.score,
-                comparison_calibrated_confidence=legacy_confidence,
-                comparison_provider_status=provider_status,
-                comparison_evidence_quality=legacy_metadata.evidence_quality,
-                comparison_execution_eligibility=legacy_metadata.execution_eligibility,
-                changed=(
-                    legacy_signal.decision_signal != signal.decision_signal
-                    or round(legacy_signal.score, 2) != round(signal.score, 2)
-                    or round(legacy_confidence, 2) != round(calibrated_confidence, 2)
-                ),
-                summary=(
-                    f"Legacy comparison {legacy_signal.decision_signal} {legacy_signal.score:.2f} "
-                    f"vs layered {signal.decision_signal} {signal.score:.2f}."
-                ),
-            )
         gated_explanation = compute_signal_and_explanation(
             buy_threshold=(
                 self.settings.signal_crypto_buy_threshold
@@ -1497,7 +1492,6 @@ class ScannerService:
                     ),
                 },
             },
-            comparison=comparison,
             created_at=created_at,
         )
 
@@ -1539,7 +1533,7 @@ class ScannerService:
             if crypto_watchlist and self.settings.defillama_enabled
             else None
         )
-        stock_bars_result, crypto_bars, fear_greed, crypto_context, binance_context, deribit_context, fred_snapshot, defillama_snapshot = await asyncio.gather(
+        provider_results = await asyncio.gather(
             stock_bars_task if stock_bars_task is not None else asyncio.sleep(0, result=({}, "alpaca")),
             crypto_bars_task if crypto_bars_task is not None else asyncio.sleep(0, result={}),
             fear_greed_task,
@@ -1548,7 +1542,24 @@ class ScannerService:
             deribit_task if deribit_task is not None else asyncio.sleep(0, result={}),
             fred_task if fred_task is not None else asyncio.sleep(0, result=None),
             defillama_task if defillama_task is not None else asyncio.sleep(0, result=None),
+            return_exceptions=True,
         )
+        # Keep a provider outage from discarding the other asset's real data.
+        # Missing data stays missing; no prices or candidate rows are invented.
+        defaults = [({}, "alpaca"), {}, (None, None), {}, {}, {}, None, None]
+        providers = ["stock_bars", "crypto_bars", "fear_greed", "coingecko", "binance", "deribit", "fred", "defillama"]
+        stock_error = provider_results[0] if isinstance(provider_results[0], Exception) else None
+        crypto_error = provider_results[1] if isinstance(provider_results[1], Exception) else None
+        for index, value in enumerate(provider_results):
+            if isinstance(value, Exception):
+                logger.warning(
+                    "scan provider %s unavailable (%s, status=%s)",
+                    providers[index], type(value).__name__, getattr(value, "status_code", None),
+                )
+                provider_results[index] = defaults[index]
+        stock_bars_result, crypto_bars, fear_greed, crypto_context, binance_context, deribit_context, fred_snapshot, defillama_snapshot = provider_results
+        if not stock_bars_result[0] and not crypto_bars and (stock_error or crypto_error):
+            raise stock_error or crypto_error
         stock_bars, stock_bars_source = stock_bars_result
         crypto_alpaca_served_stale_cache = self.alpaca.consume_last_stale_flag()
         crypto_bars = self.market_data_service.apply_crypto_price_overrides(crypto_bars)
@@ -1600,6 +1611,9 @@ class ScannerService:
                         crypto_benchmark_symbol, asset_type="crypto"
                     )
                 )[0]
+
+        learned_inputs = self.brain.refresh_weekly_inputs()
+        self.weekly_prediction_service.learned_inputs = learned_inputs
 
         analyzed = await asyncio.gather(
             *[
@@ -1659,6 +1673,17 @@ class ScannerService:
             row.model_copy(update={"rank": index + 1})
             for index, row in enumerate(ranked)
         ]
+        snapshot = self.brain.build_snapshot(
+            as_of=created_at,
+            results=results,
+            daily_bars_by_symbol=daily_bars_by_symbol,
+            stock_market_bars=stock_market_daily_bars,
+            crypto_market_bars=crypto_market_daily_bars,
+        )
+        policy_decisions = self.brain.decide_all(snapshot)
+        champion_id = self.brain.effective_champion_id()
+        if champion_id == WEEKLY_POLICY_ID:
+            results = self.brain.apply_champion(results, policy_decisions.get(WEEKLY_POLICY_ID, []))
         results = apply_top_pick_selection(
             results, settings=self.settings, limit=self.settings.effective_top_pick_limit
         )
@@ -1676,7 +1701,6 @@ class ScannerService:
             created_at=created_at,
             market_status=market_status,
             strategy_variant=self._primary_variant(),
-            shadow_enabled=bool(self.settings.scanner_shadow_enabled),
             scan_count=len(results),
             watchlist_size=len(watchlist),
             fear_greed_value=fear_greed_value,
@@ -1694,7 +1718,28 @@ class ScannerService:
                 extra={"event": "alert_failure", "run_id": run.run_id},
                 exc_info=exc,
             )
-        self.repo.save_run(run)
+        self.repo.save_run(
+            run,
+            shadow_decisions=[
+                decision
+                for policy_id, decisions in policy_decisions.items()
+                if policy_id != champion_id
+                for decision in decisions
+            ],
+            champion_policy_id=champion_id,
+            champion_fingerprint=(
+                self.brain.weekly.fingerprint()
+                if champion_id == WEEKLY_POLICY_ID
+                else self.brain.hybrid.fingerprint()
+            ),
+            champion_policy_version=(
+                self.brain.weekly.policy_version
+                if champion_id == WEEKLY_POLICY_ID
+                else self.brain.hybrid.policy_version
+            ),
+            learned_artifacts_fingerprint=learned_inputs.fingerprint,
+            learned_artifacts_json=learned_inputs.identity_json(),
+        )
         scan_duration_ms = round((time.monotonic() - scan_t0) * 1000)
         logger.info(
             "scan completed",

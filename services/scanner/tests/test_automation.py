@@ -25,7 +25,6 @@ def _build_scan_run(*, run_id: str = "run-1", signal: str = "BUY") -> ScanRun:
         created_at=created_at,
         market_status="bullish",
         strategy_variant="layered-v4",
-        shadow_enabled=False,
         scan_count=1,
         watchlist_size=1,
         alerts_sent=0,
@@ -87,7 +86,6 @@ def _build_scan_run(*, run_id: str = "run-1", signal: str = "BUY") -> ScanRun:
                 provider_status="ok",
                 provider_warnings=[],
                 layer_details={},
-                comparison=None,
                 is_top_pick=True,
                 selection_rank=1,
                 readiness_score=82.0,
@@ -138,7 +136,6 @@ class AutomationServiceTests(unittest.TestCase):
         service.settings.paper_loop_max_requests_per_symbol_window = 1
         service.settings.paper_loop_symbol_window_seconds = 21600
         service.settings.paper_loop_symbol_cooldown_minutes = 360
-        service.settings.paper_loop_signal_stale_after_minutes = 10
         service.settings.paper_loop_same_side_repeat_requires_delta = True
         service.settings.paper_loop_opposite_side_requires_unwound = True
         service.settings.paper_loop_min_confidence_delta = 5.0

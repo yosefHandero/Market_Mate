@@ -25,7 +25,7 @@ from sqlalchemy import select
 
 from app.config import Settings, get_settings
 from app.core.strategy_contract import STRATEGY_ID, STRATEGY_VERSION
-from app.core.weekly_patterns import FEATURE_VERSION
+from app.brain.weekly_patterns import FEATURE_VERSION
 from app.db import SessionLocal
 from app.models.scan import EvidenceCampaignORM
 from app.services.walk_forward_proof import code_commit
@@ -87,8 +87,11 @@ _FINGERPRINT_SETTING_KEYS = (
     "trust_recent_window_days",
     "calibration_min_signal_samples",
     "calibration_min_score_band_samples",
+    # validation_win_threshold_pct defines a "win" for weekly pattern stats that
+    # feed the serving gate, so it is decision identity. Its false-positive
+    # sibling only labels validation *reports* (ruler identity) and is
+    # deliberately absent: ruler changes never rotate prediction campaigns.
     "validation_win_threshold_pct",
-    "validation_false_positive_threshold_pct",
     # Evidence classification / pattern trust gates
     "weekly_out_of_sample_holdout_ratio",
     "track_hold_outcomes",
@@ -120,12 +123,23 @@ _FINGERPRINT_SETTING_KEYS = (
 )
 
 
-def campaign_config_fingerprint(settings: Settings) -> str:
+def campaign_config_fingerprint(
+    settings: Settings,
+    *,
+    effective_policy_id: str | None = None,
+    effective_policy_version: str | None = None,
+    effective_decision_fingerprint: str | None = None,
+    learned_artifacts_fingerprint: str | None = None,
+) -> str:
     """Stable SHA-256 over strategy identity + evidence-relevant settings."""
     payload: dict[str, Any] = {
         "strategy_id": STRATEGY_ID,
         "strategy_version": STRATEGY_VERSION,
         "feature_version": FEATURE_VERSION,
+        "effective_policy_id": effective_policy_id,
+        "effective_policy_version": effective_policy_version,
+        "effective_decision_fingerprint": effective_decision_fingerprint,
+        "learned_artifacts_fingerprint": learned_artifacts_fingerprint,
     }
     for key in _FINGERPRINT_SETTING_KEYS:
         payload[key] = getattr(settings, key, None)
@@ -142,6 +156,11 @@ class CampaignProvenance:
     feature_version: str
     config_fingerprint: str
     code_commit: str | None
+    effective_policy_id: str | None = None
+    effective_policy_version: str | None = None
+    effective_decision_fingerprint: str | None = None
+    learned_artifacts_fingerprint: str | None = None
+    learned_artifacts_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +174,10 @@ class CampaignSummary:
     feature_version: str
     config_fingerprint: str
     code_commit: str | None
+    effective_policy_id: str | None
+    effective_policy_version: str | None
+    effective_decision_fingerprint: str | None
+    learned_artifacts_fingerprint: str | None
     close_reason: str | None
 
     def as_dict(self) -> dict[str, Any]:
@@ -179,10 +202,23 @@ class EvidenceCampaignService:
         return "camp-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
 
     def get_or_create_active_campaign(
-        self, *, now: datetime | None = None
+        self,
+        *,
+        now: datetime | None = None,
+        effective_policy_id: str | None = None,
+        effective_policy_version: str | None = None,
+        effective_decision_fingerprint: str | None = None,
+        learned_artifacts_fingerprint: str | None = None,
+        learned_artifacts_json: str | None = None,
     ) -> CampaignProvenance:
         now = now or datetime.now(timezone.utc)
-        fingerprint = campaign_config_fingerprint(self.settings)
+        fingerprint = campaign_config_fingerprint(
+            self.settings,
+            effective_policy_id=effective_policy_id,
+            effective_policy_version=effective_policy_version,
+            effective_decision_fingerprint=effective_decision_fingerprint,
+            learned_artifacts_fingerprint=learned_artifacts_fingerprint,
+        )
         current_commit = code_commit()
         with self._session_factory() as session:
             active = session.execute(
@@ -220,6 +256,11 @@ class EvidenceCampaignService:
                 feature_version=FEATURE_VERSION,
                 config_fingerprint=fingerprint,
                 code_commit=current_commit,
+                effective_policy_id=effective_policy_id,
+                effective_policy_version=effective_policy_version,
+                effective_decision_fingerprint=effective_decision_fingerprint,
+                learned_artifacts_fingerprint=learned_artifacts_fingerprint,
+                learned_artifacts_json=learned_artifacts_json,
                 close_reason=None,
                 notes_json=None,
             )
@@ -235,6 +276,11 @@ class EvidenceCampaignService:
             feature_version=campaign.feature_version,
             config_fingerprint=campaign.config_fingerprint,
             code_commit=campaign.code_commit,
+            effective_policy_id=getattr(campaign, "effective_policy_id", None),
+            effective_policy_version=getattr(campaign, "effective_policy_version", None),
+            effective_decision_fingerprint=getattr(campaign, "effective_decision_fingerprint", None),
+            learned_artifacts_fingerprint=getattr(campaign, "learned_artifacts_fingerprint", None),
+            learned_artifacts_json=getattr(campaign, "learned_artifacts_json", None),
         )
 
     def get_active_campaign(self) -> CampaignSummary | None:
@@ -267,5 +313,9 @@ class EvidenceCampaignService:
             feature_version=campaign.feature_version,
             config_fingerprint=campaign.config_fingerprint,
             code_commit=campaign.code_commit,
+            effective_policy_id=getattr(campaign, "effective_policy_id", None),
+            effective_policy_version=getattr(campaign, "effective_policy_version", None),
+            effective_decision_fingerprint=getattr(campaign, "effective_decision_fingerprint", None),
+            learned_artifacts_fingerprint=getattr(campaign, "learned_artifacts_fingerprint", None),
             close_reason=campaign.close_reason,
         )

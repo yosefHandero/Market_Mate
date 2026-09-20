@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from app.http_client import MAX_RETRY_BACKOFF_SECONDS, ProviderRequestError
+
 logger = logging.getLogger(__name__)
 
 RATE_LIMIT_COOLDOWN_THRESHOLD = 3
@@ -29,19 +31,33 @@ class AsyncProviderGuard:
         self._pace_lock = asyncio.Lock()
         self._next_allowed_at = 0.0
         self._consecutive_rate_limits = 0
+        self._deferred_until = 0.0
 
     def last_served_stale_for(self, key: Any) -> bool:
         return bool(self._last_served_stale.get(key))
 
     async def throttle(self) -> None:
+        loop = asyncio.get_running_loop()
+        remaining = self._deferred_until - loop.time()
+        if remaining > 0:
+            raise ProviderRequestError(
+                f"{self.provider} is waiting for its provider-requested cooldown",
+                provider=self.provider, url="", retryable=True,
+                retry_after_seconds=remaining, status_code=429,
+            )
         if self.pace_seconds <= 0:
             return
-        loop = asyncio.get_running_loop()
         # Sleep outside the pace lock so a long Retry-After / cooldown wait does
         # not convoy every other provider caller behind one held lock.
         while True:
             async with self._pace_lock:
                 now = loop.time()
+                if self._deferred_until > now:
+                    raise ProviderRequestError(
+                        f"{self.provider} is waiting for its provider-requested cooldown",
+                        provider=self.provider, url="", retryable=True,
+                        retry_after_seconds=self._deferred_until - now, status_code=429,
+                    )
                 wait_seconds = max(self._next_allowed_at - now, 0.0)
                 if wait_seconds <= 0:
                     self._next_allowed_at = max(self._next_allowed_at, now) + self.pace_seconds
@@ -75,6 +91,8 @@ class AsyncProviderGuard:
         loop = asyncio.get_running_loop()
         async with self._pace_lock:
             self._next_allowed_at = max(self._next_allowed_at, loop.time() + delay)
+            if delay > MAX_RETRY_BACKOFF_SECONDS:
+                self._deferred_until = max(self._deferred_until, loop.time() + delay)
 
     async def cached_call(
         self,

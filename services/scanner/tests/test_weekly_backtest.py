@@ -1,8 +1,8 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from app.core.weekly_backtest import summarize_pattern_stats, walk_forward_pattern_samples
-from app.core.weekly_patterns import detect_weekly_pattern
+from app.brain.weekly_backtest import summarize_pattern_stats, walk_forward_pattern_samples
+from app.brain.weekly_patterns import detect_weekly_pattern
 
 
 def _bars(closes: list[float]) -> list[dict]:

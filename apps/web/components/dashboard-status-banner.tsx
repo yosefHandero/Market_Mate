@@ -21,9 +21,11 @@ function finiteNumber(value: number | null | undefined): number | null {
 
 function ageFromTimestamp(value: string | null | undefined): number | null {
   if (!value) return null;
-  const timestamp = Date.parse(value);
+  // SQLite-backed API timestamps can be timezone-naive; they represent UTC.
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : `${value}Z`;
+  const timestamp = Date.parse(normalized);
   if (!Number.isFinite(timestamp)) return null;
-  return Math.max(0, Math.round((Date.now() - timestamp) / 60_000));
+  return Math.max(0, (Date.now() - timestamp) / 60_000);
 }
 
 function formatMinutes(value: number | null): string {
@@ -72,9 +74,18 @@ function hasBadFreshnessFlags(latestScan: ScanRun | null): boolean {
   return (latestScan?.results ?? []).some((row) => rowHasBadFreshnessFlags(row));
 }
 
+function displayedBarAge(row: ScanResult, latestScan: ScanRun): number | null {
+  const absoluteAge = ageFromTimestamp(row.bar_as_of);
+  if (absoluteAge != null) return absoluteAge;
+  const storedAge = finiteNumber(row.bar_age_minutes);
+  if (storedAge == null) return null;
+  // Legacy rows lack bar_as_of. Their stored age was measured at scan time.
+  return storedAge + (ageFromTimestamp(row.created_at ?? latestScan.created_at) ?? 0);
+}
+
 function barsState(latestScan: ScanRun | null): { label: string; tone: StatusTone } {
   const ages = (latestScan?.results ?? [])
-    .map((row) => finiteNumber(row.bar_age_minutes))
+    .map((row) => displayedBarAge(row, latestScan!))
     .filter((age): age is number => age != null);
   const badFlags = hasBadFreshnessFlags(latestScan);
 
@@ -242,7 +253,9 @@ export function DashboardStatusBanner({
 }) {
   const backendOk = health?.ok === true;
   const scanAge =
-    finiteNumber(health?.last_scan_age_minutes) ?? ageFromTimestamp(latestScan?.created_at);
+    ageFromTimestamp(latestScan?.created_at) ?? finiteNumber(health?.last_scan_age_minutes);
+  const staleScan = health?.scan_fresh === false || latestScan?.scan_fresh === false ||
+    (scanAge != null && scanAge > (health?.max_stale_minutes ?? SCAN_FRESH_MAX_MINUTES));
   const provider = providerState(latestScan);
   const bars = barsState(latestScan);
   const schedulerEnabled = health?.scheduler_enabled === true;
@@ -272,7 +285,12 @@ export function DashboardStatusBanner({
           tone={systemReadiness.tone}
           title={systemReadiness.reasons.join('; ')}
         />
-        <StatusPill label="Provider" value={provider.label} tone={provider.tone} />
+        <StatusPill
+          label="Provider"
+          value={staleScan ? `${provider.label} (last scan)` : provider.label}
+          tone={staleScan && provider.tone === 'ok' ? 'muted' : provider.tone}
+          title="Provider status observed during the last scan; this is not a current connectivity check."
+        />
         <StatusPill label="Bars" value={bars.label} tone={bars.tone} />
         <StatusPill
           label="Real-money trust"
@@ -283,6 +301,21 @@ export function DashboardStatusBanner({
           }
         />
       </div>
+
+      {latestScan ? (
+        <p className="muted small" data-testid="scan-coverage">
+          Last scan: {latestScan.results.length} candidate results ({latestScan.results.filter((row) => row.asset_type === 'stock').length} stock,{' '}
+          {latestScan.results.filter((row) => row.asset_type === 'crypto').length} crypto) from{' '}
+          {latestScan.watchlist_size} configured symbols, including benchmarks.
+        </p>
+      ) : null}
+
+      {staleScan ? (
+        <p className="small warning" role="status" data-testid="stale-scan-banner">
+          Last scan is {formatMinutes(scanAge)} old. Prices and candidates are historical snapshots.
+          Run a scan while the app is open to refresh them.
+        </p>
+      ) : null}
 
       {safetyActive ? (
         <p className="system-health-safety-alert small negative" role="status">

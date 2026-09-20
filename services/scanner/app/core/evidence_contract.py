@@ -116,13 +116,15 @@ EVIDENCE_TRACKS: tuple[EvidenceTrackDescriptor, ...] = (
 
 
 # Mapping from the legacy stored sample_source taxonomy onto canonical tracks.
-# out_of_sample is a held-out subset of live-forward data, so it maps to
+# The live holdout family ("out_of_sample" legacy spelling, "live_holdout"
+# current spelling) is a held-out subset of live-forward data, so it maps to
 # live_forward (the UI may still show its sub-count separately).
 _SAMPLE_SOURCE_TRACK = {
     "historical": WALK_FORWARD_RESEARCH,
     "backfilled_replay": HISTORICAL_REPLAY,
     "live_paper_forward": LIVE_FORWARD,
     "out_of_sample": LIVE_FORWARD,
+    "live_holdout": LIVE_FORWARD,
 }
 
 # Mapping from the walk-forward metric track strings onto canonical tracks.

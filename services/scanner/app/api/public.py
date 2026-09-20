@@ -46,6 +46,7 @@ from app.schemas import (
     SystemReadinessResponse,
 )
 from app.services.automation import AutomationService
+from app.services.brain_runtime import BrainRuntime
 from app.services.coinbase_market_data import CoinbaseMarketDataService
 from app.services.readiness import compute_scan_freshness_fields, evaluate_operational_readiness
 from app.services.repository import ScanRepository
@@ -288,7 +289,6 @@ def _build_system_readiness_response(
         reasons.append("Provider critical with unusable/stale data")
 
     top_rejection_reasons: list[dict[str, object]] = []
-    missed_windows_14d = 0
     pending_prediction_resolutions = 0
     if db_ok and schema_status.ok:
         try:
@@ -297,19 +297,9 @@ def _build_system_readiness_response(
         except Exception:
             top_rejection_reasons = []
             pending_prediction_resolutions = 0
-        try:
-            from app.services.scan_windows import ScanWindowService
-
-            window_service = ScanWindowService()
-            window_service.ensure_and_sweep()
-            missed_windows_14d = window_service.missed_count(lookback_days=14)
-        except Exception:
-            missed_windows_14d = 0
 
     buy_count = sum(1 for row in rows if (row.decision_signal or "").upper() == "BUY")
-    # Candidate shortage and missed windows are first-class diagnostics, but they
-    # must not flip System Readiness to FAIL on an otherwise healthy host — they
-    # explain "why no candidates / did we miss a window?" without blocking paper use.
+    # Candidate shortage explains the available results without blocking paper use.
     candidate_shortage = bool(rows) and buy_count < 3
 
     if not reasons:
@@ -317,7 +307,6 @@ def _build_system_readiness_response(
 
     diagnostics = SystemReadinessDiagnostics(
         top_rejection_reasons=top_rejection_reasons,
-        missed_windows_14d=missed_windows_14d,
         pending_prediction_resolutions=pending_prediction_resolutions,
         candidate_shortage=candidate_shortage,
     )
@@ -592,6 +581,11 @@ async def get_proof_summary(
         last_scan_at=last_scan_at,
         health_max_stale_minutes=settings.health_max_stale_minutes,
     )
+    policy_promotion = BrainRuntime(
+        settings=settings,
+        repository=scan_repository,
+        walk_forward_repository=walk_forward_repository,
+    ).promotion_report_response()
     return ProofSummaryResponse(
         generated_at=datetime.now(timezone.utc),
         ledger=ledger,
@@ -618,4 +612,7 @@ async def get_proof_summary(
             if ledger.open_positions
             else None
         ),
+        ruler_version=policy_promotion.ruler_version,
+        ruler_fingerprint=policy_promotion.ruler_fingerprint,
+        policy_promotion=policy_promotion,
     )

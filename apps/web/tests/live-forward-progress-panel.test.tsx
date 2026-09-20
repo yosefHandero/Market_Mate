@@ -41,8 +41,6 @@ const progress: LiveForwardProgress = {
   ],
   last_scan_at: '2026-07-30T00:00:00Z',
   last_scan_age_minutes: 42,
-  scan_gap_exceeded: false,
-  max_expected_scan_gap_minutes: 1560,
   note: null,
 };
 
@@ -54,25 +52,25 @@ describe('LiveForwardProgressPanel', () => {
     );
   });
 
-  it('renders campaign, per-asset counts, late-resolution and no-gap state', () => {
+  it('renders campaign, per-asset counts, late-resolution and manual-session progress', () => {
     render(<LiveForwardProgressPanel progress={progress} />);
     expect(screen.getByTestId('live-forward-campaign')).toHaveTextContent('camp-abc123def456');
     expect(screen.getByTestId('live-forward-asset-stock')).toHaveTextContent('5');
     expect(screen.getByTestId('live-forward-asset-crypto')).toHaveTextContent('3');
     expect(screen.getByTestId('live-forward-late')).toHaveTextContent('resolved after their due date');
-    expect(screen.queryByTestId('live-forward-scan-gap')).not.toBeInTheDocument();
+    expect(screen.getByText(/Evidence accumulates while the app is running/)).toBeInTheDocument();
   });
 
-  it('surfaces a missed-window warning when the scan gap is exceeded', () => {
+  it('reports an old scan without imposing an automatic wake cadence', () => {
     render(
       <LiveForwardProgressPanel
         progress={{
           ...progress,
-          scan_gap_exceeded: true,
-          note: 'Last scan was 3000 min ago, beyond the 1560-min expected cadence.',
+          last_scan_age_minutes: 3000,
         }}
       />,
     );
-    expect(screen.getByTestId('live-forward-scan-gap')).toHaveTextContent('expected cadence');
+    expect(screen.getByText(/Last scan 3000 min ago/)).toBeInTheDocument();
+    expect(screen.queryByText(/missed|expected cadence|scheduler cadence/i)).not.toBeInTheDocument();
   });
 });

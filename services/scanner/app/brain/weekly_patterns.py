@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from app.core.weekly_bar_utils import bars_as_of, close_price, sorted_bars
+from app.brain.weekly_bar_utils import bars_as_of, close_price, sorted_bars
 from app.schemas import DecisionSignal
 
 DirectionalBias = Literal["bullish", "bearish", "neutral"]
@@ -13,6 +13,16 @@ DirectionalBias = Literal["bullish", "bearish", "neutral"]
 # when the feature computation changes so evidence campaigns rotate rather than
 # mixing predictions built from incompatible feature logic.
 FEATURE_VERSION = "weekly-features-v1"
+
+# The only patterns that can produce a BUY (everything else abstains before any
+# stats lookup). Hosts preload repository-accrued pattern stats for these when
+# adapting data into the weekly policy.
+BULLISH_PATTERN_NAMES = (
+    "uptrend_ma_stack",
+    "breakout_20d_high",
+    "momentum_rsi_bull",
+    "volatility_squeeze_break",
+)
 
 
 @dataclass(frozen=True)

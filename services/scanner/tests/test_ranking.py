@@ -2,13 +2,8 @@ import unittest
 from datetime import datetime, timezone
 
 from app.config import Settings
-from app.core.ranking import (
-    actionability_sort_tier,
-    buy_candidate_rank_score,
-    display_sort_key,
-    is_buy_candidate,
-    row_is_buy_candidate,
-)
+from app.brain.gates import buy_candidate_rank_score, is_buy_candidate, row_is_buy_candidate
+from app.core.ranking import actionability_sort_tier, display_sort_key
 from app.schemas import ScanResult, WeeklyPatternPrediction
 
 

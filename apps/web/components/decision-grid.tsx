@@ -3,7 +3,13 @@
 import { useMemo } from 'react';
 import { DecisionCard } from '@/components/decision-card';
 import { FRESH_BAR_MAX_MINUTES, hasBadFreshnessFlags } from '@/lib/freshness';
+import { evaluatePaperActionGate } from '@/lib/paper-order';
 import type { AutomationStatusResponse, DecisionRow, ScanResult } from '@/lib/types';
+
+function isProductionSurfaceRow(row: { decision_role?: string | null }): boolean {
+  const role = String(row.decision_role ?? 'production').trim().toLowerCase();
+  return role !== 'shadow';
+}
 
 function isBuyCandidate(row: ScanResult): boolean {
   // Never surface SELL/HOLD rows on the BUY-candidate product surface.
@@ -134,7 +140,7 @@ function officialTopPicks(
           .filter((row) => row.asset_type === assetType && row.is_top_pick)
           .sort((left, right) => (left.selection_rank ?? 999) - (right.selection_rank ?? 999));
 
-  return source.filter(isBuyCandidate);
+  return source.filter((row) => isProductionSurfaceRow(row) && isBuyCandidate(row));
 }
 
 /**
@@ -145,7 +151,7 @@ function officialTopPicks(
  */
 function referenceCandidates(results: ScanResult[], assetType: 'stock' | 'crypto'): ScanResult[] {
   return results
-    .filter((row) => row.asset_type === assetType && isBuyCandidate(row))
+    .filter((row) => row.asset_type === assetType && isProductionSurfaceRow(row) && isBuyCandidate(row))
     .sort((left, right) => {
       const rankLeft = left.selection_rank ?? 999;
       const rankRight = right.selection_rank ?? 999;
@@ -153,6 +159,35 @@ function referenceCandidates(results: ScanResult[], assetType: 'stock' | 'crypto
       return (right.upside_probability_pct ?? 0) - (left.upside_probability_pct ?? 0);
     })
     .slice(0, 5);
+}
+
+function candidateKey(row: ScanResult): string {
+  return `${row.asset_type}:${row.ticker}`;
+}
+
+function paperActionAllowed(
+  result: ScanResult,
+  decision: DecisionRow | null | undefined,
+  automation: AutomationStatusResponse | null | undefined,
+): boolean {
+  return evaluatePaperActionGate({ result, decision, automation }).allowed;
+}
+
+function readOnlySetups(
+  official: ScanResult[],
+  results: ScanResult[],
+  assetType: 'stock' | 'crypto',
+  actionable: ScanResult[],
+  decisionsBySymbol: Map<string, DecisionRow>,
+  automation: AutomationStatusResponse | null | undefined,
+): ScanResult[] {
+  const actionableKeys = new Set(actionable.map(candidateKey));
+  const heldBackOfficial = official.filter((row) => !actionableKeys.has(candidateKey(row)));
+  if (heldBackOfficial.length) return heldBackOfficial;
+  if (actionable.length) return [];
+  return referenceCandidates(results, assetType).filter(
+    (row) => !paperActionAllowed(row, decisionsBySymbol.get(row.ticker), automation),
+  );
 }
 
 export function DecisionGrid({
@@ -170,44 +205,83 @@ export function DecisionGrid({
   automation?: AutomationStatusResponse | null;
   decisionsError?: string | null;
 }) {
+  const productionResults = useMemo(
+    () => results.filter(isProductionSurfaceRow),
+    [results],
+  );
   const decisionsBySymbol = useMemo(
-    () => new Map(decisions.map((row) => [row.symbol, row])),
+    () =>
+      new Map(
+        decisions
+          .filter(isProductionSurfaceRow)
+          .map((row) => [row.symbol, row]),
+      ),
     [decisions],
   );
 
+  const officialStockPicks = useMemo(
+    () => officialTopPicks(productionResults, topStocks, 'stock'),
+    [productionResults, topStocks],
+  );
+  const officialCryptoPicks = useMemo(
+    () => officialTopPicks(productionResults, topCrypto, 'crypto'),
+    [productionResults, topCrypto],
+  );
   const stockPicks = useMemo(
-    () => officialTopPicks(results, topStocks, 'stock'),
-    [results, topStocks],
+    () =>
+      officialStockPicks.filter((row) =>
+        paperActionAllowed(row, decisionsBySymbol.get(row.ticker), automation),
+      ),
+    [automation, decisionsBySymbol, officialStockPicks],
   );
   const cryptoPicks = useMemo(
-    () => officialTopPicks(results, topCrypto, 'crypto'),
-    [results, topCrypto],
+    () =>
+      officialCryptoPicks.filter((row) =>
+        paperActionAllowed(row, decisionsBySymbol.get(row.ticker), automation),
+      ),
+    [automation, decisionsBySymbol, officialCryptoPicks],
   );
   const stockShortfall = useMemo(
     () =>
       describeCandidateScarcity(
-        results.filter((row) => row.asset_type === 'stock'),
+        productionResults.filter((row) => row.asset_type === 'stock'),
         'stock',
         stockPicks.length,
       ),
-    [results, stockPicks.length],
+    [productionResults, stockPicks.length],
   );
   const cryptoShortfall = useMemo(
     () =>
       describeCandidateScarcity(
-        results.filter((row) => row.asset_type === 'crypto'),
+        productionResults.filter((row) => row.asset_type === 'crypto'),
         'crypto',
         cryptoPicks.length,
       ),
-    [results, cryptoPicks.length],
+    [productionResults, cryptoPicks.length],
   );
-  const stockReference = useMemo(
-    () => (stockPicks.length ? [] : referenceCandidates(results, 'stock')),
-    [stockPicks, results],
+  const stockReadOnly = useMemo(
+    () =>
+      readOnlySetups(
+        officialStockPicks,
+        productionResults,
+        'stock',
+        stockPicks,
+        decisionsBySymbol,
+        automation,
+      ),
+    [automation, decisionsBySymbol, officialStockPicks, productionResults, stockPicks],
   );
-  const cryptoReference = useMemo(
-    () => (cryptoPicks.length ? [] : referenceCandidates(results, 'crypto')),
-    [cryptoPicks, results],
+  const cryptoReadOnly = useMemo(
+    () =>
+      readOnlySetups(
+        officialCryptoPicks,
+        productionResults,
+        'crypto',
+        cryptoPicks,
+        decisionsBySymbol,
+        automation,
+      ),
+    [automation, cryptoPicks, decisionsBySymbol, officialCryptoPicks, productionResults],
   );
 
   return (
@@ -227,7 +301,7 @@ export function DecisionGrid({
                 {stockShortfall}
               </p>
             ) : null}
-            <div className="decision-card-grid">
+            <div className="decision-card-grid" data-testid="stock-actionable-grid">
               {stockPicks.map((result) => (
                 <DecisionCard
                   key={result.ticker}
@@ -238,13 +312,13 @@ export function DecisionGrid({
               ))}
             </div>
           </>
-        ) : stockReference.length ? (
+        ) : stockReadOnly.length ? (
           <>
             <p className="muted small" role="status" data-testid="stock-reference-note">
               Reference only - not executable right now. {stockShortfall}
             </p>
-            <div className="decision-card-grid" data-testid="stock-reference-grid">
-              {stockReference.map((result) => (
+            <div className="decision-card-grid decision-readonly-grid" data-testid="stock-reference-grid">
+              {stockReadOnly.map((result) => (
                 <DecisionCard
                   key={result.ticker}
                   result={result}
@@ -259,6 +333,23 @@ export function DecisionGrid({
             {stockShortfall}
           </p>
         )}
+        {stockPicks.length && stockReadOnly.length ? (
+          <div className="decision-readonly-setups">
+            <p className="muted small" role="status" data-testid="stock-readonly-note">
+              Read-only setup details - paper preview is blocked by current safety or freshness gates.
+            </p>
+            <div className="decision-card-grid decision-readonly-grid" data-testid="stock-readonly-grid">
+              {stockReadOnly.map((result) => (
+                <DecisionCard
+                  key={result.ticker}
+                  result={result}
+                  decision={decisionsBySymbol.get(result.ticker) ?? null}
+                  automation={automation}
+                />
+              ))}
+            </div>
+          </div>
+        ) : null}
       </section>
 
       <section className="decision-grid-section" role="region" aria-label="Top crypto buy candidates">
@@ -270,7 +361,7 @@ export function DecisionGrid({
                 {cryptoShortfall}
               </p>
             ) : null}
-            <div className="decision-card-grid">
+            <div className="decision-card-grid" data-testid="crypto-actionable-grid">
               {cryptoPicks.map((result) => (
                 <DecisionCard
                   key={result.ticker}
@@ -281,13 +372,13 @@ export function DecisionGrid({
               ))}
             </div>
           </>
-        ) : cryptoReference.length ? (
+        ) : cryptoReadOnly.length ? (
           <>
             <p className="muted small" role="status" data-testid="crypto-reference-note">
               Reference only - not executable right now. {cryptoShortfall}
             </p>
-            <div className="decision-card-grid" data-testid="crypto-reference-grid">
-              {cryptoReference.map((result) => (
+            <div className="decision-card-grid decision-readonly-grid" data-testid="crypto-reference-grid">
+              {cryptoReadOnly.map((result) => (
                 <DecisionCard
                   key={result.ticker}
                   result={result}
@@ -302,6 +393,23 @@ export function DecisionGrid({
             {cryptoShortfall}
           </p>
         )}
+        {cryptoPicks.length && cryptoReadOnly.length ? (
+          <div className="decision-readonly-setups">
+            <p className="muted small" role="status" data-testid="crypto-readonly-note">
+              Read-only setup details - paper preview is blocked by current safety or freshness gates.
+            </p>
+            <div className="decision-card-grid decision-readonly-grid" data-testid="crypto-readonly-grid">
+              {cryptoReadOnly.map((result) => (
+                <DecisionCard
+                  key={result.ticker}
+                  result={result}
+                  decision={decisionsBySymbol.get(result.ticker) ?? null}
+                  automation={automation}
+                />
+              ))}
+            </div>
+          </div>
+        ) : null}
       </section>
     </div>
   );

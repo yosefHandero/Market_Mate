@@ -285,6 +285,11 @@ class PredictionSnapshotORM(Base):
     resolved_late: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # SHA-256 over the immutable core prediction fields, set once at insert.
     record_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    policy_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    policy_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_role: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    decision_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    learned_artifacts_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 class EvidenceCampaignORM(Base):
@@ -305,6 +310,11 @@ class EvidenceCampaignORM(Base):
     feature_version: Mapped[str] = mapped_column(String(32), default="")
     config_fingerprint: Mapped[str] = mapped_column(String(64), default="", index=True)
     code_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    effective_policy_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    effective_policy_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    effective_decision_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    learned_artifacts_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    learned_artifacts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     close_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     notes_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -418,6 +428,11 @@ class WalkForwardRunORM(Base):
     config_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     code_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
     engine_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    policy_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    policy_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    learned_artifacts_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    learned_artifacts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     universe_json: Mapped[str] = mapped_column(Text, default="[]")
     data_quality_json: Mapped[str] = mapped_column(Text, default="{}")
 
@@ -434,6 +449,12 @@ class WalkForwardPredictionORM(Base):
     ticker: Mapped[str] = mapped_column(String(24), index=True)
     selection_rank: Mapped[int] = mapped_column(Integer, default=0)
     sample_source: Mapped[str] = mapped_column(String(32), default="historical", index=True)
+    # Which DecisionPolicy produced this prediction (walk-forward evaluates
+    # replayable policies; NULL means the pre-policy weekly path).
+    policy_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    policy_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    learned_artifacts_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     pattern_name: Mapped[str] = mapped_column(String(64), default="range_neutral")
     decision_signal: Mapped[str] = mapped_column(String(16), default="BUY")
     confidence: Mapped[float] = mapped_column(Float, default=0.0)

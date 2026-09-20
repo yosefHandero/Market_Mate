@@ -117,25 +117,13 @@ export function LiveForwardProgressPanel({
             </p>
           ) : null}
 
-          {(progress.missed_windows_14d ?? 0) > 0 ? (
-            <p className="negative small" style={{ margin: '8px 0 0' }} data-testid="live-forward-missed-windows">
-              {progress.missed_windows_14d} expected scan window(s) missed in the last 14 days.
-            </p>
-          ) : null}
-
-          {progress.scan_gap_exceeded ? (
-            <p className="negative small" style={{ margin: '8px 0 0' }} data-testid="live-forward-scan-gap">
-              {progress.note ?? 'A scheduled scan window may have been missed.'}
-            </p>
-          ) : (
-            <p className="muted small" style={{ margin: '8px 0 0' }}>
-              Last scan{' '}
-              {progress.last_scan_age_minutes != null
-                ? `${Math.round(progress.last_scan_age_minutes)} min ago`
-                : 'unknown'}
-              . Scheduler cadence within expected bounds.
-            </p>
-          )}
+          <p className="muted small" style={{ margin: '8px 0 0' }}>
+            Last scan{' '}
+            {progress.last_scan_age_minutes != null
+              ? `${Math.round(progress.last_scan_age_minutes)} min ago`
+              : 'unknown'}
+            . Evidence accumulates while the app is running.
+          </p>
         </>
       )}
     </section>

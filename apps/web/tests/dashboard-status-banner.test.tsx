@@ -3,7 +3,7 @@
  */
 import { render, screen, within } from '@testing-library/react';
 import React from 'react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DashboardStatusBanner,
   computeSystemReadiness,
@@ -166,6 +166,50 @@ function serverReadiness(
 }
 
 describe('DashboardStatusBanner system readiness', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-22T12:05:00Z'));
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it('ages stored bars and identifies stale provider observations without changing the row', () => {
+    vi.setSystemTime(new Date('2026-09-19T12:00:00Z'));
+    const row = result({
+      asset_type: 'crypto',
+      created_at: '2026-09-08T12:00:00Z',
+      bar_as_of: '2026-09-08T11:55:00Z',
+    });
+    const oldScan = { ...scan([row]), created_at: row.created_at, watchlist_size: 69 };
+    render(<DashboardStatusBanner health={health({ scan_fresh: false })} automation={automation()} latestScan={oldScan} />);
+    expect(screen.getByText('>24h stale')).toBeInTheDocument();
+    expect(screen.getByText('ok (last scan)')).toBeInTheDocument();
+    expect(screen.getByTestId('stale-scan-banner')).toHaveTextContent('historical snapshots');
+    expect(screen.getByTestId('scan-coverage')).toHaveTextContent('1 candidate results (0 stock, 1 crypto) from 69 configured symbols, including benchmarks');
+    expect(row.bar_age_minutes).toBe(5);
+    expect(row.provider_status).toBe('ok');
+  });
+
+  it('ages legacy stored bar ages from the observation time when bar_as_of is missing', () => {
+    const oldScan = { ...scan([result({ created_at: '2026-05-21T12:00:00Z' })]), created_at: '2026-05-21T12:00:00Z' };
+    render(<DashboardStatusBanner health={health({ scan_fresh: false })} automation={automation()} latestScan={oldScan} />);
+    expect(screen.getByText('>24h stale')).toBeInTheDocument();
+    expect(screen.queryByText('fresh', { exact: true })).not.toBeInTheDocument();
+  });
+
+  it('uses an absolute recent bar timestamp without adding the stored age again', () => {
+    const recentScan = scan([result({ bar_as_of: '2026-05-22T12:00:00Z', bar_age_minutes: 500 })]);
+    render(<DashboardStatusBanner health={health()} automation={automation()} latestScan={recentScan} systemReadiness={serverReadiness()} />);
+    expect(screen.getByText('fresh', { exact: true })).toBeInTheDocument();
+    expect(screen.queryByTestId('stale-scan-banner')).not.toBeInTheDocument();
+  });
+
+  it('interprets timezone-naive SQLite bar timestamps as UTC', () => {
+    render(<DashboardStatusBanner health={health()} automation={automation()} latestScan={scan([result({ bar_as_of: '2026-05-22T11:00:00' })])} />);
+    expect(screen.getByText('stale', { exact: true })).toBeInTheDocument();
+    expect(screen.queryByText('fresh', { exact: true })).not.toBeInTheDocument();
+  });
+
   it('passes core system readiness even when scheduler and worker are off', () => {
     render(
       React.createElement(DashboardStatusBanner, {

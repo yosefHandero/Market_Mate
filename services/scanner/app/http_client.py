@@ -15,9 +15,8 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 RETRY_JITTER_RATIO = 0.2
-# Cap provider-dictated Retry-After / backoff sleeps. A single 429 carrying a
-# large Retry-After must not freeze a scan for minutes while the provider guard
-# holds its pace lock. Matches RATE_LIMIT_COOLDOWN_SECONDS in provider_resilience.
+# Bound time spent retrying in one request. Longer provider Retry-After values
+# defer the request instead of retrying earlier than the provider permits.
 MAX_RETRY_BACKOFF_SECONDS = 60.0
 
 
@@ -182,6 +181,14 @@ async def request_json(
             return parse_json_response(response, provider=provider, url=url)
         except ProviderRequestError as exc:
             last_error = exc
+            if float(exc.retry_after_seconds or 0.0) > MAX_RETRY_BACKOFF_SECONDS:
+                if on_backoff is not None:
+                    deferred = on_backoff(
+                        exc.retry_after_seconds, rate_limited=exc.status_code == 429
+                    )
+                    if asyncio.iscoroutine(deferred):
+                        await deferred
+                raise
             if exc.status_code == 429:
                 logger.warning(
                     "provider rate limited",

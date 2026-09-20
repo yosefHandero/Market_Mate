@@ -264,6 +264,7 @@ describe('DecisionCard', () => {
     expect(screen.getByTestId('confidence-score')).toHaveTextContent('88');
     expect(screen.getByTestId('data-quality')).toHaveTextContent('Good');
     expect(screen.getByTestId('current-price')).toHaveTextContent('$100.00');
+    expect(screen.getByTestId('actionability-status')).toHaveTextContent(/paper preview eligible/i);
     expect(screen.getByTestId('pattern-name')).toHaveTextContent(/breakout_20d_high/i);
     expect(screen.getByTestId('evidence-provenance')).toHaveTextContent(/historical-only/i);
     // Exit window / stop-growing instead of a SELL label.
@@ -273,6 +274,7 @@ describe('DecisionCard', () => {
     expect(screen.getByTestId('invalidation-level')).toHaveTextContent(/\$99\.00/);
     expect(screen.getByTestId('risk-warning')).toBeInTheDocument();
     expect(screen.getByTestId('blocked-reason')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /preview paper trade/i })).toBeEnabled();
   });
 
   it('shows insufficient evidence when no upside probability is available', () => {
@@ -288,6 +290,64 @@ describe('DecisionCard', () => {
     );
 
     expect(screen.getByTestId('upside-probability')).toHaveTextContent(/insufficient evidence/i);
+    expect(screen.getByTestId('upside-probability').closest('.decision-card-metric')).toHaveTextContent(
+      /Upside probability\s+Insufficient evidence/i,
+    );
+  });
+
+  it('keeps metric labels separated from values', () => {
+    render(
+      <DecisionCard
+        result={sampleResult({ price: 514.39, confidence_score: 40 })}
+        decision={sampleDecision({ confidence_score: 40 })}
+        automation={sampleAutomation()}
+      />,
+    );
+
+    const metrics = screen
+      .getByTestId('decision-card-AAPL')
+      .querySelector('.decision-card-metrics') as HTMLElement;
+    expect(metrics).toHaveTextContent(/Confidence\s+40/);
+    expect(metrics).toHaveTextContent(/Price\s+\$514\.39/);
+    expect(metrics).not.toHaveTextContent(/Confidence40/i);
+    expect(metrics).not.toHaveTextContent(/Price\$514\.39/i);
+  });
+
+  it('renders hard-blocked stale candidates as read-only setup details without preview action', () => {
+    render(
+      <DecisionCard
+        result={sampleResult({
+          recommended_action: 'blocked',
+          gate_passed: false,
+          gate_reason: 'Blocked by freshness.',
+          execution_eligibility: 'blocked',
+          provider_status: 'critical',
+          bar_age_minutes: 420,
+          freshness_flags: { bars: 'stale' },
+          readiness_hard_stop: true,
+          readiness_reason: 'Hard stop: provider is critical and bars are stale over 6 hours.',
+        })}
+        decision={sampleDecision({
+          recommended_action: 'blocked',
+          execution_eligibility: 'blocked',
+          gate_passed: false,
+          provider_status: 'critical',
+          bar_age_minutes: 420,
+          freshness_flags: { bars: 'stale' },
+          readiness_hard_stop: true,
+          readiness_reason: 'Hard stop: provider is critical and bars are stale over 6 hours.',
+        })}
+        automation={sampleAutomation()}
+      />,
+    );
+
+    const card = screen.getByTestId('decision-card-AAPL');
+    expect(card).toHaveAttribute('data-color', 'gray');
+    expect(screen.getByTestId('actionability-status')).toHaveTextContent(/read-only setup/i);
+    expect(screen.queryByRole('button', { name: /preview paper trade/i })).not.toBeInTheDocument();
+    expect(screen.getByTestId('setup-details')).toHaveTextContent(/view setup details/i);
+    expect(screen.getByTestId('setup-details')).toHaveTextContent(/provider is critical/i);
+    expect(screen.getByTestId('setup-details')).toHaveTextContent(/bars are stale/i);
   });
 
   it('shows a live-forward-proven provenance badge when evidence is proven', () => {

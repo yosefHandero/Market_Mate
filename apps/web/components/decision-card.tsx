@@ -33,6 +33,25 @@ function formatCurrency(value: number | null | undefined) {
   });
 }
 
+function Metric({
+  label,
+  value,
+  testId,
+}: {
+  label: string;
+  value: string | number;
+  testId: string;
+}) {
+  return (
+    <div className="decision-card-metric">
+      <span className="muted small decision-card-metric-label">{label}</span>{' '}
+      <strong className="decision-card-metric-value" data-testid={testId}>
+        {value}
+      </strong>
+    </div>
+  );
+}
+
 export function DecisionCard({
   result,
   decision,
@@ -75,6 +94,7 @@ export function DecisionCard({
   const previewDisabledReason = !previewEnabled
     ? actionGate.reason.replace(/^Blocked:\s*/i, '')
     : undefined;
+  const blockedReason = actionGate.reason.replace(/^Blocked:\s*/i, '');
 
   return (
     <article
@@ -90,32 +110,28 @@ export function DecisionCard({
             {result.asset_type === 'crypto' ? 'Crypto' : 'Stock'}
           </p>
         </div>
-        <span
-          className={`badge ${liveProven ? 'green' : ''}`.trim()}
-          data-testid="evidence-provenance"
-          title="Whether this candidate has live paper-forward evidence or only historical evidence."
-        >
-          {provenance}
-        </span>
+        <div className="decision-card-header-badges">
+          <span
+            className={`badge ${blocked ? 'amber' : 'green'}`}
+            data-testid="actionability-status"
+          >
+            {blocked ? 'Read-only setup' : 'Paper preview eligible'}
+          </span>
+          <span
+            className={`badge ${liveProven ? 'green' : ''}`.trim()}
+            data-testid="evidence-provenance"
+            title="Whether this candidate has live paper-forward evidence or only historical evidence."
+          >
+            {provenance}
+          </span>
+        </div>
       </header>
 
       <div className="decision-card-metrics">
-        <div>
-          <span className="muted small">Upside probability</span>
-          <strong data-testid="upside-probability">{upside}</strong>
-        </div>
-        <div>
-          <span className="muted small">Confidence</span>
-          <strong data-testid="confidence-score">{confidence}</strong>
-        </div>
-        <div>
-          <span className="muted small">Data quality</span>
-          <strong data-testid="data-quality">{dataQuality}</strong>
-        </div>
-        <div>
-          <span className="muted small">Price</span>
-          <strong data-testid="current-price">{formatCurrency(result.price)}</strong>
-        </div>
+        <Metric label="Upside probability" value={upside} testId="upside-probability" />
+        <Metric label="Confidence" value={confidence} testId="confidence-score" />
+        <Metric label="Data quality" value={dataQuality} testId="data-quality" />
+        <Metric label="Price" value={formatCurrency(result.price)} testId="current-price" />
       </div>
 
       <p className="muted small decision-card-pattern" data-testid="pattern-name">
@@ -202,35 +218,54 @@ export function DecisionCard({
         {recommendedActionLine(recommendedAction, result.decision_signal)}
       </p>
 
-      <div className="decision-card-actions">
-        <button
-          type="button"
-          className="button button-primary"
-          onClick={() => void runPreview()}
-          disabled={!previewEnabled}
-          aria-disabled={!previewEnabled}
-          title={previewDisabledReason}
-          aria-label={
-            previewDisabledReason
-              ? `Preview unavailable: ${previewDisabledReason}`
-              : 'Preview paper trade'
-          }
+      {blocked ? (
+        <details
+          className="ui-disclosure decision-card-setup-details"
+          data-testid="setup-details"
         >
-          {busy === 'preview' ? 'Previewing...' : 'Preview Paper Trade'}
-        </button>
-        {canAct && preview ? (
+          <summary className="ui-disclosure-summary muted small">View setup details</summary>
+          <div className="decision-card-setup-details-body small">
+            <p>Paper preview is unavailable for this setup.</p>
+            <p>
+              <span className="muted">Reason:</span> {blockedReason}
+            </p>
+            <p>
+              <span className="muted">Recommended action:</span>{' '}
+              {recommendedActionLine(recommendedAction, result.decision_signal)}
+            </p>
+          </div>
+        </details>
+      ) : (
+        <div className="decision-card-actions">
           <button
             type="button"
-            className="button button-secondary"
-            onClick={() => void runPlace()}
-            disabled={!placeEnabled}
+            className="button button-primary"
+            onClick={() => void runPreview()}
+            disabled={!previewEnabled}
+            aria-disabled={!previewEnabled}
+            title={previewDisabledReason}
+            aria-label={
+              previewDisabledReason
+                ? `Preview unavailable: ${previewDisabledReason}`
+                : 'Preview paper trade'
+            }
           >
-            {busy === 'place' ? 'Placing...' : 'Place Dry Run'}
+            {busy === 'preview' ? 'Previewing...' : 'Preview Paper Trade'}
           </button>
-        ) : null}
-      </div>
+          {canAct && preview ? (
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={() => void runPlace()}
+              disabled={!placeEnabled}
+            >
+              {busy === 'place' ? 'Placing...' : 'Place Dry Run'}
+            </button>
+          ) : null}
+        </div>
+      )}
 
-      {preview ? (
+      {!blocked && preview ? (
         <details className="ui-disclosure decision-card-preview">
           <summary className="ui-disclosure-summary muted small">Preview details</summary>
           <div className="decision-card-preview-body small">

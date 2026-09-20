@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MarketStatus = Literal["bullish", "neutral", "bearish"]
@@ -19,7 +19,11 @@ DataGrade = Literal["decision", "research", "degraded"]
 RecommendedAction = Literal["ignore", "review", "preview", "dry_run", "blocked"]
 ReadinessBand = Literal["high", "watch", "low", "none"]
 OutcomeHorizon = Literal["15m", "1h", "1d", "1w"]
-SampleSource = Literal["historical", "backfilled_replay", "live_paper_forward", "out_of_sample"]
+# "live_holdout" is the current name for the live-forward ticker-hash holdout;
+# "out_of_sample" is its legacy stored spelling (still readable, never rewritten).
+SampleSource = Literal[
+    "historical", "backfilled_replay", "live_paper_forward", "out_of_sample", "live_holdout"
+]
 WeeklyEvidenceBasis = Literal["historical_only", "live_forward_proven", "mixed", "insufficient"]
 WeeklyDirectionalBias = Literal["bullish", "bearish", "neutral"]
 JournalActionState = Literal["watching", "reviewed", "took", "skipped"]
@@ -86,19 +90,6 @@ class GateCheck(BaseModel):
     name: str
     passed: bool
     detail: str
-
-
-class VariantComparison(BaseModel):
-    primary_variant: str
-    comparison_variant: str
-    comparison_signal: DecisionSignal = "HOLD"
-    comparison_raw_score: float = 0.0
-    comparison_calibrated_confidence: float = 0.0
-    comparison_provider_status: ProviderStatus = "ok"
-    comparison_evidence_quality: EvidenceQuality = "low"
-    comparison_execution_eligibility: ExecutionEligibility = "not_applicable"
-    changed: bool = False
-    summary: str = "Shadow comparison disabled."
 
 
 class ErrorDetails(BaseModel):
@@ -249,7 +240,6 @@ class ScanResult(BaseModel):
     selection_rank: int | None = None
     is_top_pick: bool = False
     layer_details: dict = {}
-    comparison: VariantComparison | None = None
     created_at: datetime
 
 
@@ -258,7 +248,6 @@ class ScanRun(BaseModel):
     created_at: datetime
     market_status: MarketStatus
     strategy_variant: str = "layered-v4"
-    shadow_enabled: bool = False
     scan_count: int
     watchlist_size: int
     alerts_sent: int = 0
@@ -545,7 +534,6 @@ class SystemReadinessDiagnostics(BaseModel):
     """First-class answers to 'why no candidates?' and 'did we miss a window?'."""
 
     top_rejection_reasons: list[dict[str, object]] = []
-    missed_windows_14d: int = 0
     pending_prediction_resolutions: int = 0
     candidate_shortage: bool = False
 
@@ -899,6 +887,9 @@ class ValidationBucket(BaseModel):
     avg_loss_return: float | None = None
     expectancy: float | None = None
     avg_return_after_friction: float | None = None
+    # Derived view: win rate recomputed after friction is deducted from the
+    # canonical raw returns. Raw outcomes stay canonical; this reinterprets.
+    win_rate_after_friction: float | None = None
     expectancy_after_friction: float | None = None
     false_positive_rate: float | None = None
     min_sample_met: bool = True
@@ -920,8 +911,11 @@ class ValidationSummary(BaseModel):
     evaluated_fraction: float | None = None
     confidence_note: str = ""
     overall: ValidationBucket
-    in_sample: ValidationBucket | None = None
-    out_of_sample: ValidationBucket | None = None
+    # Recency half-split of the selected window. This is a stability check on
+    # serving data, not a genuine out-of-sample test (the strategy saw none of
+    # it in training, but thresholds were tuned on overlapping history).
+    earlier_window: ValidationBucket | None = None
+    recent_window: ValidationBucket | None = None
     degradation_warnings: list[str] = []
     regime_advisories: list[str] = []
     by_signal: list[ValidationBucket]
@@ -1062,6 +1056,18 @@ class PredictionAccuracyMetrics(BaseModel):
     below_range_count: int = 0
     above_range_count: int = 0
     missed_count: int = 0
+    # Headline honesty metrics: was the direction right, and was the stated
+    # probability sharp (Brier: lower is better, 0.25 = coin-flip forecast)?
+    direction_evaluated_count: int = 0
+    direction_hit_rate_pct: float | None = None
+    brier_score: float | None = None
+    # Missingness: evaluated snapshots whose resolution never found a usable
+    # bar. High missingness silently biases every other number here.
+    missing_rate_pct: float | None = None
+    # Scope: which prediction campaign these numbers cover ("all campaigns"
+    # mixes strategy identities and is only for transparency).
+    campaign_id: str | None = None
+    scope: str = "all_campaigns"
     note: str | None = None
 
 
@@ -1108,9 +1114,6 @@ class LiveForwardProgress(BaseModel):
     by_asset: list[LiveForwardAssetProgress] = []
     last_scan_at: datetime | None = None
     last_scan_age_minutes: float | None = None
-    scan_gap_exceeded: bool = False
-    max_expected_scan_gap_minutes: float | None = None
-    missed_windows_14d: int = 0
     note: str | None = None
 
 
@@ -1147,6 +1150,8 @@ class ConfidenceCalibrationBucket(BaseModel):
 class ConfidenceCalibration(BaseModel):
     buckets: list[ConfidenceCalibrationBucket] = []
     mean_abs_reliability_gap_pct: float | None = None
+    campaign_id: str | None = None
+    scope: str = "all_campaigns"
     note: str | None = None
 
 
@@ -1196,6 +1201,13 @@ class WalkForwardAssetMetrics(BaseModel):
     resolved_count: int = 0
     pending_count: int = 0
     upside_hit_rate_pct: float | None = None
+    # Derived view: hit rate after friction is deducted from canonical raw returns.
+    upside_hit_rate_after_friction_pct: float | None = None
+    # Brier score of stated upside probability vs realized direction (lower is
+    # better; 0.25 = coin flip). Missing resolution rate reports how many
+    # selected predictions never found a usable forward bar.
+    brier_score: float | None = None
+    missing_resolution_rate_pct: float | None = None
     avg_return_pct: float | None = None
     avg_return_after_friction_pct: float | None = None
     avg_return_after_friction_stressed_pct: float | None = None
@@ -1268,6 +1280,11 @@ class WalkForwardPilotVerdict(BaseModel):
     summary: str = "Historical walk-forward proof only; not a real-money trust grant."
     checks: list[GateCheck] = []
     by_asset: list[WalkForwardAssetVerdict] = []
+    # Trials ledger: distinct configurations evaluated against this history.
+    # Many trials weaken any single passing verdict (multiple testing).
+    trials: dict[str, Any] | None = None
+    # Non-gating honesty caveats (survivorship, adjustment policy, ...).
+    caveats: list[str] = []
 
 
 class EvidenceTrackDescriptor(BaseModel):
@@ -1303,6 +1320,14 @@ class WalkForwardRunSummary(BaseModel):
     config_fingerprint: str | None = None
     code_commit: str | None = None
     engine_version: str | None = None
+    policy_id: str | None = None
+    policy_version: str | None = None
+    decision_fingerprint: str | None = None
+    learned_artifacts_fingerprint: str | None = None
+    # Ruler identity: how this evidence was judged. Separate from the decision
+    # fingerprints of the evidence itself; ruler changes never rotate campaigns.
+    ruler_version: str | None = None
+    ruler_fingerprint: str | None = None
     universe: list[str] = []
     universe_source: str | None = None
     data_quality_ok: bool | None = None
@@ -1336,6 +1361,35 @@ class WalkForwardProofRunResponse(BaseModel):
     summary: WalkForwardRunSummary
 
 
+class PolicyPromotionCheck(BaseModel):
+    name: str
+    passed: bool
+    detail: str
+
+
+class PolicyPromotionReport(BaseModel):
+    champion_policy_id: str
+    challenger_policy_id: str
+    challenger_replayable: bool = True
+    ruler_version: str
+    ruler_fingerprint: str | None = None
+    champion_decision_fingerprint: str | None = None
+    challenger_decision_fingerprint: str | None = None
+    gates_cleared: bool
+    walk_forward_holdout_passed: bool
+    summary: str
+    checks: list[PolicyPromotionCheck] = []
+    paired_returns_total: int = 0
+    paired_returns_informative: int = 0
+    paired_returns_both_abstained: int = 0
+    paired_returns_resolution_clusters: int = 0
+    paired_returns_cluster_metadata_complete: bool = False
+    paired_returns_superior: bool = False
+    pair_exclusion_counts: dict[str, int] = {}
+    effective_champion_policy_id: str
+    requested_champion_policy_id: str
+
+
 class ProofSummaryResponse(BaseModel):
     generated_at: datetime
     ledger: PaperLedgerSummaryResponse
@@ -1351,6 +1405,11 @@ class ProofSummaryResponse(BaseModel):
     scan_fresh: bool | None = None
     mark_prices_source: str = "latest_scan"
     note: str | None = None
+    # Ruler identity for the proof summary as a whole. This describes how
+    # evidence is judged and stays separate from decision policy fingerprints.
+    ruler_version: str | None = None
+    ruler_fingerprint: str | None = None
+    policy_promotion: PolicyPromotionReport | None = None
 
 
 class PromotionGateResult(BaseModel):
@@ -1422,7 +1481,6 @@ class ReplayRequest(BaseModel):
     interval_minutes: int = Field(default=60, ge=5, le=1440)
     warmup_bars: int = Field(default=30, ge=10, le=300)
     strategy_variant: str | None = None
-    compare_strategy_variant: str | None = None
     include_secondary_providers: bool = False
     apply_friction: bool = True
     replay_mode: Literal["intraday", "weekly"] = "intraday"
@@ -1457,7 +1515,6 @@ class ReplaySignalRow(BaseModel):
     strategy_version: str
     market_status: MarketStatus
     provider_status: ProviderStatus
-    comparison: VariantComparison | None = None
     entry_price: float
     future_price: float | None = None
     raw_return_pct: float | None = None
@@ -1481,7 +1538,6 @@ class ReplayResponse(BaseModel):
     strategy_id: str
     strategy_version: str
     strategy_variant: str = "layered-v4"
-    compare_strategy_variant: str | None = None
     start: datetime
     end: datetime
     interval_minutes: int

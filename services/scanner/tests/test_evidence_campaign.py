@@ -36,7 +36,6 @@ _B1_BEHAVIOR_SETTING_KEYS = (
     "calibration_min_signal_samples",
     "calibration_min_score_band_samples",
     "validation_win_threshold_pct",
-    "validation_false_positive_threshold_pct",
     "weekly_out_of_sample_holdout_ratio",
     "track_hold_outcomes",
     "weekly_pattern_gate_min_historical_samples",
@@ -68,7 +67,9 @@ _B1_PROVIDER_OVERLAY_SETTING_KEYS = (
     "defillama_enabled",
 )
 
-# Operational / walk-forward-admin knobs that must NOT enter the live fingerprint.
+# Operational / walk-forward-admin / ruler-only knobs that must NOT enter the
+# live fingerprint. Ruler-only keys judge stored evidence without changing any
+# produced decision, so mutating them must never rotate prediction campaigns.
 _OPERATIONAL_ONLY_SETTING_KEYS = (
     "log_level",
     "scan_interval_seconds",
@@ -82,7 +83,6 @@ _OPERATIONAL_ONLY_SETTING_KEYS = (
     "public_read_access_enabled",
     "cors_allowed_origins",
     "weekly_daily_bar_cache_ttl_seconds",
-    "live_forward_max_scan_gap_minutes",
     "paper_loop_enabled",
     "proof_target_years",
     "proof_holdout_months",
@@ -91,6 +91,10 @@ _OPERATIONAL_ONLY_SETTING_KEYS = (
     "proof_atr_lookback_days",
     "proof_confidence_shrinkage_k",
     "proof_top_n_per_asset",
+    # Ruler-only (evaluation) keys
+    "validation_false_positive_threshold_pct",
+    "validation_min_sample_size",
+    "proof_eval_step_days",
 )
 
 
@@ -258,6 +262,69 @@ class EvidenceCampaignServiceTests(unittest.TestCase):
             ).scalar_one()
         self.assertEqual(closed.status, "closed")
         self.assertEqual(closed.close_reason, "config_change")
+
+    def test_requested_champion_change_does_not_rotate_same_effective_policy(self) -> None:
+        service = self._service()
+        first = service.get_or_create_active_campaign(
+            effective_policy_id="hybrid_legacy",
+            effective_policy_version="hybrid-v4.2",
+            effective_decision_fingerprint="effective-fp-1",
+            learned_artifacts_fingerprint="artifact-fp-1",
+        )
+
+        self.settings.brain_champion_policy_id = "weekly_probability"
+        second = self._service().get_or_create_active_campaign(
+            effective_policy_id="hybrid_legacy",
+            effective_policy_version="hybrid-v4.2",
+            effective_decision_fingerprint="effective-fp-1",
+            learned_artifacts_fingerprint="artifact-fp-1",
+        )
+
+        self.assertEqual(first.campaign_id, second.campaign_id)
+        self.assertEqual(self._campaign_count(), 1)
+
+    def test_effective_decision_fingerprint_change_rotates_campaign(self) -> None:
+        first = self._service().get_or_create_active_campaign(
+            effective_policy_id="hybrid_legacy",
+            effective_policy_version="hybrid-v4.2",
+            effective_decision_fingerprint="effective-fp-1",
+            learned_artifacts_fingerprint="artifact-fp-1",
+        )
+        rotated = self._service().get_or_create_active_campaign(
+            effective_policy_id="hybrid_legacy",
+            effective_policy_version="hybrid-v4.2",
+            effective_decision_fingerprint="effective-fp-2",
+            learned_artifacts_fingerprint="artifact-fp-1",
+        )
+
+        self.assertNotEqual(first.campaign_id, rotated.campaign_id)
+        self.assertNotEqual(first.config_fingerprint, rotated.config_fingerprint)
+        self.assertEqual(self._campaign_count(), 2)
+        with self.SessionLocal() as session:
+            closed = session.execute(
+                select(EvidenceCampaignORM).where(
+                    EvidenceCampaignORM.campaign_id == first.campaign_id
+                )
+            ).scalar_one()
+        self.assertEqual(closed.status, "closed")
+        self.assertEqual(closed.close_reason, "config_change")
+
+    def test_effective_learned_artifact_change_rotates_campaign(self) -> None:
+        first = self._service().get_or_create_active_campaign(
+            effective_policy_id="hybrid_legacy",
+            effective_policy_version="hybrid-v4.2",
+            effective_decision_fingerprint="effective-fp-1",
+            learned_artifacts_fingerprint="artifact-fp-1",
+        )
+        rotated = self._service().get_or_create_active_campaign(
+            effective_policy_id="hybrid_legacy",
+            effective_policy_version="hybrid-v4.2",
+            effective_decision_fingerprint="effective-fp-2",
+            learned_artifacts_fingerprint="artifact-fp-2",
+        )
+
+        self.assertNotEqual(first.campaign_id, rotated.campaign_id)
+        self.assertEqual(rotated.learned_artifacts_fingerprint, "artifact-fp-2")
 
 
 if __name__ == "__main__":

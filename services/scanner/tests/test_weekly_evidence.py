@@ -1,8 +1,8 @@
 import unittest
 
 from app.config import Settings
-from app.core.weekly_backtest import PatternBacktestStats
-from app.core.weekly_evidence import evaluate_weekly_pattern_evidence
+from app.brain.weekly_backtest import PatternBacktestStats
+from app.brain.weekly_evidence import evaluate_weekly_pattern_evidence
 
 
 class WeeklyEvidenceTests(unittest.TestCase):

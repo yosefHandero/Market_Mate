@@ -27,7 +27,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
                 asyncio.run(service.run_forever())
 
         instance_id = service.settings.app_instance_id
-        repository.acquire_lease.assert_called_once_with(instance_id)
+        repository.acquire_lease.assert_called_once_with(instance_id, for_maintenance=True)
         repository.heartbeat.assert_called_once_with(instance_id)
         scanner_service.refresh_due_signal_outcomes.assert_awaited_once()
         scanner_service.close_open_positions_past_horizon.assert_awaited_once()
@@ -86,7 +86,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
         repository.reset_missed_run_on_startup.assert_called_once_with(
             interval_seconds=service.settings.scan_interval_seconds
         )
-        repository.acquire_lease.assert_called_once_with(instance_id)
+        repository.acquire_lease.assert_called_once_with(instance_id, for_maintenance=True)
         repository.due_for_run.assert_called_once_with()
         repository.mark_run_started.assert_not_called()
         scanner_service.run_scan.assert_not_awaited()
@@ -120,7 +120,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
                     interval_seconds=service.settings.scan_interval_seconds
                 ),
                 call.recover_stale_run(),
-                call.acquire_lease(instance_id),
+                call.acquire_lease(instance_id, for_maintenance=True),
                 call.heartbeat(instance_id),
                 call.due_for_run(),
                 call.mark_run_started(instance_id),

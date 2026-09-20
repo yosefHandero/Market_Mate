@@ -8,8 +8,9 @@ import json
 import logging
 from statistics import median, quantiles
 import time
+from typing import Any
 
-from sqlalchemy import desc, func, inspect, or_, select, update
+from sqlalchemy import and_, desc, func, inspect, or_, select, update
 from sqlalchemy.exc import OperationalError
 
 from app.config import get_settings
@@ -20,17 +21,19 @@ from app.core.decision_presentation import (
     evidence_grade_label,
 )
 from app.core.freshness import signal_age_minutes as _signal_age_minutes
-from app.core.structural_prediction import evaluate_exit_window_outcome_with_disambiguation, evaluate_prediction_accuracy
-from app.core.weekly_backtest import PatternBacktestStats
-from app.core.weekly_evidence import evaluate_weekly_pattern_evidence
+from app.brain.structural_prediction import evaluate_exit_window_outcome_with_disambiguation, evaluate_prediction_accuracy
+from app.brain.weekly_backtest import PatternBacktestStats
+from app.brain.weekly_evidence import evaluate_weekly_pattern_evidence
 from app.core.freshness_policy import enrich_scan_run_freshness
-from app.core.ranking import display_sort_key, is_buy_candidate
+from app.brain.gates import is_buy_candidate
+from app.core.ranking import display_sort_key
 from app.core.signals import map_score_to_decision_signal
 from app.core.strategy_contract import build_strategy_evaluation_metadata, determine_recommended_action
 from app.db import SessionLocal, engine
 from app.models.journal import JournalEntryORM
 from app.models.scan import (
     AutomationIntentORM,
+    EvidenceCampaignORM,
     ExecutionAuditORM,
     PaperPositionORM,
     PredictionSnapshotORM,
@@ -79,7 +82,6 @@ from app.schemas import (
     ThresholdSweepRow,
     ValidationBucket,
     ValidationSummary,
-    VariantComparison,
     WeeklyEvidenceProgress,
     WeeklyPatternPrediction,
 )
@@ -114,6 +116,13 @@ _SQLITE_LOCK_MESSAGES = (
     "database table is locked",
     "database schema is locked",
 )
+
+# The live-forward holdout family. "live_holdout" is the current stored name;
+# "out_of_sample" is the legacy spelling on older rows (read-compatible, never
+# rewritten). Rows in this family are genuinely held out: they must never feed
+# served confidence calibration, trade-gate evidence, or any other statistic
+# that flows back into production decisions.
+LIVE_HOLDOUT_SOURCES: tuple[str, ...] = ("out_of_sample", "live_holdout")
 
 
 def _is_transient_sqlite_lock(exc: OperationalError) -> bool:
@@ -278,7 +287,26 @@ class ScanRepository:
             column["name"]
             for column in inspect(self._schema_inspection_bind()).get_columns("prediction_snapshots")
         }
-        return "campaign_id" in columns and "record_hash" in columns
+        return {
+            "campaign_id",
+            "record_hash",
+            "learned_artifacts_fingerprint",
+        }.issubset(columns)
+
+    def _has_policy_columns(self) -> bool:
+        if not self._prediction_snapshots_table_exists():
+            return False
+        columns = {
+            column["name"]
+            for column in inspect(self._schema_inspection_bind()).get_columns("prediction_snapshots")
+        }
+        return {
+            "policy_id",
+            "policy_version",
+            "decision_role",
+            "decision_fingerprint",
+            "learned_artifacts_fingerprint",
+        }.issubset(columns)
 
     def _expected_friction_bps(self, asset_type: str) -> float:
         settings = self.settings
@@ -379,16 +407,20 @@ class ScanRepository:
 
     def _live_forward_sample_source(self, ticker: str) -> str:
         """Deterministically assign a live outcome to the in-sample live_paper_forward
-        track or the out-of-sample holdout, by ticker. The holdout's real forward
-        outcomes are never used for calibration, so they form a genuine out-of-sample
-        evidence track that can accrue automatically alongside live_paper_forward."""
+        track or the live holdout, by ticker. The holdout's real forward outcomes are
+        never used for calibration or served statistics, so they form a genuinely
+        held-out live evidence track that accrues alongside live_paper_forward.
+
+        New rows are stamped "live_holdout" (honest name: it is held-out live-forward
+        data, not walk-forward out-of-sample). Legacy rows stamped "out_of_sample"
+        are read-compatible via LIVE_HOLDOUT_SOURCES and never rewritten."""
         ratio = float(getattr(self.settings, "weekly_out_of_sample_holdout_ratio", 0.0) or 0.0)
         if ratio <= 0.0:
             return "live_paper_forward"
         ratio = min(ratio, 1.0)
         digest = hashlib.md5((ticker or "").strip().upper().encode("utf-8")).hexdigest()
         bucket = int(digest[:8], 16) / 0xFFFFFFFF
-        return "out_of_sample" if bucket < ratio else "live_paper_forward"
+        return "live_holdout" if bucket < ratio else "live_paper_forward"
 
     def _score_band(self, score: float) -> str:
         if score >= 90:
@@ -710,6 +742,11 @@ class ScanRepository:
             avg_loss_return=avg_loss_return,
             expectancy=expectancy,
             avg_return_after_friction=adjusted_avg_return,
+            win_rate_after_friction=(
+                round((len(adjusted_wins) / len(friction_adjusted_returns)) * 100, 2)
+                if friction_adjusted_returns
+                else None
+            ),
             expectancy_after_friction=adjusted_expectancy,
             false_positive_rate=false_positive_rate,
             min_sample_met=min_sample_met,
@@ -1007,15 +1044,6 @@ class ScanRepository:
         except json.JSONDecodeError:
             return {}
         return decoded if isinstance(decoded, dict) else {}
-
-    def _deserialize_comparison(self, raw_value: str | None) -> VariantComparison | None:
-        payload = self._deserialize_dict(raw_value)
-        if not payload:
-            return None
-        try:
-            return VariantComparison(**payload)
-        except Exception:
-            return None
 
     def _bucket_metrics(
         self,
@@ -1559,17 +1587,43 @@ class ScanRepository:
             avg_return_1w=self._avg(returns_1w),
         )
 
-    def save_run(self, run: ScanRun) -> None:
+    def save_run(
+        self,
+        run: ScanRun,
+        *,
+        shadow_decisions: list | None = None,
+        champion_policy_id: str = "hybrid_legacy",
+        champion_fingerprint: str | None = None,
+        champion_policy_version: str | None = None,
+        learned_artifacts_fingerprint: str | None = None,
+        learned_artifacts_json: str | None = None,
+    ) -> None:
         for attempt in range(_SQLITE_LOCK_RETRY_ATTEMPTS):
             try:
-                self._save_run_once(run)
+                self._save_run_once(
+                    run,
+                    shadow_decisions=shadow_decisions,
+                    champion_policy_id=champion_policy_id,
+                    champion_fingerprint=champion_fingerprint,
+                    champion_policy_version=champion_policy_version,
+                    learned_artifacts_fingerprint=learned_artifacts_fingerprint,
+                    learned_artifacts_json=learned_artifacts_json,
+                )
                 return
             except OperationalError as exc:
                 if not _is_transient_sqlite_lock(exc) or attempt == _SQLITE_LOCK_RETRY_ATTEMPTS - 1:
                     raise
                 time.sleep(_SQLITE_LOCK_RETRY_BACKOFF_SECONDS * (attempt + 1))
 
-    def _campaign_provenance(self):
+    def _campaign_provenance(
+        self,
+        *,
+        effective_policy_id: str | None,
+        effective_policy_version: str | None,
+        effective_decision_fingerprint: str | None,
+        learned_artifacts_fingerprint: str | None,
+        learned_artifacts_json: str | None,
+    ):
         """Resolve (or open) the active evidence campaign for stamping snapshots.
 
         Computed before the run transaction opens so the campaign session does not
@@ -1583,13 +1637,37 @@ class ScanRepository:
                 return None
             from app.services.evidence_campaign import EvidenceCampaignService
 
-            return EvidenceCampaignService(settings=self.settings).get_or_create_active_campaign()
+            return EvidenceCampaignService(
+                settings=self.settings, session_factory=SessionLocal
+            ).get_or_create_active_campaign(
+                effective_policy_id=effective_policy_id,
+                effective_policy_version=effective_policy_version,
+                effective_decision_fingerprint=effective_decision_fingerprint,
+                learned_artifacts_fingerprint=learned_artifacts_fingerprint,
+                learned_artifacts_json=learned_artifacts_json,
+            )
         except Exception:  # pragma: no cover - campaign is best-effort provenance
             logger.exception("failed to resolve evidence campaign for scan run")
             return None
 
-    def _save_run_once(self, run: ScanRun) -> None:
-        campaign = self._campaign_provenance()
+    def _save_run_once(
+        self,
+        run: ScanRun,
+        *,
+        shadow_decisions: list | None = None,
+        champion_policy_id: str = "hybrid_legacy",
+        champion_fingerprint: str | None = None,
+        champion_policy_version: str | None = None,
+        learned_artifacts_fingerprint: str | None = None,
+        learned_artifacts_json: str | None = None,
+    ) -> None:
+        campaign = self._campaign_provenance(
+            effective_policy_id=champion_policy_id,
+            effective_policy_version=champion_policy_version,
+            effective_decision_fingerprint=champion_fingerprint,
+            learned_artifacts_fingerprint=learned_artifacts_fingerprint,
+            learned_artifacts_json=learned_artifacts_json,
+        )
         with SessionLocal.begin() as session:
             session.add(
                 ScanRunORM(
@@ -1597,7 +1675,6 @@ class ScanRepository:
                     created_at=run.created_at,
                     market_status=run.market_status,
                     strategy_variant=getattr(run, "strategy_variant", "layered-v4") or "layered-v4",
-                    shadow_enabled=bool(getattr(run, "shadow_enabled", False)),
                     scan_count=run.scan_count,
                     watchlist_size=run.watchlist_size,
                     alerts_sent=run.alerts_sent,
@@ -1754,6 +1831,14 @@ class ScanRepository:
                             else "accepted_outside_top_n",
                             rejection_reason=None,
                         )
+                    self._stamp_policy_identity(
+                        snapshot_kwargs,
+                        policy_id=champion_policy_id,
+                        policy_version=champion_policy_version,
+                        decision_role="production",
+                        decision_fingerprint=champion_fingerprint,
+                        learned_artifacts_fingerprint=learned_artifacts_fingerprint,
+                    )
                     session.add(PredictionSnapshotORM(**snapshot_kwargs))
                 elif (
                     prediction
@@ -1790,7 +1875,283 @@ class ScanRepository:
                         selection_status="rejected",
                         rejection_reason=self._rejection_reason_for(result),
                     )
+                    self._stamp_policy_identity(
+                        rejected_kwargs,
+                        policy_id=champion_policy_id,
+                        policy_version=champion_policy_version,
+                        decision_role="production",
+                        decision_fingerprint=champion_fingerprint,
+                        learned_artifacts_fingerprint=learned_artifacts_fingerprint,
+                    )
                     session.add(PredictionSnapshotORM(**rejected_kwargs))
+
+            self._persist_shadow_decisions(
+                session,
+                run=run,
+                decisions=shadow_decisions or [],
+                campaign=campaign,
+                learned_artifacts_fingerprint=learned_artifacts_fingerprint,
+            )
+
+    def _stamp_policy_identity(
+        self,
+        snapshot_kwargs: dict,
+        *,
+        policy_id: str | None,
+        policy_version: str | None,
+        decision_role: str,
+        decision_fingerprint: str | None,
+        learned_artifacts_fingerprint: str | None = None,
+    ) -> None:
+        if not self._has_policy_columns():
+            return
+        snapshot_kwargs["policy_id"] = policy_id
+        snapshot_kwargs["policy_version"] = policy_version
+        snapshot_kwargs["decision_role"] = decision_role
+        snapshot_kwargs["decision_fingerprint"] = decision_fingerprint
+        snapshot_kwargs["learned_artifacts_fingerprint"] = learned_artifacts_fingerprint
+
+    def _persist_shadow_decisions(
+        self,
+        session,
+        *,
+        run: ScanRun,
+        decisions: list,
+        campaign,
+        learned_artifacts_fingerprint: str | None = None,
+    ) -> None:
+        if not decisions or not self._prediction_snapshots_table_exists() or not self._has_policy_columns():
+            return
+        by_ticker = {row.ticker: row for row in run.results}
+        for decision in decisions:
+            result = by_ticker.get(decision.symbol)
+            if result is None:
+                continue
+            exit_plan = getattr(decision, "exit_plan", None)
+            range_low = float(exit_plan.stop_price) if exit_plan and exit_plan.stop_price else result.price
+            range_high = float(exit_plan.target_price) if exit_plan and exit_plan.target_price else result.price
+            is_buy = decision.action == "BUY"
+            kwargs: dict = {
+                "run_id": run.run_id,
+                "ticker": decision.symbol,
+                "asset_type": decision.asset_type,
+                "signal": "BUY" if is_buy else "HOLD",
+                "evidence_grade": getattr(result, "evidence_grade", "Weak") or "Weak",
+                "entry_price": result.price,
+                "range_low": range_low,
+                "range_high": range_high,
+                "horizon": "1w",
+                "invalidation": "",
+                "methodology": decision.probability_methodology or "weekly_probability",
+                "generated_at": result.created_at,
+                "status": "pending" if is_buy else "rejected_no_outcome",
+                "sample_source": self._live_forward_sample_source(decision.symbol),
+                "pattern_name": decision.pattern_name,
+                "pattern_metadata_json": self._serialize_dict(
+                    {
+                        "upside_probability_pct": decision.p_up_calibrated,
+                        "expected_value_pct": decision.expected_value_pct,
+                        "reasons": list(decision.reasons),
+                    }
+                ),
+            }
+            if campaign is not None and self._has_provenance_columns():
+                self._apply_snapshot_provenance(
+                    kwargs,
+                    result=result,
+                    campaign=campaign,
+                    selection_status="selected" if is_buy else "rejected",
+                    rejection_reason=None if is_buy else (",".join(decision.reasons) or "shadow_abstain"),
+                )
+            self._stamp_policy_identity(
+                kwargs,
+                policy_id=decision.policy_id,
+                policy_version=decision.policy_version,
+                decision_role="shadow",
+                decision_fingerprint=decision.decision_fingerprint,
+                learned_artifacts_fingerprint=learned_artifacts_fingerprint,
+            )
+            session.add(PredictionSnapshotORM(**kwargs))
+
+    def _snapshot_after_friction_return(self, row) -> float | None:
+        if row is None or (getattr(row, "signal", "") or "").upper() != "BUY":
+            return None
+        status = getattr(row, "status", None)
+        if status == "pending":
+            return None
+        hold = getattr(row, "hold_return_pct", None)
+        if hold is None and getattr(row, "price_at_horizon", None) and getattr(row, "entry_price", 0):
+            entry = float(row.entry_price)
+            if entry > 0:
+                hold = (float(row.price_at_horizon) - entry) / entry * 100.0
+        if hold is None:
+            return None
+        friction = float(getattr(row, "expected_friction_bps", 0.0) or 0.0) / 100.0
+        return round(float(hold) - friction, 4)
+
+    def _snapshot_brier_score(self, row) -> float | None:
+        if row is None or getattr(row, "price_at_horizon", None) is None:
+            return None
+        entry = float(getattr(row, "entry_price", 0) or 0)
+        if entry <= 0:
+            return None
+        metadata = self._deserialize_dict(getattr(row, "pattern_metadata_json", None))
+        predicted = None
+        if isinstance(metadata, dict):
+            predicted = metadata.get("upside_probability_pct")
+        if predicted is None:
+            return None
+        went_up = float(row.price_at_horizon) > entry
+        probability = min(max(float(predicted) / 100.0, 0.0), 1.0)
+        return (probability - (1.0 if went_up else 0.0)) ** 2
+
+    def _snapshot_resolution_week(self, *rows) -> datetime | None:
+        """Resolution cluster key for paired promotion inference.
+
+        Prefer the planned resolution due date when provenance has it; otherwise
+        use the actual evaluation timestamp, then the generated timestamp plus
+        the prediction horizon. This preserves older rows without rewriting
+        historical evidence.
+        """
+        for row in rows:
+            if row is None:
+                continue
+            due_at = getattr(row, "resolve_due_at", None)
+            if due_at is not None:
+                return due_at
+        for row in rows:
+            if row is None:
+                continue
+            evaluated_at = getattr(row, "evaluated_at", None)
+            if evaluated_at is not None:
+                return evaluated_at
+        for row in rows:
+            if row is None:
+                continue
+            generated_at = getattr(row, "generated_at", None)
+            if generated_at is None:
+                continue
+            horizon = str(getattr(row, "horizon", None) or "1w").strip().lower()
+            return generated_at + self._OUTCOME_HORIZONS.get(horizon, timedelta(days=7))
+        return None
+
+    def list_paired_policy_outcomes(
+        self,
+        *,
+        champion_policy_id: str,
+        champion_policy_version: str | None = None,
+        champion_decision_fingerprint: str | None = None,
+        champion_learned_artifacts_fingerprint: str | None = None,
+        challenger_policy_id: str,
+        challenger_policy_version: str | None = None,
+        challenger_decision_fingerprint: str | None = None,
+        challenger_learned_artifacts_fingerprint: str | None = None,
+    ) -> dict[str, list]:
+        from app.brain.evaluation.paired import PairedOutcome
+
+        if not self._has_policy_columns():
+            return {"returns": [], "brier": [], "exclusions": {"missing_policy_columns": 1}}
+        with SessionLocal() as session:
+            rows = session.execute(select(PredictionSnapshotORM)).scalars().all()
+        champion_rows: dict[str, Any] = {}
+        challenger_rows: dict[str, Any] = {}
+        exclusions: Counter[str] = Counter()
+
+        def row_matches(
+            row,
+            *,
+            expected_policy_id: str,
+            expected_policy_version: str | None,
+            expected_decision_fingerprint: str | None,
+            expected_learned_artifacts_fingerprint: str | None,
+            expected_role: str,
+        ) -> bool:
+            policy_id = getattr(row, "policy_id", None)
+            if policy_id != expected_policy_id:
+                return False
+            role = (getattr(row, "decision_role", None) or "").lower()
+            if role != expected_role:
+                exclusions[f"{expected_policy_id}_role_mismatch"] += 1
+                return False
+            if (
+                expected_policy_version is not None
+                and getattr(row, "policy_version", None) != expected_policy_version
+            ):
+                exclusions[f"{expected_policy_id}_version_mismatch"] += 1
+                return False
+            if (
+                expected_decision_fingerprint is not None
+                and getattr(row, "decision_fingerprint", None) != expected_decision_fingerprint
+            ):
+                exclusions[f"{expected_policy_id}_fingerprint_mismatch"] += 1
+                return False
+            if (
+                expected_learned_artifacts_fingerprint is not None
+                and getattr(row, "learned_artifacts_fingerprint", None)
+                != expected_learned_artifacts_fingerprint
+            ):
+                exclusions[f"{expected_policy_id}_learned_artifact_mismatch"] += 1
+                return False
+            return True
+
+        for row in rows:
+            if not getattr(row, "policy_id", None):
+                exclusions["ambiguous_legacy_or_null_policy"] += 1
+                continue
+            key = f"{row.run_id}:{row.ticker}"
+            if row_matches(
+                row,
+                expected_policy_id=champion_policy_id,
+                expected_policy_version=champion_policy_version,
+                expected_decision_fingerprint=champion_decision_fingerprint,
+                expected_learned_artifacts_fingerprint=champion_learned_artifacts_fingerprint,
+                expected_role="production",
+            ):
+                champion_rows[key] = row
+                continue
+            if row_matches(
+                row,
+                expected_policy_id=challenger_policy_id,
+                expected_policy_version=challenger_policy_version,
+                expected_decision_fingerprint=challenger_decision_fingerprint,
+                expected_learned_artifacts_fingerprint=challenger_learned_artifacts_fingerprint,
+                expected_role="shadow",
+            ):
+                challenger_rows[key] = row
+
+        keys = set(champion_rows) & set(challenger_rows)
+        exclusions["champion_missing_counterpart"] += len(set(champion_rows) - keys)
+        exclusions["challenger_missing_counterpart"] += len(set(challenger_rows) - keys)
+        returns: list = []
+        briers: list = []
+        for key in sorted(keys):
+            c_row = champion_rows.get(key)
+            h_row = challenger_rows.get(key)
+            if (c_row is not None and c_row.status == "pending") or (
+                h_row is not None and h_row.status == "pending"
+            ):
+                exclusions["pending_pair"] += 1
+                continue
+            resolution_week = self._snapshot_resolution_week(c_row, h_row)
+            returns.append(
+                PairedOutcome(
+                    key=key,
+                    champion_return_pct=self._snapshot_after_friction_return(c_row),
+                    challenger_return_pct=self._snapshot_after_friction_return(h_row),
+                    resolution_week=resolution_week,
+                )
+            )
+            c_brier = self._snapshot_brier_score(c_row)
+            h_brier = self._snapshot_brier_score(h_row)
+            briers.append(
+                PairedOutcome(
+                    key=key,
+                    champion_return_pct=None if c_brier is None else -c_brier * 100.0,
+                    challenger_return_pct=None if h_brier is None else -h_brier * 100.0,
+                    resolution_week=resolution_week,
+                )
+            )
+        return {"returns": returns, "brier": briers, "exclusions": dict(exclusions)}
 
     def _map_run(self, run: ScanRunORM, results: list[ScanResultORM]) -> ScanRun:
         sorted_results = self._sort_results_for_display(results)
@@ -1899,7 +2260,6 @@ class ScanRepository:
                         getattr(r, "freshness_flags_json", None)
                     ),
                     layer_details=layer_details,
-                    comparison=self._deserialize_comparison(getattr(r, "comparison_json", None)),
                     recommended_action=self._recommended_action_from_row(r, meta),
                     readiness_score=float(getattr(r, "readiness_score", 0.0) or 0.0),
                     readiness_band=getattr(r, "readiness_band", "none") or "none",
@@ -1924,7 +2284,6 @@ class ScanRepository:
             created_at=run.created_at,
             market_status=run.market_status,
             strategy_variant=getattr(run, "strategy_variant", "layered-v4") or "layered-v4",
-            shadow_enabled=bool(getattr(run, "shadow_enabled", False)),
             scan_count=run.scan_count,
             watchlist_size=run.watchlist_size,
             alerts_sent=run.alerts_sent,
@@ -2204,14 +2563,16 @@ class ScanRepository:
             return latest
 
     def get_due_outcome_counts(self, *, observed_at: datetime | None = None) -> dict[str, int]:
-        pending = self.list_due_signal_outcome_evaluations(
-            observed_at=observed_at or datetime.now(timezone.utc),
-            limit=5000,
-        )
-        counts = {"15m": 0, "1h": 0, "1d": 0, "1w": 0}
-        for item in pending:
-            counts[item.horizon] = counts.get(item.horizon, 0) + 1
-        return counts
+        observed_at = self._outcome_query_time(observed_at or datetime.now(timezone.utc))
+        with SessionLocal() as session:
+            return {
+                horizon: int(session.scalar(
+                    select(func.count(SignalOutcomeORM.id)).where(
+                        self._pending_signal_horizon_filter(horizon, observed_at)
+                    )
+                ) or 0)
+                for horizon in self._OUTCOME_HORIZONS
+            }
 
     def get_integrity_report(self, *, observed_at: datetime | None = None) -> dict[str, object]:
         mismatches_by_horizon = {"15m": 0, "1h": 0, "1d": 0}
@@ -2878,11 +3239,25 @@ class ScanRepository:
                 "horizon": evaluation_horizon,
             }
 
+    @staticmethod
+    def _outcome_query_time(observed_at: datetime) -> datetime:
+        if observed_at.tzinfo is not None:
+            return observed_at.astimezone(timezone.utc).replace(tzinfo=None)
+        return observed_at
+
+    def _pending_signal_horizon_filter(self, horizon: str, observed_at: datetime):
+        return and_(
+            getattr(SignalOutcomeORM, f"price_after_{horizon}").is_(None),
+            getattr(SignalOutcomeORM, f"status_{horizon}") == "pending",
+            SignalOutcomeORM.generated_at <= observed_at - self._OUTCOME_HORIZONS[horizon],
+        )
+
     def list_due_signal_outcome_evaluations(
         self,
         *,
         observed_at: datetime,
         limit: int | None = None,
+        exclude_ids: set[int] | None = None,
     ) -> list[PendingSignalOutcomeEvaluation]:
         batch_limit = limit or self.settings.outcome_evaluation_batch_limit
         with SessionLocal() as session:
@@ -2890,13 +3265,12 @@ class ScanRepository:
                 select(SignalOutcomeORM)
                 .where(
                     or_(
-                        SignalOutcomeORM.price_after_15m.is_(None),
-                        SignalOutcomeORM.price_after_1h.is_(None),
-                        SignalOutcomeORM.price_after_1d.is_(None),
-                        SignalOutcomeORM.price_after_1w.is_(None),
-                    )
+                        *(self._pending_signal_horizon_filter(horizon, self._outcome_query_time(observed_at))
+                          for horizon in self._OUTCOME_HORIZONS)
+                    ),
+                    SignalOutcomeORM.id.not_in(exclude_ids or ()),
                 )
-                .order_by(SignalOutcomeORM.generated_at)
+                .order_by(SignalOutcomeORM.generated_at, SignalOutcomeORM.id)
                 .limit(batch_limit)
             ).scalars().all()
 
@@ -3227,7 +3601,15 @@ class ScanRepository:
         generated_at_start: datetime | None = None,
         generated_at_end: datetime | None = None,
         gate_passed: bool | None = None,
+        include_holdout: bool = False,
     ) -> list[SignalOutcomeORM]:
+        """Load outcome rows for summaries and reports.
+
+        Holdout-family rows (``LIVE_HOLDOUT_SOURCES``) are excluded by default:
+        they are reserved for held-out comparison and must never leak into served
+        calibration, trade-gate evidence, or the in-sample reporting track. Pass
+        ``include_holdout=True`` only for surfaces that explicitly present the
+        holdout track."""
         normalized_start = self._normalize_report_datetime(generated_at_start)
         normalized_end = self._normalize_report_datetime(generated_at_end)
         with SessionLocal() as session:
@@ -3237,6 +3619,13 @@ class ScanRepository:
             if normalized_end is not None:
                 query = query.where(SignalOutcomeORM.generated_at < normalized_end)
             rows = session.execute(query).scalars().all()
+        if not include_holdout and self._has_sample_source_column():
+            rows = [
+                row
+                for row in rows
+                if (getattr(row, "sample_source", None) or "live_paper_forward")
+                not in LIVE_HOLDOUT_SOURCES
+            ]
         return self._filter_loaded_signal_outcome_rows(
             rows,
             asset_type=asset_type,
@@ -3346,10 +3735,14 @@ class ScanRepository:
             baseline=self._build_outcome_baseline_summary(slices_by_key=slices_by_key),
         )
 
-    def _split_rows_for_out_of_sample(
+    def _split_rows_by_recency(
         self,
         rows: list[SignalOutcomeORM],
     ) -> tuple[list[SignalOutcomeORM], list[SignalOutcomeORM]]:
+        """Half-split by generated_at: (earlier_window, recent_window).
+
+        A stability check only. The recent half is NOT out-of-sample evidence:
+        both halves come from the same serving track and tuned thresholds."""
         ordered = sorted(rows, key=lambda row: row.generated_at)
         if len(ordered) < 4:
             return ordered, []
@@ -3404,23 +3797,23 @@ class ScanRepository:
             rows=rows,
             friction_scenario=friction_scenario,
         )
-        in_sample_rows, out_of_sample_rows = self._split_rows_for_out_of_sample(rows)
-        in_sample = (
+        earlier_rows, recent_rows = self._split_rows_by_recency(rows)
+        earlier_window = (
             self._build_validation_bucket(
-                key="in_sample",
-                rows=in_sample_rows,
+                key="earlier_window",
+                rows=earlier_rows,
                 friction_scenario=friction_scenario,
             )
-            if in_sample_rows
+            if earlier_rows
             else None
         )
-        out_of_sample = (
+        recent_window = (
             self._build_validation_bucket(
-                key="out_of_sample",
-                rows=out_of_sample_rows,
+                key="recent_window",
+                rows=recent_rows,
                 friction_scenario=friction_scenario,
             )
-            if out_of_sample_rows
+            if recent_rows
             else None
         )
         by_market_status = self._group_validation_buckets(
@@ -3434,16 +3827,16 @@ class ScanRepository:
             friction_scenario=friction_scenario,
         )
         degradation_warnings: list[str] = []
-        if in_sample and out_of_sample and in_sample.evaluated_count and out_of_sample.evaluated_count:
-            in_sample_expectancy = in_sample.expectancy_after_friction or in_sample.expectancy or 0.0
-            out_of_sample_expectancy = out_of_sample.expectancy_after_friction or out_of_sample.expectancy or 0.0
-            if out_of_sample_expectancy < in_sample_expectancy:
+        if earlier_window and recent_window and earlier_window.evaluated_count and recent_window.evaluated_count:
+            earlier_expectancy = earlier_window.expectancy_after_friction or earlier_window.expectancy or 0.0
+            recent_expectancy = recent_window.expectancy_after_friction or recent_window.expectancy or 0.0
+            if recent_expectancy < earlier_expectancy:
                 degradation_warnings.append(
-                    "Out-of-sample expectancy is weaker than the earlier half of the selected window."
+                    "Recent-window expectancy is weaker than the earlier half of the selected window."
                 )
-            if (out_of_sample.false_positive_rate or 0.0) > (in_sample.false_positive_rate or 0.0):
+            if (recent_window.false_positive_rate or 0.0) > (earlier_window.false_positive_rate or 0.0):
                 degradation_warnings.append(
-                    "Out-of-sample false-positive rate is worse than the earlier half of the selected window."
+                    "Recent-window false-positive rate is worse than the earlier half of the selected window."
                 )
         min_sample = self.settings.validation_min_sample_size
         sample_size_sufficient = overall.evaluated_count >= min_sample
@@ -3475,8 +3868,8 @@ class ScanRepository:
             evaluated_fraction=evaluated_fraction,
             confidence_note=confidence_note,
             overall=overall,
-            in_sample=in_sample,
-            out_of_sample=out_of_sample,
+            earlier_window=earlier_window,
+            recent_window=recent_window,
             degradation_warnings=degradation_warnings,
             regime_advisories=self._build_regime_advisories(
                 market_status_buckets=by_market_status,
@@ -3971,6 +4364,7 @@ class ScanRepository:
         *,
         observed_at: datetime,
         limit: int | None = None,
+        exclude_ids: set[int] | None = None,
     ) -> list[PendingPredictionEvaluation]:
         if not self._prediction_snapshots_table_exists():
             return []
@@ -3996,8 +4390,15 @@ class ScanRepository:
         with SessionLocal() as session:
             rows = session.execute(
                 select(*due_columns)
-                .where(PredictionSnapshotORM.status == "pending")
-                .order_by(PredictionSnapshotORM.generated_at)
+                .where(
+                    PredictionSnapshotORM.status == "pending",
+                    PredictionSnapshotORM.id.not_in(exclude_ids or ()),
+                    or_(*(and_(
+                        func.lower(func.trim(func.coalesce(func.nullif(PredictionSnapshotORM.horizon, ""), "1h"))) == horizon,
+                        PredictionSnapshotORM.generated_at <= self._outcome_query_time(observed_at) - delta,
+                    ) for horizon, delta in self._OUTCOME_HORIZONS.items())),
+                )
+                .order_by(PredictionSnapshotORM.generated_at, PredictionSnapshotORM.id)
                 .limit(batch_limit)
             ).all()
 
@@ -4151,8 +4552,7 @@ class ScanRepository:
         """Campaign-scoped live-forward accumulation for the Proof page.
 
         Counts selected / accepted-outside-top-N / rejected snapshots and their
-        resolution state for the active campaign, plus a scan-gap diagnostic
-        (last scan age vs an expected cadence) so missed windows are visible.
+        resolution state for the active campaign, plus the last scan's age.
         This is transparency/completion progress, not real-money readiness."""
         from app.schemas import LiveForwardAssetProgress, LiveForwardProgress
 
@@ -4165,20 +4565,18 @@ class ScanRepository:
         try:
             from app.services.evidence_campaign import EvidenceCampaignService
 
-            active = EvidenceCampaignService(settings=self.settings).get_active_campaign()
+            active = EvidenceCampaignService(
+                settings=self.settings, session_factory=SessionLocal
+            ).get_active_campaign()
         except Exception:  # pragma: no cover - campaign lookup is best-effort
             logger.exception("failed to load active campaign for live-forward progress")
 
         last_scan_at = self.get_latest_run_timestamp()
         age_minutes, _ = self.scan_run_freshness_fields(last_scan_at) if last_scan_at else (None, None)
-        max_gap = float(getattr(self.settings, "live_forward_max_scan_gap_minutes", 1560.0) or 1560.0)
-        gap_exceeded = bool(age_minutes is not None and age_minutes > max_gap)
 
         progress = LiveForwardProgress(
             last_scan_at=last_scan_at,
             last_scan_age_minutes=age_minutes,
-            scan_gap_exceeded=gap_exceeded,
-            max_expected_scan_gap_minutes=max_gap,
         )
         if active is not None:
             progress.campaign_id = active.campaign_id
@@ -4192,14 +4590,18 @@ class ScanRepository:
             return progress
 
         with SessionLocal() as session:
-            rows = session.execute(
-                select(
-                    PredictionSnapshotORM.asset_type,
-                    PredictionSnapshotORM.selection_status,
-                    PredictionSnapshotORM.status,
-                    PredictionSnapshotORM.resolved_late,
-                ).where(PredictionSnapshotORM.campaign_id == active.campaign_id)
-            ).all()
+            query = select(
+                PredictionSnapshotORM.asset_type,
+                PredictionSnapshotORM.selection_status,
+                PredictionSnapshotORM.status,
+                PredictionSnapshotORM.resolved_late,
+            ).where(PredictionSnapshotORM.campaign_id == active.campaign_id)
+            if self._has_policy_columns():
+                query = query.where(
+                    (PredictionSnapshotORM.decision_role.is_(None))
+                    | (PredictionSnapshotORM.decision_role == "production")
+                )
+            rows = session.execute(query).all()
 
         buckets: dict[str, LiveForwardAssetProgress] = {
             asset: LiveForwardAssetProgress(asset_type=asset) for asset in ("stock", "crypto")
@@ -4229,40 +4631,65 @@ class ScanRepository:
         progress.resolved_count = sum(b.resolved for b in progress.by_asset)
         progress.pending_count = sum(b.pending for b in progress.by_asset)
         progress.resolved_late_count = sum(b.resolved_late for b in progress.by_asset)
-        try:
-            from app.services.scan_windows import ScanWindowService
-
-            progress.missed_windows_14d = ScanWindowService().missed_count(lookback_days=14)
-        except Exception:
-            progress.missed_windows_14d = 0
-        if gap_exceeded:
-            progress.note = (
-                f"Last scan was {age_minutes:.0f} min ago, beyond the {max_gap:.0f}-min "
-                "expected cadence. A scheduled window may have been missed."
-            )
-        elif progress.missed_windows_14d:
-            progress.note = (
-                f"{progress.missed_windows_14d} expected scan window(s) missed in the last 14 days."
-            )
         return progress
 
-    def get_prediction_accuracy_summary(self) -> PredictionAccuracyMetrics:
+    def _active_campaign_id(self) -> str | None:
+        """Current active evidence campaign id, or None when the table is absent
+        or no campaign is active (pre-campaign installs)."""
+        try:
+            with SessionLocal() as session:
+                return session.execute(
+                    select(EvidenceCampaignORM.campaign_id)
+                    .where(EvidenceCampaignORM.status == "active")
+                    .order_by(desc(EvidenceCampaignORM.started_at))
+                    .limit(1)
+                ).scalar_one_or_none()
+        except OperationalError:
+            return None
+
+    def get_prediction_accuracy_summary(self, *, scope: str = "campaign") -> PredictionAccuracyMetrics:
+        """Structural range accuracy plus honesty headlines (direction hit rate,
+        Brier score, missingness) for prediction snapshots.
+
+        Defaults to the active evidence campaign so numbers describe one frozen
+        strategy identity; falls back to all campaigns when none is active.
+        Pass ``scope="all_campaigns"`` for the transparency view across
+        identities (mixing campaigns is only for transparency, never for
+        judging the current strategy)."""
         if not self._prediction_snapshots_table_exists():
             return PredictionAccuracyMetrics(
                 note="Prediction snapshot table not migrated yet. Run alembic upgrade head.",
             )
+        campaign_id: str | None = None
+        if scope == "campaign":
+            campaign_id = self._active_campaign_id()
+            if campaign_id is None:
+                scope = "all_campaigns"
         with SessionLocal() as session:
-            rows = session.execute(
-                select(
-                    PredictionSnapshotORM.status,
-                    PredictionSnapshotORM.accuracy_outcome,
+            query = select(
+                PredictionSnapshotORM.status,
+                PredictionSnapshotORM.accuracy_outcome,
+                PredictionSnapshotORM.signal,
+                PredictionSnapshotORM.entry_price,
+                PredictionSnapshotORM.price_at_horizon,
+                PredictionSnapshotORM.pattern_metadata_json,
+            )
+            if campaign_id is not None:
+                query = query.where(PredictionSnapshotORM.campaign_id == campaign_id)
+            if self._has_policy_columns():
+                query = query.where(
+                    (PredictionSnapshotORM.decision_role.is_(None))
+                    | (PredictionSnapshotORM.decision_role == "production")
                 )
-            ).all()
+            rows = session.execute(query).all()
         if not rows:
             return PredictionAccuracyMetrics(
+                campaign_id=campaign_id,
+                scope=scope,
                 note="No prediction snapshots yet. Accuracy tracking starts after the next BUY/SELL scans.",
             )
         pending = sum(1 for row in rows if row.status == "pending")
+        unresolved = sum(1 for row in rows if row.status == "rejected_no_outcome")
         evaluated = [
             row
             for row in rows
@@ -4274,6 +4701,32 @@ class ScanRepository:
         missed = sum(1 for row in evaluated if row.accuracy_outcome == "missed")
         evaluated_count = len(evaluated)
         rate = round((in_range / evaluated_count) * 100, 2) if evaluated_count else None
+
+        # Direction hit rate: did price move the predicted way at the horizon?
+        direction_hits = 0
+        direction_evaluated = 0
+        # Brier over stated upside probability vs realized up-move (lower is
+        # better; 0.25 is what an uninformative coin-flip forecast scores).
+        brier_terms: list[float] = []
+        for row in evaluated:
+            entry = float(row.entry_price or 0.0)
+            horizon_price = row.price_at_horizon
+            if horizon_price is None or entry <= 0:
+                continue
+            went_up = float(horizon_price) > entry
+            signal = (row.signal or "").upper()
+            if signal in ("BUY", "SELL"):
+                direction_evaluated += 1
+                if (signal == "BUY" and went_up) or (signal == "SELL" and not went_up):
+                    direction_hits += 1
+            metadata = self._deserialize_dict(row.pattern_metadata_json)
+            predicted = metadata.get("upside_probability_pct") if isinstance(metadata, dict) else None
+            if predicted is not None:
+                probability = min(max(float(predicted) / 100.0, 0.0), 1.0)
+                brier_terms.append((probability - (1.0 if went_up else 0.0)) ** 2)
+
+        resolvable = evaluated_count + unresolved
+        missing_rate = round((unresolved / resolvable) * 100, 2) if resolvable else None
         note = (
             "Structural range accuracy at the primary horizon. Low sample sizes are not statistically meaningful."
             if evaluated_count < 30
@@ -4287,6 +4740,16 @@ class ScanRepository:
             below_range_count=below,
             above_range_count=above,
             missed_count=missed,
+            direction_evaluated_count=direction_evaluated,
+            direction_hit_rate_pct=(
+                round((direction_hits / direction_evaluated) * 100, 2) if direction_evaluated else None
+            ),
+            brier_score=(
+                round(sum(brier_terms) / len(brier_terms), 4) if brier_terms else None
+            ),
+            missing_rate_pct=missing_rate,
+            campaign_id=campaign_id,
+            scope=scope,
             note=note,
         )
 
@@ -4403,27 +4866,41 @@ class ScanRepository:
             note = "At least one group shows higher-confidence bands underperforming lower bands."
         return ConfidenceRanking(buckets=buckets, monotonic_by_group=monotonic, note=note)
 
-    def get_confidence_calibration(self) -> ConfidenceCalibration:
+    def get_confidence_calibration(self, *, scope: str = "campaign") -> ConfidenceCalibration:
         """Predicted upside probability vs realized up-rate, bucketed by probability
         band and split by asset type. Proves calibration: a predicted 70% should
-        resolve up about 70% of the time."""
+        resolve up about 70% of the time.
+
+        Defaults to the active evidence campaign (one frozen strategy identity);
+        falls back to all campaigns when none is active."""
         if not self._prediction_snapshots_table_exists():
             return ConfidenceCalibration(
                 note="Prediction snapshot table not migrated yet. Run alembic upgrade head.",
             )
+        campaign_id: str | None = None
+        if scope == "campaign":
+            campaign_id = self._active_campaign_id()
+            if campaign_id is None:
+                scope = "all_campaigns"
         with SessionLocal() as session:
-            rows = session.execute(
-                select(
-                    PredictionSnapshotORM.status,
-                    PredictionSnapshotORM.price_at_horizon,
-                    PredictionSnapshotORM.entry_price,
-                    PredictionSnapshotORM.pattern_metadata_json,
-                    PredictionSnapshotORM.asset_type,
-                ).where(
-                    PredictionSnapshotORM.status != "pending",
-                    PredictionSnapshotORM.price_at_horizon.isnot(None),
+            query = select(
+                PredictionSnapshotORM.status,
+                PredictionSnapshotORM.price_at_horizon,
+                PredictionSnapshotORM.entry_price,
+                PredictionSnapshotORM.pattern_metadata_json,
+                PredictionSnapshotORM.asset_type,
+            ).where(
+                PredictionSnapshotORM.status != "pending",
+                PredictionSnapshotORM.price_at_horizon.isnot(None),
+            )
+            if campaign_id is not None:
+                query = query.where(PredictionSnapshotORM.campaign_id == campaign_id)
+            if self._has_policy_columns():
+                query = query.where(
+                    (PredictionSnapshotORM.decision_role.is_(None))
+                    | (PredictionSnapshotORM.decision_role == "production")
                 )
-            ).all()
+            rows = session.execute(query).all()
         samples: list[tuple[float, float, str]] = []
         for row in rows:
             metadata = self._deserialize_dict(row.pattern_metadata_json)
@@ -4439,6 +4916,8 @@ class ScanRepository:
             samples.append((float(predicted), realized_up, asset_type))
         if not samples:
             return ConfidenceCalibration(
+                campaign_id=campaign_id,
+                scope=scope,
                 note="No resolved snapshots with a predicted upside probability yet.",
             )
         grouped: dict[tuple[str, str], list[tuple[float, float]]] = {}
@@ -4476,6 +4955,8 @@ class ScanRepository:
         return ConfidenceCalibration(
             buckets=buckets,
             mean_abs_reliability_gap_pct=round(sum(gaps) / len(gaps), 2) if gaps else None,
+            campaign_id=campaign_id,
+            scope=scope,
             note=(
                 "Predicted upside probability vs realized up-rate. "
                 "Low per-bucket counts are not statistically meaningful."
@@ -4506,7 +4987,13 @@ class ScanRepository:
                 PredictionSnapshotORM.hold_return_pct,
                 PredictionSnapshotORM.asset_type,
             ]
-            rows = session.execute(select(*summary_columns)).all()
+            summary_query = select(*summary_columns)
+            if self._has_policy_columns():
+                summary_query = summary_query.where(
+                    (PredictionSnapshotORM.decision_role.is_(None))
+                    | (PredictionSnapshotORM.decision_role == "production")
+                )
+            rows = session.execute(summary_query).all()
         if not rows:
             return ExitWindowAccuracyMetrics(
                 note="No prediction snapshots yet. Exit-window proof starts after BUY scans with exit targets.",
@@ -4595,10 +5082,12 @@ class ScanRepository:
         signal: str | None = None,
     ) -> PatternBacktestStats:
         column_present = self._has_sample_source_column()
-        # Fail closed: trust sources (live/out-of-sample) require the provenance column.
-        # Without it we cannot prove a sample is genuinely live/out-of-sample, so report
+        # Fail closed: trust sources (live/holdout) require the provenance column.
+        # Without it we cannot prove a sample is genuinely live or held out, so report
         # zero rather than silently merging calibration and trust evidence together.
-        if not column_present and sample_source in ("live_paper_forward", "out_of_sample"):
+        if not column_present and (
+            sample_source == "live_paper_forward" or sample_source in LIVE_HOLDOUT_SOURCES
+        ):
             return PatternBacktestStats(
                 pattern_name=pattern_name,
                 sample_size=0,
@@ -4611,7 +5100,12 @@ class ScanRepository:
                 SignalOutcomeORM.return_after_1w.isnot(None),
             )
             if column_present:
-                query = query.where(SignalOutcomeORM.sample_source == sample_source)
+                if sample_source in LIVE_HOLDOUT_SOURCES:
+                    # Either spelling of the holdout family selects the whole family:
+                    # legacy rows say "out_of_sample", newer rows say "live_holdout".
+                    query = query.where(SignalOutcomeORM.sample_source.in_(LIVE_HOLDOUT_SOURCES))
+                else:
+                    query = query.where(SignalOutcomeORM.sample_source == sample_source)
             if signal is not None:
                 query = query.where(SignalOutcomeORM.signal == signal)
             rows = session.execute(query).scalars().all()
@@ -4657,6 +5151,10 @@ class ScanRepository:
                 ).scalars().all()
             for source in sources:
                 key = source or "live_paper_forward"
+                if key in LIVE_HOLDOUT_SOURCES:
+                    # Whole holdout family (legacy "out_of_sample" + current
+                    # "live_holdout") counts into the single holdout bucket.
+                    key = "out_of_sample"
                 if key in counts:
                     counts[key] += 1
         s = self.settings

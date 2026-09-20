@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { DecisionGrid } from '@/components/decision-grid';
@@ -93,6 +93,90 @@ describe('DecisionGrid', () => {
     expect(screen.getByTestId('card-AAPL')).toBeInTheDocument();
   });
 
+  it('splits blocked top BUY setups into a read-only section when valid candidates remain', () => {
+    const valid = {
+      ticker: 'NVDA',
+      asset_type: 'stock',
+      decision_signal: 'BUY',
+      is_buy_candidate: true,
+      provider_status: 'ok',
+      bar_age_minutes: 3,
+      freshness_flags: {},
+      readiness_hard_stop: false,
+      readiness_score: 85,
+      readiness_band: 'high',
+      readiness_reason: 'Actionable: gates passed and data is fresh.',
+      gate_passed: true,
+      recommended_action: 'preview',
+    } as unknown as ScanResult;
+    const blocked = {
+      ...valid,
+      ticker: 'ROKU',
+      provider_status: 'critical',
+      bar_age_minutes: 420,
+      freshness_flags: { bars: 'stale' },
+      readiness_hard_stop: true,
+      readiness_reason: 'Hard stop: provider is critical and bars are stale over 6 hours.',
+      execution_eligibility: 'blocked',
+    } as unknown as ScanResult;
+
+    render(
+      <DecisionGrid
+        results={[valid, blocked]}
+        topStocks={[valid, blocked]}
+        decisions={[]}
+        automation={null}
+      />,
+    );
+
+    expect(
+      within(screen.getByTestId('stock-actionable-grid')).getByTestId('card-NVDA'),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId('stock-actionable-grid')).queryByTestId('card-ROKU'),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId('stock-readonly-note')).toHaveTextContent(/read-only setup details/i);
+    expect(
+      within(screen.getByTestId('stock-readonly-grid')).getByTestId('card-ROKU'),
+    ).toBeInTheDocument();
+  });
+
+  it('does not expose shadow rows on the Decision surface', () => {
+    const production = {
+      ticker: 'NVDA',
+      asset_type: 'stock',
+      decision_signal: 'BUY',
+      is_buy_candidate: true,
+      provider_status: 'ok',
+      bar_age_minutes: 3,
+      freshness_flags: {},
+      readiness_hard_stop: false,
+      readiness_score: 85,
+      readiness_band: 'high',
+      readiness_reason: 'Actionable: gates passed and data is fresh.',
+      gate_passed: true,
+      recommended_action: 'preview',
+      decision_role: 'production',
+    } as unknown as ScanResult;
+    const shadow = {
+      ...production,
+      ticker: 'WEEKLY-SHADOW',
+      decision_role: 'shadow',
+    } as unknown as ScanResult;
+
+    render(
+      <DecisionGrid
+        results={[production, shadow]}
+        topStocks={[production, shadow]}
+        decisions={[]}
+        automation={null}
+      />,
+    );
+
+    expect(screen.getByTestId('card-NVDA')).toBeInTheDocument();
+    expect(screen.queryByTestId('card-WEEKLY-SHADOW')).not.toBeInTheDocument();
+  });
+
   it('explains when nothing meets the buy threshold', () => {
     const holds = ['A', 'B', 'C'].map(
       (ticker) =>
@@ -123,7 +207,11 @@ describe('DecisionGrid', () => {
       bar_age_minutes: 3,
       freshness_flags: {},
       readiness_hard_stop: false,
+      readiness_score: 85,
+      readiness_band: 'high',
+      readiness_reason: 'Actionable: gates passed and data is fresh.',
       gate_passed: true,
+      recommended_action: 'preview',
     } as unknown as ScanResult;
     const rejectedStock = {
       ...stockCandidate,

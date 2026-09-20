@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.core.structural_prediction import (
+from app.brain.structural_prediction import (
     PriceBar,
     evaluate_exit_window_outcome,
     evaluate_exit_window_outcome_with_disambiguation,

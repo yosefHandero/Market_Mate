@@ -8,18 +8,19 @@ import unittest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 from unittest.mock import patch
 
 import app.db as db_module
 import app.services.repository as repository_module
-from app.schemas import ScanResult, ScanRun
+from app.schemas import PricePrediction, ScanResult, ScanRun
 from app.services.repository import ScanRepository
 
 
 def _scan_run(run_id: str) -> ScanRun:
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 9, 19, 12, tzinfo=timezone.utc)
     return ScanRun(
         run_id=run_id,
         created_at=now,
@@ -46,6 +47,9 @@ def _scan_run(run_id: str) -> ScanRun:
                 sector_strength_score=0.5,
                 relative_strength_pct=0.2,
                 gate_passed=True,
+                price_prediction=PricePrediction(
+                    range_low=95.0, range_high=110.0, invalidation="Below 95"
+                ),
                 created_at=now,
             )
         ],
@@ -53,8 +57,69 @@ def _scan_run(run_id: str) -> ScanRun:
 
 
 class SchemaMigrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Guard before exercising any database path, including a service's
+        # import-time default factory. Never open the personal database, even
+        # if best-effort provenance catches the resulting exception.
+        isolated_root = tempfile.TemporaryDirectory()
+        self.addCleanup(isolated_root.cleanup)
+        self._isolated_root = Path(isolated_root.name).resolve()
+        self._blocked_database_accesses: list[str] = []
+        original_raw_connection = Engine.raw_connection
+
+        def guarded_raw_connection(engine):
+            database = engine.url.database
+            if (
+                engine.url.get_backend_name() != "sqlite"
+                or not database
+                or not Path(database).resolve().is_relative_to(self._isolated_root)
+            ):
+                self._blocked_database_accesses.append(str(engine.url))
+                raise AssertionError("Database access outside this test's isolated directory")
+            return original_raw_connection(engine)
+
+        guard = patch.object(Engine, "raw_connection", guarded_raw_connection)
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.addCleanup(lambda: self.assertEqual(self._blocked_database_accesses, []))
+
+    def _assert_scan_campaign_link(self, session_factory, run_id: str) -> str:
+        with session_factory() as session:
+            row = session.execute(text(
+                "SELECT c.campaign_id, c.effective_policy_id, p.policy_id, "
+                "p.decision_role, p.record_hash FROM scan_runs r "
+                "JOIN prediction_snapshots p ON p.run_id = r.run_id "
+                "JOIN evidence_campaigns c ON c.campaign_id = p.campaign_id "
+                "WHERE r.run_id = :run_id AND c.status = 'active'"
+            ), {"run_id": run_id}).one()
+            self.assertEqual(session.execute(text(
+                "SELECT COUNT(*) FROM evidence_campaigns"
+            )).scalar_one(), 1)
+        self.assertEqual(row.effective_policy_id, "hybrid_legacy")
+        self.assertEqual(row.policy_id, "hybrid_legacy")
+        self.assertEqual(row.decision_role, "production")
+        self.assertTrue(row.record_hash)
+        return row.campaign_id
+
+    def test_scan_and_campaign_share_injected_database(self) -> None:
+        engine = db_module.create_scanner_engine(
+            f"sqlite:///{(self._isolated_root / 'scanner.db').as_posix()}"
+        )
+        self.addCleanup(engine.dispose)
+        session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+        db_module.Base.metadata.create_all(engine)
+        repo = ScanRepository()
+        with patch.object(repository_module, "SessionLocal", session_factory):
+            # Keep provenance enabled: use the real campaign service, writes,
+            # schema inspection, and snapshot stamping.
+            repo.save_run(_scan_run("isolated-run"))
+            campaign_id = self._assert_scan_campaign_link(session_factory, "isolated-run")
+            progress = repo.get_live_forward_progress()
+            self.assertEqual(progress.campaign_id, campaign_id)
+            self.assertEqual(progress.pending_count, 1)
+
     def test_alembic_upgrade_creates_expected_backend_tables(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(dir=self._isolated_root) as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"
             config = Config("alembic.ini")
             config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path.as_posix()}")
@@ -82,7 +147,7 @@ class SchemaMigrationTests(unittest.TestCase):
             engine.dispose()
 
     def test_sqlite_engine_enables_wal_and_busy_timeout(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(dir=self._isolated_root) as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"
             engine = db_module.create_scanner_engine(
                 f"sqlite:///{database_path.as_posix()}",
@@ -99,7 +164,7 @@ class SchemaMigrationTests(unittest.TestCase):
                 engine.dispose()
 
     def test_scan_save_retries_after_real_transient_sqlite_write_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(dir=self._isolated_root) as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"
             # Short busy timeout so the first blocked write fails quickly and
             # save_run's retry loop is exercised instead of waiting on SQLite.
@@ -118,6 +183,7 @@ class SchemaMigrationTests(unittest.TestCase):
             locker = engine.raw_connection()
             first_lock_failure = Event()
             result: dict[str, object] = {}
+            thread = None
             try:
                 locker.execute("BEGIN IMMEDIATE")
 
@@ -127,9 +193,9 @@ class SchemaMigrationTests(unittest.TestCase):
                         with patch.object(repository_module, "SessionLocal", SessionLocal):
                             original_save_once = repo._save_run_once
 
-                            def _tracked_save_once(run: ScanRun) -> None:
+                            def _tracked_save_once(run: ScanRun, **kwargs) -> None:
                                 try:
-                                    original_save_once(run)
+                                    original_save_once(run, **kwargs)
                                 except OperationalError as exc:
                                     # Publish only after a real lock failure so
                                     # the main thread cannot release early and
@@ -168,11 +234,14 @@ class SchemaMigrationTests(unittest.TestCase):
                         {"run_id": "locked-run"},
                     ).scalar_one()
                 self.assertEqual(saved_count, 1)
+                self._assert_scan_campaign_link(SessionLocal, "locked-run")
             finally:
                 try:
                     locker.rollback()
                 except Exception:
                     pass
+                if thread is not None:
+                    thread.join(timeout=5)
                 locker.close()
                 engine.dispose()
 
@@ -215,7 +284,7 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
 
     def test_apply_required_schema_patches_refuses_without_repair_env(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(dir=self._isolated_root) as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"
             engine = create_engine(
                 f"sqlite:///{database_path.as_posix()}",
@@ -235,7 +304,7 @@ class SchemaMigrationTests(unittest.TestCase):
                 engine.dispose()
 
     def test_get_schema_status_reports_missing_items_without_mutating(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(dir=self._isolated_root) as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"
             engine = create_engine(
                 f"sqlite:///{database_path.as_posix()}",

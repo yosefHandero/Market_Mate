@@ -97,6 +97,8 @@ describe('WalkForwardProofPanel', () => {
         summary={makeSummary({
           config_fingerprint: 'abcdef0123456789',
           engine_version: 'wf-engine-v1',
+          ruler_version: 'ruler-v2',
+          ruler_fingerprint: '1234567890abcdef',
           overlap_status: 'non_overlapping',
           data_quality_ok: true,
           survivorship_caveat: 'Universe is the current watchlist only; survivorship-limited.',
@@ -118,5 +120,6 @@ describe('WalkForwardProofPanel', () => {
     const manifest = screen.getByTestId('walk-forward-manifest');
     expect(manifest).toHaveTextContent('survivorship-limited');
     expect(manifest).toHaveTextContent('abcdef012345');
+    expect(manifest).toHaveTextContent('ruler ruler-v2 / 1234567890ab');
   });
 });

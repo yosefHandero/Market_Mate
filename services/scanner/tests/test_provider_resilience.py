@@ -73,48 +73,30 @@ class HttpClientResilienceTests(unittest.TestCase):
         self.assertEqual(payload, {"ok": True})
         self.assertEqual(client.request.await_count, 2)
 
-    def test_request_json_clamps_large_retry_after(self) -> None:
+    def test_large_retry_after_defers_without_retrying_early(self) -> None:
         client = MagicMock()
-        client.request = AsyncMock(
-            side_effect=[
-                httpx.Response(
-                    429,
-                    headers={"retry-after": "600"},
-                    text="rate limit exceeded",
-                ),
-                httpx.Response(
-                    200,
-                    headers={"content-type": "application/json"},
-                    json={"ok": True},
-                ),
-            ]
-        )
-        slept: list[float] = []
+        client.request = AsyncMock(return_value=httpx.Response(
+            429, headers={"retry-after": "600"}, text="rate limit exceeded"
+        ))
+        guard = AsyncProviderGuard("test")
 
-        async def _fake_sleep(seconds: float) -> None:
-            slept.append(seconds)
-
-        async def run() -> dict:
-            with patch("app.http_client.get_settings") as mocked_settings, patch(
-                "app.http_client.asyncio.sleep", _fake_sleep
-            ):
-                mocked_settings.return_value = SimpleNamespace(
-                    provider_retry_attempts=1,
-                    provider_retry_backoff_seconds=0.0,
-                )
-                return await request_json(
-                    client,
-                    method="GET",
-                    url="https://example.com/data",
-                    provider="test",
-                )
-
-        payload = asyncio.run(run())
-        self.assertEqual(payload, {"ok": True})
-        self.assertEqual(len(slept), 1)
-        # Without the clamp this would be ~600s; it must not exceed the cap (+ jitter).
-        self.assertLessEqual(slept[0], MAX_RETRY_BACKOFF_SECONDS * (1.0 + RETRY_JITTER_RATIO) + 1e-6)
-        self.assertGreater(slept[0], 0.0)
+        async def run():
+            with patch("app.http_client.get_settings") as settings, patch(
+                "app.http_client.asyncio.sleep", new_callable=AsyncMock
+            ) as sleep:
+                settings.return_value = SimpleNamespace(provider_retry_attempts=1, provider_retry_backoff_seconds=0)
+                with self.assertRaises(ProviderRequestError) as caught:
+                    await request_json(client, method="GET", url="https://example.com/data",
+                                       provider="test", on_backoff=guard.register_backoff)
+                self.assertEqual(caught.exception.retry_after_seconds, 600)
+                self.assertEqual(client.request.await_count, 1)
+                sleep.assert_not_awaited()
+                # Even an unpaced sibling call must defer, not issue a new request.
+                with self.assertRaises(ProviderRequestError) as deferred:
+                    await guard.throttle()
+                self.assertGreater(deferred.exception.retry_after_seconds, 590)
+                self.assertEqual(client.request.await_count, 1)
+        asyncio.run(run())
 
     def test_request_json_retries_html_block_page_then_succeeds(self) -> None:
         client = MagicMock()

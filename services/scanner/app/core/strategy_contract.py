@@ -18,8 +18,9 @@ ENTRY_ASSUMPTION = (
     "Validation remains direction-based and does not claim perfect fills."
 )
 EXIT_ASSUMPTION = (
-    "Primary validation measures forward returns over fixed 15m, 1h, and 1d horizons. "
-    "This is not yet a stop-loss or target-based exit system."
+    "Primary validation measures forward returns over the fixed 1w horizon "
+    "(secondary diagnostics at 15m, 1h, and 1d). This is not yet a stop-loss "
+    "or target-based exit system."
 )
 
 

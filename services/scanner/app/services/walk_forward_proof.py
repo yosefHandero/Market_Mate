@@ -11,13 +11,25 @@ from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
-from app.config import Settings, get_settings
-from app.core.calibration import (
+from app.brain.calibration import (
     build_reliability_map,
     calibrated_mean_abs_gap_pct,
     reliability_map_to_payload,
 )
-from app.core.candidate_quality import (
+from app.brain.config import RulerConfig, WeeklyPolicyConfig
+from app.brain.contracts import BrainDecision, DecisionPolicy, MarketSnapshot, SymbolSnapshot
+from app.brain.identity import RULER_VERSION, ruler_fingerprint
+from app.brain.evaluation.stats import (
+    calibration_band as _calibration_band,
+    confidence_discrimination_pct as _confidence_discrimination_pct,
+    max_drawdown_pct as _max_drawdown_pct,
+    mean as _mean,
+    percentile as _percentile,
+    spearman_ic as _spearman_ic,
+    wilson_lower_bound_pct as _wilson_lower_bound_pct,
+    worst_decile_mean as _worst_decile_mean,
+)
+from app.brain.candidate_quality import (
     atr_pct as _atr_pct,
     buy_candidate_reject_reason,
     historical_buy_hold_avg_return as _historical_buy_hold_avg_return,
@@ -28,33 +40,38 @@ from app.core.candidate_quality import (
     sma as _sma,
     volume_confirmed as _volume_confirmed,
 )
-from app.core.decision_presentation import build_exit_window
-from app.core.ranking import expected_value_after_friction
-from app.core.structural_prediction import (
+from app.brain.gates import expected_value_after_friction
+from app.brain.probability import compute_upside_probability
+from app.brain.structural_prediction import (
     build_structural_prediction,
     evaluate_exit_window_outcome_with_disambiguation,
     evaluate_prediction_accuracy,
 )
-from app.core.weekly_backtest import summarize_pattern_stats, walk_forward_pattern_samples
-from app.core.weekly_bar_utils import (
+from app.brain.weekly_backtest import summarize_pattern_stats, walk_forward_pattern_samples
+from app.brain.weekly_bar_utils import (
     bars_as_of,
     close_price,
     forward_close_after,
     parse_bar_timestamp,
     sorted_bars,
 )
-from app.core.weekly_patterns import detect_weekly_pattern, project_weekly_range
+from app.brain.weekly_patterns import detect_weekly_pattern, project_weekly_range
+from app.brain.policies import WeeklyProbabilityPolicy
+from app.config import Settings, get_settings
+from app.core.decision_presentation import build_exit_window
 from app.schemas import GateCheck, WeeklyPatternPrediction
 from app.services.historical_bar_store import BarCoverage, HistoricalBarStore
 from app.services.repository import ScanRepository
-from app.services.weekly_prediction_service import compute_upside_probability
 from app.services.walk_forward_repository import WalkForwardRepository
 
 logger = logging.getLogger(__name__)
 
 # Bump when the walk-forward engine's computation changes in a way that makes old
 # metrics incomparable. Part of the run manifest for auditable, versioned reruns.
-WALK_FORWARD_ENGINE_VERSION = "wf-engine-v1"
+# v2: ruler hardening - non-overlapping eval schedule (proof_eval_step_days),
+# Brier + missingness metrics, opportunity-matched buy-and-hold benchmark,
+# trials ledger, survivorship/adjustment caveats, ruler-identity stamping.
+WALK_FORWARD_ENGINE_VERSION = "wf-engine-v2"
 
 # Evidence-relevant settings whose change should invalidate comparability of runs.
 # Kept explicit (not "all settings") so trivial, non-evidence tweaks do not churn
@@ -66,6 +83,7 @@ _FINGERPRINT_SETTING_KEYS = (
     "proof_holdout_months",
     "proof_validation_months",
     "proof_step_days",
+    "proof_eval_step_days",
     "proof_top_n_per_asset",
     "proof_min_pattern_samples",
     "proof_min_expected_value_pct",
@@ -418,149 +436,6 @@ def _volatility_regime_from_closes(closes: list[float]) -> str:
     return "extreme"
 
 
-def _calibration_band(predicted: float | None) -> str:
-    if predicted is None:
-        return "unknown"
-    if predicted < 50:
-        return "<50"
-    if predicted < 60:
-        return "50-59"
-    if predicted < 70:
-        return "60-69"
-    if predicted < 80:
-        return "70-79"
-    if predicted < 90:
-        return "80-89"
-    return "90-100"
-
-
-def _mean(values: list[float]) -> float | None:
-    if not values:
-        return None
-    return round(sum(values) / len(values), 4)
-
-
-def _percentile(sorted_values: list[float], pct: float) -> float | None:
-    if not sorted_values:
-        return None
-    if len(sorted_values) == 1:
-        return round(sorted_values[0], 4)
-    rank = pct * (len(sorted_values) - 1)
-    low = int(rank)
-    high = min(low + 1, len(sorted_values) - 1)
-    frac = rank - low
-    return round(sorted_values[low] * (1 - frac) + sorted_values[high] * frac, 4)
-
-
-def _worst_decile_mean(returns: list[float]) -> float | None:
-    if not returns:
-        return None
-    ordered = sorted(returns)
-    count = max(1, len(ordered) // 10)
-    return _mean(ordered[:count])
-
-
-def _confidence_discrimination_pct(resolved: list[dict[str, Any]]) -> float | None:
-    """Realized up-rate of high-confidence picks minus low-confidence picks.
-
-    Splits resolved predictions at the median confidence and returns the
-    difference in realized up-rate (percentage points). Positive means higher
-    stated confidence tracks better realized outcomes; a value at or below zero
-    means the confidence signal is not discriminating and must not add trust.
-    """
-    scored = [
-        (float(p["confidence"]), float(p["return_after_1w"]) > 0)
-        for p in resolved
-        if p.get("confidence") is not None and p.get("return_after_1w") is not None
-    ]
-    if len(scored) < 4:
-        return None
-    scored.sort(key=lambda item: item[0])
-    mid = len(scored) // 2
-    low = scored[:mid]
-    high = scored[mid:]
-    if not low or not high:
-        return None
-    low_rate = sum(1 for _c, up in low if up) / len(low) * 100.0
-    high_rate = sum(1 for _c, up in high if up) / len(high) * 100.0
-    return round(high_rate - low_rate, 4)
-
-
-def _max_drawdown_pct(ordered_returns: list[float]) -> float | None:
-    if not ordered_returns:
-        return None
-    equity = 1.0
-    peak = 1.0
-    max_dd = 0.0
-    for ret in ordered_returns:
-        equity *= 1.0 + (ret / 100.0)
-        peak = max(peak, equity)
-        if peak > 0:
-            drawdown = (peak - equity) / peak * 100.0
-            max_dd = max(max_dd, drawdown)
-    return round(max_dd, 4)
-
-
-def _wilson_lower_bound_pct(successes: int, total: int, *, z: float = 1.96) -> float | None:
-    """Wilson score 95% lower bound on a proportion, returned as a percentage.
-
-    Used as the honest floor on the realized up-rate: it answers "given this many
-    samples, how low could the true rate plausibly be?" A thin sample yields a low
-    bound, correctly refusing to certify an edge that has not been earned.
-    """
-    if total <= 0:
-        return None
-    phat = successes / total
-    denom = 1.0 + (z * z) / total
-    center = phat + (z * z) / (2.0 * total)
-    margin = z * math.sqrt((phat * (1.0 - phat) + (z * z) / (4.0 * total)) / total)
-    return round((center - margin) / denom * 100.0, 4)
-
-
-def _average_ranks(values: list[float]) -> list[float]:
-    order = sorted(range(len(values)), key=lambda i: values[i])
-    ranks = [0.0] * len(values)
-    i = 0
-    while i < len(values):
-        j = i
-        while j + 1 < len(values) and values[order[j + 1]] == values[order[i]]:
-            j += 1
-        avg_rank = (i + j) / 2.0 + 1.0
-        for k in range(i, j + 1):
-            ranks[order[k]] = avg_rank
-        i = j + 1
-    return ranks
-
-
-def _spearman_ic(pairs: list[tuple[float, float]]) -> tuple[float | None, float | None]:
-    """Spearman rank information coefficient between signal and realized return.
-
-    Returns (ic, t_stat). IC is the correlation between the predicted upside
-    probability and the realized forward return - the core "is there real edge in
-    the signal" measure. t_stat > ~2 indicates the correlation is unlikely to be
-    noise. Returns (None, None) for underpowered or degenerate samples.
-    """
-    if len(pairs) < 4:
-        return None, None
-    xs = [p[0] for p in pairs]
-    ys = [p[1] for p in pairs]
-    rx = _average_ranks(xs)
-    ry = _average_ranks(ys)
-    n = len(pairs)
-    mx = sum(rx) / n
-    my = sum(ry) / n
-    cov = sum((rx[i] - mx) * (ry[i] - my) for i in range(n))
-    var_x = sum((rx[i] - mx) ** 2 for i in range(n))
-    var_y = sum((ry[i] - my) ** 2 for i in range(n))
-    if var_x <= 0 or var_y <= 0:
-        return None, None
-    ic = cov / math.sqrt(var_x * var_y)
-    if abs(ic) >= 1.0 or n <= 2:
-        return round(ic, 4), None
-    t_stat = ic * math.sqrt((n - 2) / (1.0 - ic * ic))
-    return round(ic, 4), round(t_stat, 4)
-
-
 def _benchmark_regime(market_bars: list[dict[str, Any]] | None, as_of: datetime) -> str:
     """Classify the market regime at as_of using benchmark 50/200-day SMAs.
 
@@ -602,11 +477,37 @@ class WalkForwardProofService:
         bar_store: HistoricalBarStore | None = None,
         repository: WalkForwardRepository | None = None,
         scan_repository: ScanRepository | None = None,
+        replay_policy: DecisionPolicy | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.bar_store = bar_store or HistoricalBarStore(settings=self.settings)
         self.repository = repository or WalkForwardRepository()
         self.scan_repository = scan_repository or ScanRepository()
+        if replay_policy is not None and not replay_policy.replayable:
+            raise ValueError("Walk-forward proof can only evaluate replayable DecisionPolicy instances.")
+        self.replay_policy = replay_policy
+
+    def _policy_identity(self) -> dict[str, Any]:
+        policy = self.replay_policy or WeeklyProbabilityPolicy(
+            config=WeeklyPolicyConfig.from_settings(self.settings),
+            reliability_maps={},
+            extra_stats={},
+        )
+        learned_fingerprint = None
+        learned_json = None
+        learned_fingerprint_fn = getattr(policy, "learned_artifacts_fingerprint", None)
+        if callable(learned_fingerprint_fn):
+            learned_fingerprint = learned_fingerprint_fn()
+        learned_identity_fn = getattr(policy, "learned_artifact_identity", None)
+        if callable(learned_identity_fn):
+            learned_json = json.dumps(learned_identity_fn(), sort_keys=True, default=str)
+        return {
+            "policy_id": policy.policy_id,
+            "policy_version": policy.policy_version,
+            "decision_fingerprint": policy.fingerprint(),
+            "learned_artifacts_fingerprint": learned_fingerprint,
+            "learned_artifacts_json": learned_json,
+        }
 
     # --- date selection -------------------------------------------------
 
@@ -903,6 +804,7 @@ class WalkForwardProofService:
             "generated_at": as_of,
             "resolve_due_at": as_of + timedelta(days=forward_days),
             "status": "pending",
+            "policy_id": "weekly_probability",
         }
 
     def _data_quality(self, bar_count: int) -> str:
@@ -911,6 +813,131 @@ class WalkForwardProofService:
         if bar_count >= self.settings.weekly_daily_lookback_bars_min:
             return "low"
         return "degraded"
+
+    def _snapshot_for_policy(
+        self,
+        *,
+        as_of: datetime,
+        bars_by_symbol: dict[str, list[dict[str, Any]]],
+        asset_by_symbol: dict[str, str],
+        market_bars: dict[str, list[dict[str, Any]]],
+    ) -> MarketSnapshot:
+        symbols: list[SymbolSnapshot] = []
+        for symbol, bars in sorted(bars_by_symbol.items()):
+            usable = bars_as_of(bars, as_of)
+            if not usable:
+                continue
+            asset_type = asset_by_symbol.get(symbol) or HistoricalBarStore.resolve_asset_type(symbol)
+            symbols.append(
+                SymbolSnapshot(
+                    symbol=symbol,
+                    asset_type=asset_type,  # type: ignore[arg-type]
+                    daily_bars=usable,
+                    data_quality=self._data_quality(len(usable)),
+                    daily_bars_stale=False,
+                    daily_bars_source="historical_bar_store",
+                )
+            )
+        benchmarks = {
+            "SPY": bars_as_of(market_bars.get("stock") or [], as_of),
+            "BTC/USD": bars_as_of(market_bars.get("crypto") or [], as_of),
+        }
+        return MarketSnapshot(
+            as_of=as_of,
+            symbols=tuple(symbols),
+            benchmark_daily_bars=benchmarks,
+            universe_source="current_watchlist",
+        )
+
+    def _prediction_from_policy_decision(
+        self,
+        decision: BrainDecision,
+        *,
+        sample_source: str,
+    ) -> dict[str, Any] | None:
+        """Convert a replayable policy BUY into the stored WF prediction shape."""
+        if decision.action != "BUY" or decision.exit_plan is None:
+            return None
+        entry_price = float(decision.exit_plan.entry_price or 0.0)
+        if entry_price <= 0:
+            return None
+        upside = decision.p_up_calibrated
+        if upside is None:
+            return None
+        sample_sizes = decision.evidence_basis.sample_sizes or {}
+        sample_size = int((decision.diagnostics or {}).get("sample_size") or max(sample_sizes.values(), default=0))
+        range_low = (
+            float(decision.exit_plan.stop_price)
+            if decision.exit_plan.stop_price is not None
+            else entry_price
+        )
+        range_high = (
+            float(decision.exit_plan.target_price)
+            if decision.exit_plan.target_price is not None
+            else entry_price
+        )
+        forward_days = int(decision.exit_plan.horizon_days or self.settings.weekly_forward_days)
+        return {
+            "as_of": decision.as_of,
+            "asset_type": decision.asset_type,
+            "ticker": decision.symbol.upper(),
+            "selection_rank": 0,
+            "sample_source": sample_source,
+            "pattern_name": decision.pattern_name or decision.policy_id,
+            "decision_signal": "BUY",
+            "confidence": round(float(upside), 4),
+            "upside_probability_pct": round(float(upside), 4),
+            "historical_hit_rate_pct": decision.evidence_basis.historical_hit_rate_pct,
+            "sample_size": sample_size,
+            "entry_price": round(entry_price, 6),
+            "projected_range_low": round(range_low, 6),
+            "projected_range_high": round(range_high, 6),
+            "estimated_exit_price": round(range_high, 6),
+            "invalidation_level": round(range_low, 6),
+            "stop_growing_signal": None,
+            "horizon": "1w",
+            "forward_days": forward_days,
+            "expected_friction_bps": round(
+                self.scan_repository._friction_bps_for_asset_type(decision.asset_type), 4
+            ),
+            "generated_at": decision.as_of,
+            "resolve_due_at": decision.as_of + timedelta(days=forward_days),
+            "status": "pending",
+            "policy_id": decision.policy_id,
+            "policy_version": decision.policy_version,
+            "decision_fingerprint": decision.decision_fingerprint,
+        }
+
+    def _policy_predictions_at(
+        self,
+        *,
+        policy: DecisionPolicy,
+        as_of: datetime,
+        sample_source: str,
+        bars_by_symbol: dict[str, list[dict[str, Any]]],
+        asset_by_symbol: dict[str, str],
+        market_bars: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        snapshot = self._snapshot_for_policy(
+            as_of=as_of,
+            bars_by_symbol=bars_by_symbol,
+            asset_by_symbol=asset_by_symbol,
+            market_bars=market_bars,
+        )
+        by_asset: dict[str, list[dict[str, Any]]] = {"stock": [], "crypto": []}
+        learned_fingerprint = None
+        learned_fingerprint_fn = getattr(policy, "learned_artifacts_fingerprint", None)
+        if callable(learned_fingerprint_fn):
+            learned_fingerprint = learned_fingerprint_fn()
+        for decision in policy.decide_all(snapshot):
+            prediction = self._prediction_from_policy_decision(
+                decision,
+                sample_source=sample_source,
+            )
+            if prediction is not None:
+                prediction["learned_artifacts_fingerprint"] = learned_fingerprint
+                by_asset.setdefault(prediction["asset_type"], []).append(prediction)
+        return by_asset
 
     def _evidence_confidence(
         self,
@@ -1031,9 +1058,12 @@ class WalkForwardProofService:
         persist: bool = True,
     ) -> tuple[str, dict[str, Any]]:
         target_years = int(years or self.settings.proof_effective_years)
-        step = int(step_days or self.settings.proof_step_days)
+        # The ruler's evaluation schedule (replay-date step), distinct from the
+        # policy's own nested sampling step (proof_step_days).
+        step = int(step_days or self.settings.proof_eval_step_days)
         top_n = max(3, min(5, int(top_n_per_asset or self.settings.proof_effective_top_n_per_asset)))
         forward_days = int(self.settings.weekly_forward_days)
+        tolerance_days = int(self.settings.weekly_forward_tolerance_days)
 
         resolved_symbols = symbols or (
             self.settings.watchlist_items + self.settings.crypto_watchlist_items
@@ -1048,10 +1078,13 @@ class WalkForwardProofService:
         as_of_dates = self.select_replay_dates(
             window_start=window_start, window_end=window_end, step_days=step
         )
-        # Overlap invariant: with step >= forward_days consecutive predictions do
-        # not share forward windows. We record status rather than hard-failing so a
-        # deliberately overlapping research run stays possible but is labelled.
-        overlap_status = "non_overlapping" if step >= forward_days else "overlapping"
+        # Overlap invariant: consecutive evaluated predictions must not share any
+        # part of the forward resolution window (forward days + tolerance). We
+        # record status rather than hard-failing so a deliberately overlapping
+        # research run stays possible but is labelled.
+        overlap_status = (
+            "non_overlapping" if step >= forward_days + tolerance_days else "overlapping"
+        )
 
         bars_by_symbol: dict[str, list[dict[str, Any]]] = {}
         asset_by_symbol: dict[str, str] = {}
@@ -1072,6 +1105,7 @@ class WalkForwardProofService:
             force_refresh=force_refresh,
             asset_types=set(asset_by_symbol.values()),
         )
+        policy_identity = self._policy_identity()
 
         predictions: list[dict[str, Any]] = []
         rejection_tracker: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1109,27 +1143,43 @@ class WalkForwardProofService:
 
         for as_of in as_of_dates:
             track = self._track_for(as_of, holdout_start, validation_start)
-            by_asset: dict[str, list[dict[str, Any]]] = {"stock": [], "crypto": []}
-            for symbol in resolved_symbols:
-                bars = bars_by_symbol.get(symbol) or []
-                if not bars:
-                    continue
-                asset_type = asset_by_symbol[symbol]
-                prediction = self.build_prediction_at(
-                    symbol=symbol,
-                    asset_type=asset_type,
-                    bars=bars,
+            if self.replay_policy is not None:
+                by_asset = self._policy_predictions_at(
+                    policy=self.replay_policy,
                     as_of=as_of,
-                    market_bars=market_bars.get(asset_type),
                     sample_source=track,
-                    rejection_tracker=rejection_tracker,
-                    candidate_filter_tracker=candidate_filter_tracker,
-                    selection_stage_tracker=selection_stage_tracker,
+                    bars_by_symbol=bars_by_symbol,
+                    asset_by_symbol=asset_by_symbol,
+                    market_bars=market_bars,
                 )
-                if prediction is None:
-                    continue
-                prediction["sample_source"] = track
-                by_asset.setdefault(prediction["asset_type"], []).append(prediction)
+            else:
+                by_asset = {"stock": [], "crypto": []}
+                for symbol in resolved_symbols:
+                    bars = bars_by_symbol.get(symbol) or []
+                    if not bars:
+                        continue
+                    asset_type = asset_by_symbol[symbol]
+                    prediction = self.build_prediction_at(
+                        symbol=symbol,
+                        asset_type=asset_type,
+                        bars=bars,
+                        as_of=as_of,
+                        market_bars=market_bars.get(asset_type),
+                        sample_source=track,
+                        rejection_tracker=rejection_tracker,
+                        candidate_filter_tracker=candidate_filter_tracker,
+                        selection_stage_tracker=selection_stage_tracker,
+                    )
+                    if prediction is None:
+                        continue
+                    prediction["sample_source"] = track
+                    prediction["policy_id"] = policy_identity["policy_id"]
+                    prediction["policy_version"] = policy_identity["policy_version"]
+                    prediction["decision_fingerprint"] = policy_identity["decision_fingerprint"]
+                    prediction["learned_artifacts_fingerprint"] = policy_identity[
+                        "learned_artifacts_fingerprint"
+                    ]
+                    by_asset.setdefault(prediction["asset_type"], []).append(prediction)
 
             for asset_type, candidates in by_asset.items():
                 candidates.sort(
@@ -1201,16 +1251,60 @@ class WalkForwardProofService:
 
         fingerprint = config_fingerprint(self.settings)
         commit = code_commit()
+        ruler_config = RulerConfig.from_settings(self.settings)
+        ruler_id = ruler_fingerprint(config_payload=ruler_config.payload())
+
+        # Trials ledger: how many distinct configurations have been tried against
+        # this history. Many trials inflate the chance that a passing verdict is
+        # a multiple-testing artifact; the verdict must carry that context.
+        try:
+            prior_fingerprints = self.repository.count_distinct_fingerprints()
+            prior_runs = self.repository.count_runs()
+        except Exception:
+            prior_fingerprints, prior_runs = 0, 0
+        trials = {
+            "distinct_config_fingerprints": prior_fingerprints
+            + (0 if self.repository.fingerprint_seen(fingerprint) else 1),
+            "total_runs": prior_runs + 1,
+            "note": (
+                "Every distinct configuration evaluated against this history is one "
+                "trial. The more trials, the weaker any single passing verdict."
+            ),
+        }
+
+        caveats = [
+            (
+                "Survivorship: the replay universe is the current watchlist; symbols "
+                "that failed and were delisted or dropped are not represented, which "
+                "biases historical results upward."
+            ),
+            (
+                "Adjustment policy: stock bars are split-adjusted only (dividends not "
+                "reinvested); crypto history may mix Alpaca and Polygon sources."
+            ),
+        ]
+
         manifest = {
             "config_fingerprint": fingerprint,
             "code_commit": commit,
             "engine_version": WALK_FORWARD_ENGINE_VERSION,
+            "policy_id": policy_identity["policy_id"],
+            "policy_version": policy_identity["policy_version"],
+            "decision_fingerprint": policy_identity["decision_fingerprint"],
+            "learned_artifacts_fingerprint": policy_identity["learned_artifacts_fingerprint"],
+            "learned_artifacts_json": policy_identity["learned_artifacts_json"],
+            "ruler_version": RULER_VERSION,
+            "ruler_fingerprint": ruler_id,
             "validation_start": validation_start,
             "universe": resolved_symbols,
             "universe_source": "current_watchlist",
             "overlap_status": overlap_status,
             "data_quality": data_quality,
+            "trials": trials,
+            "caveats": caveats,
         }
+        verdict["trials"] = trials
+        verdict["caveats"] = caveats
         # Deterministic run id over the manifest + window so stored-bar reruns with
         # an identical configuration produce the same id (and thus identical rows).
         determinism_key = json.dumps(
@@ -1240,6 +1334,8 @@ class WalkForwardProofService:
                     "holdout_months": int(self.settings.proof_holdout_months),
                     "validation_months": int(self.settings.proof_validation_months),
                     "overlap_status": overlap_status,
+                    "ruler_version": RULER_VERSION,
+                    "ruler_fingerprint": ruler_id,
                 },
                 window_start=window_start,
                 window_end=window_end,
@@ -1283,11 +1379,19 @@ class WalkForwardProofService:
             "config_fingerprint": fingerprint,
             "code_commit": commit,
             "engine_version": WALK_FORWARD_ENGINE_VERSION,
+            "policy_id": policy_identity["policy_id"],
+            "policy_version": policy_identity["policy_version"],
+            "decision_fingerprint": policy_identity["decision_fingerprint"],
+            "learned_artifacts_fingerprint": policy_identity["learned_artifacts_fingerprint"],
+            "ruler_version": RULER_VERSION,
+            "ruler_fingerprint": ruler_id,
             "universe": resolved_symbols,
             "universe_source": "current_watchlist",
             "data_quality_ok": data_quality_ok,
             "data_quality_issues": qc_issues[:100],
             "overlap_status": overlap_status,
+            "trials": trials,
+            "caveats": caveats,
             "note": metrics.get("note"),
         }
         return run_id, summary
@@ -1349,6 +1453,12 @@ class WalkForwardProofService:
         tolerance = int(self.settings.weekly_forward_tolerance_days)
         momentum_lookback = int(self.settings.proof_momentum_lookback_days)
         draws = max(1, int(self.settings.proof_benchmark_random_draws))
+        # Opportunity matching: baselines may only hold symbols the strategy could
+        # have considered at that date (enough visible history to warm up pattern
+        # detection). Without this, buy-and-hold gets credit for symbols the
+        # strategy was structurally unable to pick, making the edge unfairly hard
+        # (or easy) depending on which symbols lack early history.
+        eligibility_warmup = max(int(self.settings.weekly_daily_lookback_bars_min) // 4, 60)
         symbols_by_asset: dict[str, list[str]] = {"stock": [], "crypto": []}
         for symbol, asset_type in asset_by_symbol.items():
             symbols_by_asset.setdefault(asset_type, []).append(symbol)
@@ -1389,9 +1499,12 @@ class WalkForwardProofService:
                     fr = _forward_return(bars, as_of=as_of, forward_days=forward_days, tolerance_days=tolerance)
                     if fr is None:
                         continue
-                    forwards[symbol] = fr
                     usable = bars_as_of(bars, as_of)
                     closes = [close_price(b) for b in usable if close_price(b) > 0]
+                    if len(closes) < eligibility_warmup:
+                        # Not in the strategy's opportunity set at this date.
+                        continue
+                    forwards[symbol] = fr
                     mom = _momentum_pct(closes, momentum_lookback)
                     if mom is not None:
                         momentum[symbol] = mom
@@ -1581,6 +1694,14 @@ class WalkForwardProofService:
                 )
                 metrics_row["prediction_count"] = len(group_all)
                 metrics_row["pending_count"] = len(group_all) - len(group)
+                # Missingness: selected predictions that never resolved (no usable
+                # forward bar). A high rate silently biases every other metric, so
+                # it is reported alongside them rather than hidden.
+                metrics_row["missing_resolution_rate_pct"] = (
+                    round((len(group_all) - len(group)) / len(group_all) * 100.0, 4)
+                    if group_all
+                    else None
+                )
                 # Calibrate holdout using only the earlier research window (no lookahead).
                 if track_label == "holdout" and reliability_map:
                     holdout_pairs = [
@@ -1719,11 +1840,28 @@ class WalkForwardProofService:
                 }
             )
 
+        # Brier score of the stated probability against the realized direction:
+        # mean((p/100 - outcome)^2) over resolved predictions that carried a
+        # probability. Lower is better; 0.25 is the score of a coin-flip forecast.
+        brier_terms = [
+            (float(p["upside_probability_pct"]) / 100.0 - (1.0 if float(p["return_after_1w"]) > 0 else 0.0)) ** 2
+            for p in ordered
+            if p.get("upside_probability_pct") is not None
+        ]
+        brier_score = round(sum(brier_terms) / len(brier_terms), 4) if brier_terms else None
+
+        # Derived view: hit rate recomputed after friction is deducted from the
+        # canonical raw returns (raw outcomes stay canonical; this reinterprets).
+        up_after_friction = sum(1 for r in after_friction if r > 0)
         metrics_row = {
             "asset_type": asset_type,
             "track": track_label,
             "resolved_count": len(ordered),
             "upside_hit_rate_pct": round(up_count / len(returns) * 100.0, 4) if returns else None,
+            "upside_hit_rate_after_friction_pct": (
+                round(up_after_friction / len(after_friction) * 100.0, 4) if after_friction else None
+            ),
+            "brier_score": brier_score,
             "avg_return_pct": _mean(returns),
             "avg_return_after_friction_pct": _mean(after_friction),
             "avg_return_after_friction_stressed_pct": _mean(after_friction_stressed),

@@ -10,6 +10,7 @@ from unittest.mock import patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.brain.contracts import BrainDecision, EvidenceBasis, ExitPlan, MarketSnapshot
 from app.config import Settings
 from app.db import Base
 from app.services.historical_bar_store import BarCoverage
@@ -282,6 +283,97 @@ class SelectionTests(unittest.TestCase):
             ranked = sorted(rows, key=lambda r: r["selection_rank"])
             probs = [r["upside_probability_pct"] or 0.0 for r in ranked]
             self.assertEqual(probs, sorted(probs, reverse=True))
+
+
+class FakeReplayPolicy:
+    policy_id = "fake_replay_policy"
+    policy_version = "fake-v1"
+    replayable = True
+
+    def config_payload(self) -> dict:
+        return {"fixture": "generic-wf"}
+
+    def fingerprint(self) -> str:
+        return "fake-fingerprint"
+
+    def decide_all(self, snapshot: MarketSnapshot) -> list[BrainDecision]:
+        decisions: list[BrainDecision] = []
+        for symbol in snapshot.symbols:
+            closes = [float(bar["c"]) for bar in symbol.daily_bars if float(bar.get("c", 0.0)) > 0]
+            if not closes:
+                continue
+            price = closes[-1]
+            decisions.append(
+                BrainDecision(
+                    policy_id=self.policy_id,
+                    policy_version=self.policy_version,
+                    decision_fingerprint=self.fingerprint(),
+                    symbol=symbol.symbol,
+                    asset_type=symbol.asset_type,
+                    as_of=snapshot.as_of,
+                    action="BUY",
+                    p_up_calibrated=61.0,
+                    expected_value_pct=1.0,
+                    exit_plan=ExitPlan(
+                        entry_price=price,
+                        target_price=price * 1.03,
+                        stop_price=price * 0.98,
+                        horizon_days=7,
+                    ),
+                    evidence_basis=EvidenceBasis(
+                        basis="historical_only",
+                        sample_sizes={"historical": 50},
+                        historical_hit_rate_pct=61.0,
+                        historical_avg_return_pct=1.0,
+                    ),
+                    pattern_name="fake_non_weekly_setup",
+                )
+            )
+        return decisions
+
+
+class GenericPolicyWalkForwardTests(unittest.TestCase):
+    def test_run_evaluates_replayable_decision_policy_without_weekly_special_case(self) -> None:
+        last_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Downward series: the legacy weekly pattern detector should not be able
+        # to manufacture bullish candidates, so any resolved rows must come from
+        # the fake policy's BrainDecision outputs.
+        bars = {
+            "AAA": make_uptrend_bars(count=760, last_day=last_day, daily_drift=-0.02),
+            "BBB": make_uptrend_bars(count=760, last_day=last_day, daily_drift=-0.015),
+            "CCC/USD": make_uptrend_bars(count=760, last_day=last_day, daily_drift=-0.01),
+        }
+        service = WalkForwardProofService(
+            settings=proof_settings(),
+            bar_store=FakeBarStore(bars),
+            scan_repository=ScanRepository(),
+            replay_policy=FakeReplayPolicy(),
+        )
+        captured: dict[str, list[dict]] = {}
+        real_metrics = service.compute_metrics
+
+        def capture(predictions, **kwargs):
+            captured["predictions"] = predictions
+            return real_metrics(predictions, **kwargs)
+
+        with patch.object(service, "compute_metrics", side_effect=capture):
+            _run_id, summary = asyncio.run(
+                service.run(
+                    symbols=list(bars),
+                    years=2,
+                    step_days=28,
+                    top_n_per_asset=3,
+                    persist=False,
+                )
+            )
+
+        predictions = captured["predictions"]
+        self.assertGreater(summary["prediction_count"], 0)
+        self.assertTrue(predictions)
+        self.assertEqual({row["policy_id"] for row in predictions}, {"fake_replay_policy"})
+        self.assertEqual({row["policy_version"] for row in predictions}, {"fake-v1"})
+        self.assertEqual({row["decision_fingerprint"] for row in predictions}, {"fake-fingerprint"})
+        self.assertEqual({row["pattern_name"] for row in predictions}, {"fake_non_weekly_setup"})
 
 
 class CandidateFilterDiagnosticsTests(unittest.TestCase):
@@ -1037,7 +1129,7 @@ class FilterTests(unittest.TestCase):
 
 class CalibrationTests(unittest.TestCase):
     def test_reliability_map_and_gap(self) -> None:
-        from app.core.calibration import build_reliability_map, calibrated_mean_abs_gap_pct
+        from app.brain.calibration import build_reliability_map, calibrated_mean_abs_gap_pct
 
         research = [(70.0, True), (72.0, False), (30.0, False), (32.0, True), (30.0, False)]
         mapping = build_reliability_map(research, n_bins=5)
@@ -1256,6 +1348,10 @@ class WalkForwardRepositoryTests(unittest.TestCase):
                 "config_fingerprint": "abc123",
                 "code_commit": "deadbeef",
                 "engine_version": "wf-engine-v1",
+                "policy_id": "weekly_probability",
+                "policy_version": "weekly-prob-v1",
+                "decision_fingerprint": "weekly-fp-1",
+                "learned_artifacts_fingerprint": "artifact-fp-1",
                 "validation_start": now - timedelta(days=180),
                 "universe": ["AAA", "BBB/USD"],
                 "data_quality": {"ok": False, "issues": ["AAA: stale tail"]},
@@ -1266,10 +1362,38 @@ class WalkForwardRepositoryTests(unittest.TestCase):
         self.assertEqual(summary.config_fingerprint, "abc123")
         self.assertEqual(summary.code_commit, "deadbeef")
         self.assertEqual(summary.engine_version, "wf-engine-v1")
+        self.assertEqual(summary.policy_id, "weekly_probability")
+        self.assertEqual(summary.policy_version, "weekly-prob-v1")
+        self.assertEqual(summary.decision_fingerprint, "weekly-fp-1")
+        self.assertEqual(summary.learned_artifacts_fingerprint, "artifact-fp-1")
         self.assertEqual(summary.universe, ["AAA", "BBB/USD"])
         self.assertIsNotNone(summary.validation_start)
         self.assertFalse(summary.data_quality_ok)
         self.assertEqual(summary.overlap_status, "non_overlapping")
+        applicable = self.repo.get_latest_applicable_run_summary(
+            policy_id="weekly_probability",
+            policy_version="weekly-prob-v1",
+            decision_fingerprint="weekly-fp-1",
+            learned_artifacts_fingerprint="artifact-fp-1",
+        )
+        self.assertIsNotNone(applicable)
+        assert applicable is not None
+        self.assertEqual(applicable.run_id, "wf-manifest-1")
+        self.assertIsNone(
+            self.repo.get_latest_applicable_run_summary(
+                policy_id="weekly_probability",
+                policy_version="weekly-prob-v1",
+                decision_fingerprint="weekly-fp-1",
+                learned_artifacts_fingerprint="different-artifact",
+            )
+        )
+        self.assertIsNone(
+            self.repo.get_latest_applicable_run_summary(
+                policy_id="weekly_probability",
+                policy_version="weekly-prob-v1",
+                decision_fingerprint="different-fp",
+            )
+        )
 
     def test_validation_track_rows_round_trip(self) -> None:
         # The engine emits research/validation/holdout track labels; the summary

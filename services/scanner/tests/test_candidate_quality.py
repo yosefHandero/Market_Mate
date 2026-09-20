@@ -4,8 +4,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from app.core.candidate_quality import buy_candidate_reject_reason, rsi, sma, volume_confirmed
-from app.core.weekly_backtest import PatternBacktestStats
+from app.brain.candidate_quality import buy_candidate_reject_reason, rsi, sma, volume_confirmed
+from app.brain.weekly_backtest import PatternBacktestStats
 
 LAST_DAY = datetime(2026, 1, 1, tzinfo=timezone.utc)
 

@@ -428,7 +428,7 @@ class RepositoryCalibrationTests(unittest.TestCase):
 
         self.assertFalse(allowed)
 
-    def test_validation_summary_surfaces_out_of_sample_degradation(self) -> None:
+    def test_validation_summary_surfaces_recent_window_degradation(self) -> None:
         base_time = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
         rows = [
             self._outcome_row(
@@ -447,8 +447,8 @@ class RepositoryCalibrationTests(unittest.TestCase):
         with patch.object(self.repo, "_load_signal_outcome_rows", return_value=rows):
             summary = self.repo.get_signal_validation_summary()
 
-        self.assertIsNotNone(summary.in_sample)
-        self.assertIsNotNone(summary.out_of_sample)
+        self.assertIsNotNone(summary.earlier_window)
+        self.assertIsNotNone(summary.recent_window)
         self.assertTrue(summary.degradation_warnings)
 
     def test_filter_loaded_signal_outcome_rows_applies_date_range_and_asset_type(self) -> None:

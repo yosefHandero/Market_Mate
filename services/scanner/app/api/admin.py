@@ -202,19 +202,6 @@ async def list_proof_campaigns() -> dict[str, object]:
     return _campaigns_payload()
 
 
-@router.get("/scan/windows")
-async def list_scan_windows(limit: int = 30) -> dict[str, object]:
-    from app.services.scan_windows import ScanWindowService
-
-    service = ScanWindowService()
-    service.ensure_and_sweep()
-    windows = service.list_recent(limit=limit)
-    return {
-        "missed_count_14d": service.missed_count(lookback_days=14),
-        "windows": [window.as_dict() for window in windows],
-    }
-
-
 @router.get("/risk/trade-eligibility", response_model=TradeEligibilityResponse)
 async def get_trade_eligibility(
     ticker: str = Query(min_length=1),

@@ -258,6 +258,23 @@ class AlpacaClient:
             timeframe=timeframe,
             limit=10000,
         )
+        # A long weekend/holiday can leave the ordinary three-calendar-day
+        # window empty. Retry only missing symbols once with older real bars;
+        # keep returned timestamps intact so the existing freshness gates apply.
+        bars = dict(payload.get("bars") or {})
+        missing = [symbol for symbol in symbols if not bars.get(symbol)]
+        if missing:
+            older = await self._fetch_stock_bars(
+                symbols=missing,
+                start=end - timedelta(days=7),
+                end=end,
+                timeframe=timeframe,
+                limit=10000,
+            )
+            for symbol in missing:
+                if (older.get("bars") or {}).get(symbol):
+                    bars[symbol] = older["bars"][symbol]
+        payload = {"bars": bars}
         return self._build_bars_by_symbol(payload)
 
     async def _get_latest_crypto_bars_uncached(

@@ -137,8 +137,10 @@ class ScannerServiceHardeningTests(unittest.TestCase):
 
     def test_daily_bar_service_shares_provider_clients(self) -> None:
         service = ScannerService()
-        self.assertIs(service.daily_bar_service.alpaca, service.alpaca)
-        self.assertIs(service.daily_bar_service.polygon, service.polygon)
+        # The store behind the daily-bar spine must reuse the scanner's provider
+        # clients rather than building duplicate HTTP stacks.
+        self.assertIs(service.daily_bar_service.bar_store.alpaca, service.alpaca)
+        self.assertIs(service.daily_bar_service.bar_store.polygon, service.polygon)
 
     def test_run_scan_bounds_daily_bar_fetch_with_concurrency_limit(self) -> None:
         service = ScannerService()

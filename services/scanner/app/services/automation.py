@@ -70,9 +70,12 @@ class AutomationService:
         for result in run.results:
             if not result.is_top_pick:
                 continue
-            if result.decision_signal not in {"BUY", "SELL"}:
+            # BUY-only product: SELL/HOLD are detector classifications, never
+            # actionable entries. Sell-side orders exist only to unwind paper
+            # positions, not as short entries from SELL signals.
+            if result.decision_signal != "BUY":
                 continue
-            side = "buy" if result.decision_signal == "BUY" else "sell"
+            side = "buy"
             qty = self._compute_qty(result)
             if qty <= 0:
                 continue

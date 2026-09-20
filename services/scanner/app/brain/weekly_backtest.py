@@ -3,14 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from app.core.weekly_bar_utils import (
+from app.brain.weekly_bar_utils import (
     bars_as_of,
     close_price,
     forward_close_after,
     parse_bar_timestamp,
     sorted_bars,
 )
-from app.core.weekly_patterns import DetectedPattern, detect_weekly_pattern
+from app.brain.weekly_patterns import DetectedPattern, detect_weekly_pattern
 from app.schemas import SampleSource
 
 

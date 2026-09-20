@@ -1,8 +1,8 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from app.core.weekly_bar_utils import bars_as_of, parse_bar_timestamp
-from app.core.weekly_patterns import detect_weekly_pattern, project_weekly_range
+from app.brain.weekly_bar_utils import bars_as_of, parse_bar_timestamp
+from app.brain.weekly_patterns import detect_weekly_pattern, project_weekly_range
 
 
 def _bars(closes: list[float], start: datetime | None = None) -> list[dict]:

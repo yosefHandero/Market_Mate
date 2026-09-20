@@ -173,6 +173,8 @@ export function WalkForwardProofPanel({
         <p style={{ margin: '4px 0 0' }}>
           Run manifest: engine {summary.engine_version ?? 'n/a'} &middot; config{' '}
           {summary.config_fingerprint ? summary.config_fingerprint.slice(0, 12) : 'n/a'} &middot;{' '}
+          ruler {summary.ruler_version ?? 'n/a'} /{' '}
+          {summary.ruler_fingerprint ? summary.ruler_fingerprint.slice(0, 12) : 'n/a'} &middot;{' '}
           {summary.overlap_status ?? 'overlap n/a'} &middot; data quality{' '}
           {summary.data_quality_ok == null
             ? 'n/a'

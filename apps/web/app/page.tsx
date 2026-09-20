@@ -1,22 +1,31 @@
 import { DashboardStatusBanner } from '@/components/dashboard-status-banner';
+import { DecisionServingPolicyStatus } from '@/components/decision-serving-policy-status';
 import { DecisionGrid } from '@/components/decision-grid';
 import {
   getAutomationStatus,
   getLatestDecisions,
   getLatestScan,
+  getProofSummary,
   getReadyz,
   getSystemReadiness,
 } from '@/lib/api';
 
 export default async function DecisionPage() {
-  const [decisionsResult, automationResult, healthResult, systemReadinessResult, latestScanResult] =
-    await Promise.all([
-      getLatestDecisions(50),
-      getAutomationStatus(),
-      getReadyz(),
-      getSystemReadiness(),
-      getLatestScan(),
-    ]);
+  const [
+    decisionsResult,
+    automationResult,
+    healthResult,
+    systemReadinessResult,
+    latestScanResult,
+    proofSummaryResult,
+  ] = await Promise.all([
+    getLatestDecisions(50),
+    getAutomationStatus(),
+    getReadyz(),
+    getSystemReadiness(),
+    getLatestScan(),
+    getProofSummary(),
+  ]);
 
   const errors = [
     decisionsResult.error,
@@ -36,6 +45,10 @@ export default async function DecisionPage() {
               estimated exit window. Paper dry-run only; not financial advice.
             </p>
           </div>
+          <DecisionServingPolicyStatus
+            report={proofSummaryResult.data?.policy_promotion}
+            error={proofSummaryResult.error}
+          />
         </div>
 
         {errors.length ? (

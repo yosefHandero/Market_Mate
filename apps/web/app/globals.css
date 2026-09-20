@@ -227,6 +227,27 @@ th {
   line-height: 1.4;
 }
 
+.decision-policy-status {
+  justify-self: flex-end;
+  max-width: 360px;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid rgba(157, 176, 208, 0.16);
+  border-radius: 8px;
+  background: rgba(11, 21, 36, 0.48);
+  line-height: 1.4;
+}
+
+.decision-policy-status strong {
+  color: var(--text);
+}
+
+.decision-policy-mismatch {
+  display: block;
+  margin-top: 2px;
+  color: var(--amber);
+}
+
 .system-health-errors {
   display: grid;
   gap: 6px;
@@ -544,6 +565,7 @@ tr.highlighted-row td {
 .decision-card-gray {
   border-left: 4px solid #6b7a94;
   opacity: 0.92;
+  background: rgba(16, 26, 43, 0.78);
 }
 
 .decision-card-header {
@@ -551,6 +573,13 @@ tr.highlighted-row td {
   justify-content: space-between;
   align-items: flex-start;
   gap: 12px;
+}
+
+.decision-card-header-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .decision-card-symbol {
@@ -564,6 +593,22 @@ tr.highlighted-row td {
   gap: 8px;
 }
 
+.decision-card-metric {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.decision-card-metric-label,
+.decision-card-metric-value {
+  line-height: 1.25;
+}
+
+.decision-card-metric-value {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
 .decision-reason-list {
   margin: 0;
   padding-left: 18px;
@@ -573,6 +618,25 @@ tr.highlighted-row td {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.decision-readonly-setups {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(157, 176, 208, 0.24);
+}
+
+.decision-readonly-grid .decision-card {
+  border-style: dashed;
+}
+
+.decision-card-setup-details-body {
+  display: grid;
+  gap: 6px;
+}
+
+.decision-card-setup-details-body p {
+  margin: 0;
 }
 
 .proof-page-title {
@@ -618,4 +682,15 @@ tr.highlighted-row td {
   padding-left: 18px;
   display: grid;
   gap: 3px;
+}
+
+@media (max-width: 900px) {
+  .system-health-card-head {
+    flex-direction: column;
+  }
+
+  .decision-policy-status {
+    align-self: stretch;
+    max-width: none;
+  }
 }

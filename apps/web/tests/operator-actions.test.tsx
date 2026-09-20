@@ -110,6 +110,26 @@ beforeEach(() => {
 });
 
 describe('OperatorActions', () => {
+  it('refreshes server-rendered data after a successful manual scan', async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ scan_count: 20 })));
+    vi.stubGlobal('fetch', fetchMock);
+    renderOperatorActions();
+    await user.click(screen.getByRole('button', { name: 'Run scan now' }));
+    expect(await screen.findByText('Scan completed: 20 results')).toBeInTheDocument();
+    expect(refreshMock).toHaveBeenCalledOnce();
+  });
+
+  it('shows a provider failure without claiming a completed scan or refreshing', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: 'Provider unavailable' }), { status: 502 })));
+    renderOperatorActions();
+    await user.click(screen.getByRole('button', { name: 'Run scan now' }));
+    expect(await screen.findByText('Provider unavailable')).toBeInTheDocument();
+    expect(refreshMock).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Scan completed/)).not.toBeInTheDocument();
+  });
+
   it('starts the scheduler when disabled and readyz confirms the worker is running', async () => {
     const user = userEvent.setup();
     const fetchMock = createAppFetchMock([
@@ -225,7 +245,7 @@ describe('OperatorActions', () => {
     });
 
     expect(screen.getByText(/readiness scores drop/i)).toBeInTheDocument();
-    expect(screen.getAllByRole('button', { name: 'Copy start-worker script' }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole('button', { name: 'Copy app startup command' }).length).toBeGreaterThan(0);
   });
 
   it('shows the worker warning when readyz never reports scheduler_running after start', async () => {

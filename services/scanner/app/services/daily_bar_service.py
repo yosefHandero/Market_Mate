@@ -1,113 +1,55 @@
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any
 
+from app.brain.weekly_bar_utils import parse_bar_timestamp, sorted_bars
 from app.clients.alpaca import AlpacaClient
 from app.clients.polygon import PolygonClient
 from app.config import Settings, get_settings
-from app.core.weekly_bar_utils import parse_bar_timestamp, sorted_bars
+from app.services.historical_bar_store import HistoricalBarStore
 
 logger = logging.getLogger(__name__)
 
 
 class DailyBarService:
+    """Live access to the single point-in-time daily-bar spine.
+
+    Serves bars from :class:`HistoricalBarStore` - the same store replay and
+    the walk-forward proof engine read - so live decisions, replay backfill,
+    and historical proof all see identical history: split-adjusted stocks,
+    Polygon-deepened crypto, and auditable in-place bar revisions. There is no
+    separate JSON file cache anymore; the store is the cache. A per-process
+    TTL memo bounds how often the provider tail-refresh runs per symbol.
+    """
+
     def __init__(
         self,
         *,
         alpaca: AlpacaClient | None = None,
         polygon: PolygonClient | None = None,
         settings: Settings | None = None,
+        bar_store: HistoricalBarStore | None = None,
     ) -> None:
         self.settings = settings or get_settings()
-        self.alpaca = alpaca or AlpacaClient()
-        self.polygon = polygon or PolygonClient()
+        self.bar_store = bar_store or HistoricalBarStore(
+            alpaca=alpaca, polygon=polygon, settings=self.settings
+        )
+        self._tail_checked_at: dict[tuple[str, str], datetime] = {}
 
-    def _cache_path(self, symbol: str, asset_type: str) -> Path:
-        safe_symbol = symbol.replace("/", "_").upper()
-        return self.settings.cache_dir_path / "daily_bars" / asset_type / f"{safe_symbol}.json"
-
-    def _read_cache(self, path: Path) -> dict[str, Any] | None:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
-        except Exception:
-            logger.warning("daily_bar_cache_read_failed", extra={"path": str(path)}, exc_info=True)
-            return None
-        return payload if isinstance(payload, dict) else None
-
-    def _cache_fresh(self, payload: dict[str, Any]) -> bool:
-        fetched_at = payload.get("fetched_at")
-        if not fetched_at:
-            return False
-        try:
-            parsed = datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        age_seconds = (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()
-        return age_seconds <= max(self.settings.weekly_daily_bar_cache_ttl_seconds, 60)
-
-    def _write_cache(self, path: Path, *, symbol: str, asset_type: str, bars: list[dict[str, Any]]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "symbol": symbol.upper(),
-            "asset_type": asset_type,
-            "timeframe": "1Day",
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "bars": bars,
-        }
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    def _refresh_due(self, key: tuple[str, str], now: datetime) -> bool:
+        checked = self._tail_checked_at.get(key)
+        if checked is None:
+            return True
+        ttl_seconds = max(int(self.settings.weekly_daily_bar_cache_ttl_seconds), 60)
+        return (now - checked).total_seconds() > ttl_seconds
 
     def _trim_bars(self, bars: list[dict[str, Any]], *, max_bars: int) -> list[dict[str, Any]]:
         ordered = sorted_bars(bars)
         if len(ordered) <= max_bars:
             return ordered
         return ordered[-max_bars:]
-
-    async def _fetch_alpaca_daily(
-        self,
-        symbol: str,
-        *,
-        asset_type: str,
-        start: datetime,
-        end: datetime,
-        limit: int,
-    ) -> list[dict[str, Any]]:
-        if asset_type == "crypto":
-            return await self.alpaca.get_historical_crypto_bars(
-                symbol,
-                start=start,
-                end=end,
-                timeframe="1Day",
-                limit=limit,
-            )
-        return await self.alpaca.get_historical_stock_bars(
-            symbol,
-            start=start,
-            end=end,
-            timeframe="1Day",
-            limit=limit,
-        )
-
-    async def _fetch_polygon_daily(
-        self,
-        symbol: str,
-        *,
-        start: datetime,
-        end: datetime,
-        limit: int,
-    ) -> list[dict[str, Any]]:
-        return await self.polygon.get_historical_bars(
-            symbol,
-            start=start,
-            end=end,
-            timeframe="1Day",
-            limit=limit,
-        )
 
     async def get_daily_bars(
         self,
@@ -117,48 +59,24 @@ class DailyBarService:
         force_refresh: bool = False,
     ) -> tuple[list[dict[str, Any]], str]:
         normalized_symbol = symbol.upper()
-        resolved_asset_type = asset_type or ("crypto" if "/" in normalized_symbol else "stock")
-        cache_path = self._cache_path(normalized_symbol, resolved_asset_type)
-        if not force_refresh:
-            cached = self._read_cache(cache_path)
-            if cached and self._cache_fresh(cached):
-                bars = list(cached.get("bars") or [])
-                return self._trim_bars(bars, max_bars=self.settings.weekly_daily_lookback_bars_max), "cache"
+        resolved_asset_type = HistoricalBarStore.resolve_asset_type(normalized_symbol, asset_type)
+        key = (normalized_symbol, resolved_asset_type)
+        now = datetime.now(timezone.utc)
 
-        end = datetime.now(timezone.utc)
-        lookback_calendar_days = int(self.settings.weekly_daily_lookback_bars_max * 1.6)
-        start = end - timedelta(days=max(lookback_calendar_days, 365))
-        limit = min(max(self.settings.weekly_daily_lookback_bars_max, 500), 5000)
-        source = "alpaca"
-        bars: list[dict[str, Any]] = []
-        try:
-            bars = await self._fetch_alpaca_daily(
-                normalized_symbol,
-                asset_type=resolved_asset_type,
-                start=start,
-                end=end,
-                limit=limit,
+        if force_refresh or self._refresh_due(key, now):
+            bars = await self.bar_store.ensure_recent_tail(
+                normalized_symbol, asset_type=resolved_asset_type
             )
-        except Exception as alpaca_error:
-            if resolved_asset_type != "stock" or not self.settings.polygon_api_key:
-                raise alpaca_error
-            bars = await self._fetch_polygon_daily(
-                normalized_symbol,
-                start=start,
-                end=end,
-                limit=limit,
-            )
-            source = "polygon"
+            self._tail_checked_at[key] = now
+            source = "store_refreshed"
+        else:
+            bars = self.bar_store.load_bars(normalized_symbol, asset_type=resolved_asset_type)
+            source = "store"
 
-        trimmed = self._trim_bars(bars, max_bars=self.settings.weekly_daily_lookback_bars_max)
-        if trimmed:
-            self._write_cache(
-                cache_path,
-                symbol=normalized_symbol,
-                asset_type=resolved_asset_type,
-                bars=trimmed,
-            )
-        return trimmed, source
+        return (
+            self._trim_bars(bars, max_bars=self.settings.weekly_daily_lookback_bars_max),
+            source,
+        )
 
     def _max_age_days(self, asset_type: str | None) -> int:
         if (asset_type or "stock") == "crypto":

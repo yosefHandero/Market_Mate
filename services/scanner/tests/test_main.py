@@ -1008,6 +1008,22 @@ class MainRouteTests(unittest.TestCase):
         self.assertEqual(body["loop_metrics"]["total_audits"], 3)
         self.assertEqual(body["mark_prices_source"], "latest_scan")
         self.assertEqual(body["prediction_accuracy"]["in_range_rate_pct"], 60.0)
+        self.assertEqual(body["ruler_version"], body["policy_promotion"]["ruler_version"])
+        self.assertTrue(body["ruler_fingerprint"])
+        self.assertEqual(
+            body["ruler_fingerprint"],
+            body["policy_promotion"]["ruler_fingerprint"],
+        )
+        self.assertIn("paired_returns_resolution_clusters", body["policy_promotion"])
+        self.assertIn(
+            "paired_returns_cluster_metadata_complete",
+            body["policy_promotion"],
+        )
+        self.assertTrue(body["policy_promotion"]["champion_decision_fingerprint"])
+        self.assertTrue(body["policy_promotion"]["challenger_decision_fingerprint"])
+        self.assertIn("paired_returns_total", body["policy_promotion"])
+        self.assertIn("paired_returns_both_abstained", body["policy_promotion"])
+        self.assertIn("pair_exclusion_counts", body["policy_promotion"])
         summary_mock.assert_called_once()
 
     def test_admin_paper_routes_return_promotion_and_reconciliation_reports(self) -> None:

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Verify the Market Mate Scanner is healthy during a wake window.
+    Verify the Market Mate Scanner is healthy during a manual session.
 .DESCRIPTION
     Checks, and prints PASS/FAIL for each:
       - Backend live            (GET /livez)
@@ -16,7 +16,7 @@
 .PARAMETER MaxScanAgeMinutes
     Freshness threshold for last scan. Default 30.
 .PARAMETER ExpectScheduler
-    Require scheduler_running/worker_alive/fresh scan (use during a window). Default $true.
+    Require scheduler_running/worker_alive/fresh scan (use during a manual session). Default $true.
 #>
 [CmdletBinding()]
 param(
@@ -83,10 +83,10 @@ catch {
 # 3) Scan results exist
 try {
     $latest = Invoke-ScannerRequest -Method Get -Url "$baseUrl/scan/latest" -Headers $readHeaders
-    $hasRun = ($null -ne $latest) -and ($null -ne $latest.id)
+    $hasRun = ($null -ne $latest) -and ($null -ne $latest.run_id)
     $rowCount = 0
     if ($hasRun -and ($latest.PSObject.Properties.Name -contains 'results') -and $latest.results) { $rowCount = @($latest.results).Count }
-    Report -Name 'Latest scan exists (/scan/latest)' -Ok $hasRun -Detail "run_id=$($latest.id) rows=$rowCount"
+    Report -Name 'Latest scan exists (/scan/latest)' -Ok $hasRun -Detail "run_id=$($latest.run_id) rows=$rowCount"
 }
 catch {
     Report -Name 'Latest scan exists (/scan/latest)' -Ok $false -Detail $_.Exception.Message
@@ -113,31 +113,13 @@ else {
 # In this build EXECUTION_ENABLED=true or ALLOW_LIVE_TRADING=true is not merely
 # ignored - it makes the backend refuse to start (Settings.forbid_live_execution),
 # so a running backend already implies these are off. This .env pre-flight catches
-# a misconfiguration before you attempt a wake window.
+# a misconfiguration before starting a manual session.
 $execEnabled = (Get-DotEnvValue -Name 'EXECUTION_ENABLED')
 $liveEnabled = (Get-DotEnvValue -Name 'ALLOW_LIVE_TRADING')
 $safe = ((-not $execEnabled) -or $execEnabled.ToLower() -ne 'true') -and ((-not $liveEnabled) -or $liveEnabled.ToLower() -ne 'true')
 Report -Name 'Paper-only invariant (live flags off)' -Ok $safe -Detail "EXECUTION_ENABLED=$execEnabled ALLOW_LIVE_TRADING=$liveEnabled (true = backend will not start)"
 
-# 6) Wake timers present: a Market Mate task must be able to wake the PC, else a
-# missed overnight/weekend window will never fire while asleep.
-try {
-    $wake = (& powercfg /waketimers 2>&1 | Out-String)
-    $hasMarketMate = $wake -match 'MarketMate'
-    if ($hasMarketMate) {
-        Report -Name 'Wake timers armed (powercfg /waketimers)' -Ok $true -Detail 'MarketMate wake timer present'
-    }
-    else {
-        # No armed timer is only a warning: it is expected outside the pre-window
-        # arming period, so do not fail the run on this alone.
-        Write-Host '[WARN] Wake timers - no MarketMate wake timer currently armed (expected only near a window start).' -ForegroundColor Yellow
-    }
-}
-catch {
-    Write-Host "[WARN] Wake timers - could not query powercfg: $($_.Exception.Message)" -ForegroundColor Yellow
-}
-
-# 7) Database integrity: PRAGMA quick_check + immutable-record hash verification.
+# 6) Database integrity: PRAGMA quick_check + immutable-record hash verification.
 try {
     $adminAuth = Get-ScannerAdminAuth
     $dbCheck = Invoke-ScannerRequest -Method Post -Url "$baseUrl/system/db/check" -Headers $adminAuth.Headers
@@ -149,18 +131,6 @@ try {
 }
 catch {
     Report -Name 'Database integrity (/system/db/check)' -Ok $false -Detail $_.Exception.Message
-}
-
-# 8) Scan-window ledger / catch-up: surface missed expected windows and pending resolutions.
-try {
-    $adminAuth = Get-ScannerAdminAuth
-    $windows = Invoke-ScannerRequest -Method Get -Url "$baseUrl/scan/windows?limit=10" -Headers $adminAuth.Headers
-    $missed = 0
-    if ($windows.PSObject.Properties.Name -contains 'missed_count_14d') { $missed = [int]$windows.missed_count_14d }
-    Report -Name 'Scan-window ledger (/scan/windows)' -Ok ($missed -eq 0) -Detail "missed_14d=$missed"
-}
-catch {
-    Report -Name 'Scan-window ledger (/scan/windows)' -Ok $false -Detail $_.Exception.Message
 }
 
 try {

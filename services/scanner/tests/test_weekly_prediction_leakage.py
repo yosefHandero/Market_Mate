@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from app.config import Settings
-from app.core.weekly_backtest import PatternBacktestStats
+from app.brain.weekly_backtest import PatternBacktestStats
 from app.services.weekly_prediction_service import WeeklyPredictionService
 
 

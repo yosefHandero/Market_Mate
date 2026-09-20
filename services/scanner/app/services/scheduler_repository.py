@@ -221,19 +221,19 @@ class SchedulerRepository:
             session.commit()
             return changed or enabled
 
-    def acquire_lease(self, instance_id: str) -> bool:
+    def acquire_lease(self, instance_id: str, *, for_maintenance: bool = False) -> bool:
         now = self._utc_now()
         lease_until = now + timedelta(seconds=self.settings.scheduler_lease_seconds)
         with SessionLocal() as session:
             row = self._get_or_create_row(session)
-            if not row.enabled:
+            if not row.enabled and not for_maintenance:
                 session.commit()
                 return False
             result = session.execute(
                 update(SchedulerStateORM)
                 .where(
                     SchedulerStateORM.scheduler_key == self._KEY,
-                    SchedulerStateORM.enabled.is_(True),
+                    or_(SchedulerStateORM.enabled.is_(True), for_maintenance),
                     or_(
                         SchedulerStateORM.lease_expires_at.is_(None),
                         SchedulerStateORM.lease_expires_at < now,
@@ -302,7 +302,7 @@ class SchedulerRepository:
     def heartbeat(self, instance_id: str) -> None:
         with SessionLocal() as session:
             row = self._get_or_create_row(session)
-            if row.lease_owner == instance_id and row.enabled:
+            if row.lease_owner == instance_id:
                 row.lease_expires_at = self._utc_now() + timedelta(
                     seconds=self.settings.scheduler_lease_seconds
                 )

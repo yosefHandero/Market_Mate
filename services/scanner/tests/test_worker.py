@@ -178,7 +178,7 @@ class WorkerInstanceGuardTests(unittest.TestCase):
             self.skipTest("PowerShell is not available")
 
         repo_root = Path(__file__).resolve().parents[3]
-        launcher = repo_root / "scripts" / "windows" / "Start-ScannerWorker.ps1"
+        launcher = repo_root / "scripts" / "windows" / "Start-MarketMate.ps1"
         env = os.environ.copy()
         env["MARKET_MATE_LAUNCHER_UNDER_TEST"] = str(launcher)
         command = (
@@ -214,15 +214,11 @@ class WorkerInstanceGuardTests(unittest.TestCase):
             with self.subTest(script=script):
                 self.assertIn("python -m app.worker", script.read_text(encoding="utf-8"))
 
-        windows_launcher = (
-            repo_root / "scripts" / "windows" / "Start-ScannerWorker.ps1"
+        manual_supervisor = (
+            repo_root / "scripts" / "windows" / "manual_app.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("'-m', 'app.worker'", windows_launcher)
+        self.assertIn('[sys.executable, "-m", "app.worker"]', manual_supervisor)
 
-        wake_window = (
-            repo_root / "scripts" / "windows" / "Invoke-WakeWindow.ps1"
-        ).read_text(encoding="utf-8")
-        self.assertIn("Start-ScannerWorker.ps1", wake_window)
 
 
 if __name__ == "__main__":

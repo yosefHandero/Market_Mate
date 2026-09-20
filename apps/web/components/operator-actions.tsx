@@ -32,9 +32,7 @@ interface OperatorActionsProps {
 
 const READYZ_POLL_ATTEMPTS = 5;
 const READYZ_POLL_INTERVAL_MS = 1000;
-export const WORKER_COMMAND = 'python -m app.worker';
-export const WORKER_CWD_HINT = 'services/scanner/';
-export const WORKER_SCRIPT_BASH = 'scripts/start-worker.sh';
+export const APP_START_COMMAND = 'powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\windows\\Start-MarketMate.ps1';
 export const WORKER_NOT_RUNNING_MESSAGE =
   'Scheduler is on, but the local worker is not running. Auto-scans will not run until the worker starts.';
 const WORKER_IMPACT_MESSAGE =
@@ -200,12 +198,13 @@ export function OperatorActionsPanel({
       }
       const run = (await res.json()) as { scan_count?: number };
       showFeedback(`Scan completed: ${run.scan_count ?? 0} results`, 'positive');
+      onRefresh();
     } catch {
       showFeedback('Network error triggering scan', 'negative');
     } finally {
       setScanBusy(false);
     }
-  }, [showFeedback]);
+  }, [onRefresh, showFeedback]);
 
   const fetchReadyzSnapshot = useCallback(async (): Promise<SchedulerSnapshot | null> => {
     const readyzUrl = getReadyzUrl();
@@ -316,14 +315,11 @@ export function OperatorActionsPanel({
     }
   };
 
-  const copyWorkerCommand = () =>
+  const copyAppStartCommand = () =>
     void copyToClipboard(
-      `cd ${WORKER_CWD_HINT} && ${WORKER_COMMAND}`,
-      'Worker command copied (run from repo root: cd services/scanner).',
+      APP_START_COMMAND,
+      'App startup command copied. Run it from the repository root.',
     );
-
-  const copyWorkerScript = () =>
-    void copyToClipboard(WORKER_SCRIPT_BASH, 'Start-worker script path copied.');
 
   return (
     <section className="scheduler-operator-panel" aria-label="Local operator controls">
@@ -408,25 +404,16 @@ export function OperatorActionsPanel({
               {WORKER_IMPACT_MESSAGE}
             </p>
             <p className="muted small" style={{ margin: '6px 0 0' }}>
-              Run from <code>{WORKER_CWD_HINT}</code> or use <code>{WORKER_SCRIPT_BASH}</code> from the
-              repo root.
+              Start the app services from the repository root with <code>{APP_START_COMMAND}</code>.
             </p>
             <div className="scheduler-operator-actions" style={{ marginTop: 8 }} role="group">
               <button
                 type="button"
                 className="button button-secondary"
                 style={{ width: 'auto', padding: '6px 12px' }}
-                onClick={copyWorkerCommand}
+                onClick={copyAppStartCommand}
               >
-                Copy worker command
-              </button>
-              <button
-                type="button"
-                className="button button-secondary"
-                style={{ width: 'auto', padding: '6px 12px' }}
-                onClick={copyWorkerScript}
-              >
-                Copy start-worker script
+                Copy app startup command
               </button>
             </div>
           </>

@@ -1,6 +1,6 @@
 import unittest
 
-from app.services.weekly_prediction_service import compute_upside_probability
+from app.brain.probability import compute_upside_probability
 
 
 class UpsideProbabilityTests(unittest.TestCase):

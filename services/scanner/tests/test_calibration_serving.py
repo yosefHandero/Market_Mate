@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.core.calibration import (
+from app.brain.calibration import (
     ReliabilityBin,
     apply_reliability_map,
     build_reliability_map,

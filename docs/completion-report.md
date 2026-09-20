@@ -1,12 +1,21 @@
 # Market Mate — Application Completion Report
 
-**Date:** 2026-07-30  
+**Historical verification date:** 2026-07-30
+**Operating model updated:** 2026-09-19; see the latest root `report.txt` for freshly verified results.
 **Scope:** Phases 2–5 of the completion plan  
 **Host posture:** Local personal use, paper-only dry-run
 
 ## Verdict
 
-**Application completion** is achieved when the checklist below is green (or waived with reason) and an active evidence campaign is collecting live-forward data on the Windows wake schedule.
+**Application completion** means the manual app works within provider limits. Historical verification results below are retained as history, not freshly rerun claims. The current completion checklist is:
+
+1. One command starts API, UI, and one worker; stop removes owned processes.
+2. Stock/crypto scans report actual coverage and provider failures honestly.
+3. Production and shadow persistence retain their pinned identities and paper-only guarantees.
+4. Due outcomes process valid available data; unresolved backlog is reported without fabrication.
+5. A bounded manual session and isolated regressions verify the workflow; current results are recorded in root `report.txt`.
+
+Windows wake schedules, promotion, profitability, and future evidence accumulation are not software-completion requirements.
 
 **Real-money pilot confidence is not claimed here.** It depends on untouched live-forward evidence accumulated afterward under one frozen campaign.
 
@@ -36,7 +45,7 @@
 | 11 | Controlled real-provider scan | Operator drill | One `POST /scan/run` during market hours; verify provenance on snapshots |
 | 12 | Provider fallback | Covered in code | Alpaca → Polygon stock fallback records `provider_source` |
 | 13 | Scheduler / worker recovery | PASS | Lease, stale-run recovery, PID guard tests in suite |
-| 14 | Sleep / wake | Operator drill | Observe one `Invoke-WakeWindow.ps1` cycle; window ledger + catch-up |
+| 14 | Manual lifecycle | Current operator drill | One `Start-MarketMate.ps1` session, due-outcome processing, then Ctrl+C or `Stop-MarketMate.ps1` |
 | 15 | Paper ledger / reconcile | PASS | Covered in backend suite |
 | 16 | Security / secrets | Reviewed | Tokens via env only; no `NEXT_PUBLIC_*` secrets; CORS allowlist |
 | 17 | Dead-code / deps | PASS | `diff.txt` removed + gitignored; unused live settings removed |
@@ -64,13 +73,13 @@ All of the following must come from **one frozen** live-forward campaign:
 - Calibration gap ≤ 10 points in used bins (**S**)
 - Both campaign halves after-friction positive; live-forward hit rate inside WF holdout CI (**S**)
 - Tail / drawdown / concentration / capital limits written in advance (**P**)
-- ≥95% expected windows executed; <2% unresolved expiry; strategy fingerprint frozen (**S** / **P**)
-- Immediate return to paper on integrity, missed-window, calibration, or budget failures (**P**)
+- Data collection coverage reviewed for the intended evidence period; <2% unresolved expiry; strategy fingerprint frozen (**S** / **P**)
+- Immediate return to paper on integrity, stale-data, calibration, or budget failures (**P**)
 
 **S** = statistically motivated · **P** = personal risk decision
 
 ## Definition of done (application)
 
-1. Checklist items above are pass or waived with reason.  
-2. Active evidence campaign is collecting on the wake schedule.  
-3. Proof page shows live-forward progress and states completion ≠ readiness.
+1. The current five-item manual completion checklist is verified, with provider limitations and remaining blockers stated.
+2. Existing hybrid production, weekly shadow, pinned identities, and historical evidence are preserved.
+3. Proof page shows live-forward progress and states completion ≠ readiness; further evidence collection and predictive-edge validation remain future work.

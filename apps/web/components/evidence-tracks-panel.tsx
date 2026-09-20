@@ -3,7 +3,9 @@ import type { EvidenceTrackDescriptor, WeeklyEvidenceProgress } from '@/lib/type
 /** Map legacy sample_source progress keys onto the shared evidence-contract labels. */
 const PROGRESS_LABELS: Record<string, { label: string; trackKey: string }> = {
   live_paper_forward: { label: 'Live-forward', trackKey: 'live_forward' },
-  out_of_sample: { label: 'Live-forward (out-of-sample holdout)', trackKey: 'live_forward' },
+  // Held-out live-forward tickers (stored as "out_of_sample" on legacy rows,
+  // "live_holdout" on newer rows; the API sums the whole family here).
+  out_of_sample: { label: 'Live-forward (live holdout)', trackKey: 'live_forward' },
   historical: { label: 'Walk-forward research', trackKey: 'walk_forward_research' },
   backfilled_replay: { label: 'Historical replay', trackKey: 'historical_replay' },
 };

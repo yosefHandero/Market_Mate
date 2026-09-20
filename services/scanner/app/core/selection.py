@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.config import Settings
-from app.core.ranking import buy_candidate_rank_score, display_sort_key, row_is_buy_candidate
+from app.brain.gates import buy_candidate_rank_score, row_is_buy_candidate
+from app.core.ranking import display_sort_key
 from app.core.readiness import compute_trade_readiness
 from app.schemas import ScanResult
 

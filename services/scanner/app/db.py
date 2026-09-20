@@ -196,6 +196,28 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "evaluated_at_1d": "DATETIME",
         "status_1d": "VARCHAR(16) DEFAULT 'pending'",
     },
+    "prediction_snapshots": {
+        "learned_artifacts_fingerprint": "VARCHAR(64)",
+    },
+    "evidence_campaigns": {
+        "effective_policy_id": "VARCHAR(64)",
+        "effective_policy_version": "VARCHAR(32)",
+        "effective_decision_fingerprint": "VARCHAR(64)",
+        "learned_artifacts_fingerprint": "VARCHAR(64)",
+        "learned_artifacts_json": "TEXT",
+    },
+    "walk_forward_runs": {
+        "policy_id": "VARCHAR(64)",
+        "policy_version": "VARCHAR(32)",
+        "decision_fingerprint": "VARCHAR(64)",
+        "learned_artifacts_fingerprint": "VARCHAR(64)",
+        "learned_artifacts_json": "TEXT",
+    },
+    "walk_forward_predictions": {
+        "policy_version": "VARCHAR(32)",
+        "decision_fingerprint": "VARCHAR(64)",
+        "learned_artifacts_fingerprint": "VARCHAR(64)",
+    },
     "journal_entries": {
         "signal_label": "VARCHAR(16)",
         "score": "FLOAT",

@@ -6,7 +6,6 @@ from uuid import uuid4
 
 from app.clients.alpaca import AlpacaClient
 from app.config import get_settings
-from app.core.legacy_signals import compute_legacy_signal
 from app.core.scoring import market_status_from_change
 from app.core.signals import compute_signal_and_explanation
 from app.core.strategy_contract import (
@@ -24,11 +23,10 @@ from app.schemas import (
     ReplayResponse,
     ReplaySignalRow,
     ReplaySummary,
-    VariantComparison,
 )
-from app.core.weekly_backtest import walk_forward_pattern_samples
-from app.core.weekly_patterns import detect_weekly_pattern, project_weekly_range
-from app.core.weekly_bar_utils import bars_as_of, close_price, sorted_bars
+from app.brain.weekly_backtest import walk_forward_pattern_samples
+from app.brain.weekly_patterns import detect_weekly_pattern, project_weekly_range
+from app.brain.weekly_bar_utils import bars_as_of, close_price, sorted_bars
 from app.services.daily_bar_service import DailyBarService
 from app.services.repository import ScanRepository
 from app.services.scanner import ScannerService
@@ -189,7 +187,6 @@ class ReplayService:
             strategy_id=STRATEGY_ID,
             strategy_version=STRATEGY_VERSION,
             strategy_variant=strategy_variant,
-            compare_strategy_variant=request.compare_strategy_variant,
             start=request.start,
             end=request.end,
             interval_minutes=request.interval_minutes,
@@ -220,7 +217,6 @@ class ReplayService:
         if request.replay_mode == "weekly":
             return await self._replay_weekly(request)
         strategy_variant = request.strategy_variant or self.settings.scanner_strategy_variant or "layered-v4"
-        compare_strategy_variant = request.compare_strategy_variant
         symbols = request.symbols
         stock_symbols = [symbol for symbol in symbols if self._asset_type_for_symbol(symbol) == "stock"]
         crypto_symbols = [symbol for symbol in symbols if self._asset_type_for_symbol(symbol) == "crypto"]
@@ -377,52 +373,6 @@ class ReplayService:
                     provider_status=provider_status,
                     provider_warnings=[],
                 )
-                comparison = None
-                if compare_strategy_variant == "legacy":
-                    legacy_signal = compute_legacy_signal(
-                        price_change_pct=price_change_pct,
-                        relative_volume=relative_volume,
-                        breakout_flag=breakout_flag,
-                        breakdown_flag=breakdown_flag,
-                        above_vwap=above_vwap,
-                        close_to_high_pct=close_to_high_pct,
-                        close_to_low_pct=close_to_low_pct,
-                        sentiment_score=0.0,
-                        catalyst_score=0.0,
-                        market_status=market_status,
-                        relative_strength_pct=relative_strength_pct,
-                        options_snapshot=OptionsFlowSnapshot(summary="Replay uses core market data only."),
-                        volatility_regime=volatility_regime,
-                        data_quality=data_quality,
-                        context_bias=context_bias,
-                    )
-                    legacy_confidence = legacy_signal.score
-                    if legacy_signal.decision_signal in {"BUY", "SELL"}:
-                        legacy_confidence, _, _ = self.repo.calibrate_signal(
-                            asset_type=asset_type,
-                            signal=legacy_signal.decision_signal,
-                            raw_score=legacy_signal.score,
-                            horizon=PRIMARY_HOLDING_HORIZON,
-                            observed_at=observed_at,
-                        )
-                    comparison = VariantComparison(
-                        primary_variant=strategy_variant,
-                        comparison_variant=compare_strategy_variant,
-                        comparison_signal=legacy_signal.decision_signal,
-                        comparison_raw_score=legacy_signal.score,
-                        comparison_calibrated_confidence=legacy_confidence,
-                        comparison_provider_status=provider_status,
-                        comparison_evidence_quality=strategy_metadata.evidence_quality,
-                        comparison_execution_eligibility=strategy_metadata.execution_eligibility,
-                        changed=(
-                            legacy_signal.decision_signal != signal.decision_signal
-                            or round(legacy_signal.score, 2) != round(signal.score, 2)
-                        ),
-                        summary=(
-                            f"Legacy replay comparison {legacy_signal.decision_signal} {legacy_signal.score:.2f} "
-                            f"vs layered {signal.decision_signal} {signal.score:.2f}."
-                        ),
-                    )
                 future_price = self._future_price(rows, observed_at=observed_at, horizon=PRIMARY_HOLDING_HORIZON)
                 raw_return = None
                 adjusted_return = None
@@ -451,7 +401,6 @@ class ReplayService:
                         strategy_version=STRATEGY_VERSION,
                         market_status=market_status,
                         provider_status=provider_status,
-                        comparison=comparison,
                         entry_price=round(price, 4),
                         future_price=round(future_price, 4) if future_price is not None else None,
                         raw_return_pct=raw_return,
@@ -476,7 +425,6 @@ class ReplayService:
             strategy_id=STRATEGY_ID,
             strategy_version=STRATEGY_VERSION,
             strategy_variant=strategy_variant,
-            compare_strategy_variant=compare_strategy_variant,
             start=request.start,
             end=request.end,
             interval_minutes=request.interval_minutes,

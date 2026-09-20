@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.core.scoring import build_explanation, compute_directional_scores
-from app.core.strategy_contract import STRATEGY_VERSION
+from app.core.scoring import SCORING_VERSION, build_explanation, compute_directional_scores
 from app.schemas import DecisionSignal, MarketStatus, OptionsFlowSnapshot
 
 
@@ -17,7 +16,10 @@ class SignalComputation:
     explanation: str
     directional_reasons: tuple[str, ...] = ()
     directional_contributions: dict[str, float] | None = None
-    scoring_version: str = STRATEGY_VERSION
+    # Rows stamp the actual scoring-engine version (version unification: the
+    # strategy contract's STRATEGY_VERSION describes the overall strategy
+    # identity, while this records which scoring code produced the row).
+    scoring_version: str = SCORING_VERSION
 
 
 def compute_signal_and_explanation(

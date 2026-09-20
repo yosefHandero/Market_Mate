@@ -1,7 +1,7 @@
 import unittest
 
 from app.core.decision_presentation import build_exit_window
-from app.core.structural_prediction import build_structural_prediction
+from app.brain.structural_prediction import build_structural_prediction
 from app.schemas import WeeklyPatternPrediction
 
 

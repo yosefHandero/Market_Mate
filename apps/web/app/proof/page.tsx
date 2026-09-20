@@ -4,6 +4,7 @@ import { ExecutionAuditList } from '@/components/execution-audit-list';
 import { ExitWindowAccuracyPanel } from '@/components/exit-window-accuracy-panel';
 import { LiveForwardProgressPanel } from '@/components/live-forward-progress-panel';
 import { OperatorActions } from '@/components/operator-actions';
+import { PolicyPromotionPanel } from '@/components/policy-promotion-panel';
 import { PredictionAccuracyPanel } from '@/components/prediction-accuracy-panel';
 import { ProofLedgerSection } from '@/components/proof-ledger-section';
 import { ProofSummaryPanel } from '@/components/proof-summary-panel';
@@ -95,6 +96,8 @@ export default async function ProofPage() {
         evidence={proofSummaryResult.data?.weekly_evidence}
         contract={proofSummaryResult.data?.evidence_contract}
       />
+
+      <PolicyPromotionPanel report={proofSummaryResult.data?.policy_promotion} />
 
       <RiskControlStatus
         health={healthResult.data}

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from app.core.decision_presentation import build_decision_enrichment, build_top_reasons, evidence_grade_label
-from app.core.structural_prediction import build_structural_prediction, evaluate_prediction_accuracy
+from app.brain.structural_prediction import build_structural_prediction, evaluate_prediction_accuracy
 
 
 class StructuralPredictionTests(unittest.TestCase):

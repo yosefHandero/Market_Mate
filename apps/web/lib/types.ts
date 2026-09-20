@@ -129,6 +129,7 @@ export interface ScanResult {
   price_source?: 'alpaca' | 'coinbase_ws' | 'polygon' | 'stale_cache';
   fallback_used?: boolean;
   bar_age_minutes: number | null;
+  bar_as_of?: string | null;
   freshness_flags: Record<string, string>;
   readiness_score?: number;
   readiness_band?: 'high' | 'watch' | 'low' | 'none';
@@ -136,6 +137,7 @@ export interface ScanResult {
   readiness_reason?: string | null;
   selection_rank?: number | null;
   is_top_pick?: boolean;
+  decision_role?: string | null;
   created_at: string;
 }
 
@@ -145,6 +147,8 @@ export interface ScanRun {
   market_status: MarketStatus;
   scan_count: number;
   watchlist_size: number;
+  scan_age_minutes?: number | null;
+  scan_fresh?: boolean | null;
   alerts_sent: number;
   fear_greed_value: number | null;
   fear_greed_label: string | null;
@@ -189,6 +193,7 @@ export interface DecisionRow {
   confidence_score?: number | null;
   evidence_provenance?: WeeklyEvidenceBasis | null;
   is_buy_candidate?: boolean | null;
+  decision_role?: string | null;
   strategy_version: string | null;
   short_metric_summary: string;
   last_updated: string;
@@ -547,6 +552,15 @@ export interface PredictionAccuracyMetrics {
   below_range_count: number;
   above_range_count: number;
   missed_count: number;
+  // Honesty headlines: direction hit rate and Brier score (lower is better,
+  // 0.25 = coin flip), plus the rate of predictions that never resolved.
+  direction_evaluated_count?: number;
+  direction_hit_rate_pct?: number | null;
+  brier_score?: number | null;
+  missing_rate_pct?: number | null;
+  // Which prediction campaign these numbers cover.
+  campaign_id?: string | null;
+  scope?: string;
   note: string | null;
 }
 
@@ -593,6 +607,8 @@ export interface ConfidenceCalibrationBucket {
 export interface ConfidenceCalibration {
   buckets: ConfidenceCalibrationBucket[];
   mean_abs_reliability_gap_pct: number | null;
+  campaign_id?: string | null;
+  scope?: string;
   note: string | null;
 }
 
@@ -629,6 +645,9 @@ export interface WalkForwardAssetMetrics {
   resolved_count: number;
   pending_count: number;
   upside_hit_rate_pct: number | null;
+  upside_hit_rate_after_friction_pct?: number | null;
+  brier_score?: number | null;
+  missing_resolution_rate_pct?: number | null;
   avg_return_pct: number | null;
   avg_return_after_friction_pct: number | null;
   avg_return_after_friction_stressed_pct: number | null;
@@ -696,6 +715,9 @@ export interface WalkForwardPilotVerdict {
   summary: string;
   checks: GateCheck[];
   by_asset?: WalkForwardAssetVerdict[];
+  // Multiple-testing transparency: distinct configs already run vs this window.
+  trials?: Record<string, unknown> | null;
+  caveats?: string[];
 }
 
 export interface WalkForwardRunSummary {
@@ -721,6 +743,13 @@ export interface WalkForwardRunSummary {
   config_fingerprint?: string | null;
   code_commit?: string | null;
   engine_version?: string | null;
+  policy_id?: string | null;
+  policy_version?: string | null;
+  decision_fingerprint?: string | null;
+  learned_artifacts_fingerprint?: string | null;
+  // Ruler identity: how this evidence was judged (never rotates campaigns).
+  ruler_version?: string | null;
+  ruler_fingerprint?: string | null;
   universe?: string[];
   universe_source?: string | null;
   data_quality_ok?: boolean | null;
@@ -755,10 +784,36 @@ export interface LiveForwardProgress {
   by_asset: LiveForwardAssetProgress[];
   last_scan_at?: string | null;
   last_scan_age_minutes?: number | null;
-  scan_gap_exceeded: boolean;
-  max_expected_scan_gap_minutes?: number | null;
-  missed_windows_14d?: number;
   note?: string | null;
+}
+
+export interface PolicyPromotionCheck {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface PolicyPromotionReport {
+  champion_policy_id: string;
+  challenger_policy_id: string;
+  challenger_replayable: boolean;
+  ruler_version: string;
+  ruler_fingerprint: string | null;
+  champion_decision_fingerprint?: string | null;
+  challenger_decision_fingerprint?: string | null;
+  gates_cleared: boolean;
+  walk_forward_holdout_passed: boolean;
+  summary: string;
+  checks: PolicyPromotionCheck[];
+  paired_returns_total: number;
+  paired_returns_informative: number;
+  paired_returns_both_abstained: number;
+  paired_returns_resolution_clusters: number;
+  paired_returns_cluster_metadata_complete: boolean;
+  paired_returns_superior: boolean;
+  pair_exclusion_counts: Record<string, number>;
+  effective_champion_policy_id: string;
+  requested_champion_policy_id: string;
 }
 
 export interface ProofSummary {
@@ -776,6 +831,9 @@ export interface ProofSummary {
   scan_fresh: boolean | null;
   mark_prices_source: string;
   note: string | null;
+  ruler_version?: string | null;
+  ruler_fingerprint?: string | null;
+  policy_promotion?: PolicyPromotionReport | null;
 }
 
 export interface ReconciliationIssue {

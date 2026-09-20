@@ -46,7 +46,7 @@ export function RiskControlStatus({
   const liveTradingDisabled = automation?.dry_run_only !== false;
   const killSwitchOn = automation?.kill_switch_enabled === true;
   const breakerOpen = automation?.breaker?.state === 'open';
-  const scanFresh = health?.scan_fresh !== false;
+  const scanFresh = health?.scan_fresh;
   const providerWorst = systemReadiness?.provider?.worst_status ?? 'unknown';
   const providerCritical = (systemReadiness?.provider?.critical_count ?? 0) > 0;
 
@@ -77,13 +77,14 @@ export function RiskControlStatus({
         />
         <StatusPill
           label="Scan fresh"
-          value={scanFresh ? 'yes' : 'stale'}
-          tone={scanFresh ? 'ok' : 'warning'}
+          value={scanFresh == null ? 'unknown' : scanFresh ? 'yes' : 'stale'}
+          tone={scanFresh == null ? 'muted' : scanFresh ? 'ok' : 'warning'}
         />
         <StatusPill
           label="Provider"
-          value={providerWorst}
-          tone={providerCritical ? 'bad' : 'ok'}
+          value={scanFresh === false ? `${providerWorst} (last scan)` : providerWorst}
+          tone={providerCritical ? 'bad' : providerWorst === 'degraded' ? 'warning' : providerWorst === 'unknown' || scanFresh !== true ? 'muted' : 'ok'}
+          title="Provider status observed during the last scan."
         />
         {marketStatus ? (
           <MarketStatusBadge status={marketStatus} />

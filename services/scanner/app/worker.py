@@ -4,6 +4,7 @@ import asyncio
 from contextlib import suppress
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 from typing import Callable
@@ -274,6 +275,14 @@ async def _worker_heartbeat_loop() -> None:
 
 async def main() -> None:
     configure_logging()
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    previous_break_handler = None
+    if hasattr(signal, "SIGBREAK") and main_task is not None:
+        previous_break_handler = signal.signal(
+            signal.SIGBREAK,
+            lambda *_args: loop.call_soon_threadsafe(main_task.cancel),
+        )
     market_data_task = None
     heartbeat_task = asyncio.create_task(
         _worker_heartbeat_loop(),
@@ -287,6 +296,8 @@ async def main() -> None:
     try:
         await scheduler_service.run_forever()
     finally:
+        if previous_break_handler is not None:
+            signal.signal(signal.SIGBREAK, previous_break_handler)
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
@@ -304,6 +315,9 @@ def run() -> int:
     except WorkerInstanceGuardError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl+C / supervisor Ctrl+Break unwind the scheduler lease and PID guard.
+        return 0
     return 0
 
 

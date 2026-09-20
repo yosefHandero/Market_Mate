@@ -45,7 +45,6 @@ class Settings(BaseSettings):
     admin_api_token: str = ""
     startup_check_timeout_seconds: int = 5
     health_max_stale_minutes: int = 30
-    signal_max_age_minutes: int = 120
     stale_signal_max_age_minutes: int = 10
     signal_buy_threshold: float = 52.0
     signal_sell_threshold: float = 52.0
@@ -93,7 +92,6 @@ class Settings(BaseSettings):
     paper_loop_max_requests_per_symbol_window: int = 1
     paper_loop_symbol_window_seconds: int = 21600
     paper_loop_symbol_cooldown_minutes: int = 360
-    paper_loop_signal_stale_after_minutes: int = 10
     paper_loop_same_side_repeat_requires_delta: bool = True
     paper_loop_opposite_side_requires_unwound: bool = True
     paper_loop_min_confidence_delta: float = 5.0
@@ -162,10 +160,6 @@ class Settings(BaseSettings):
     weekly_out_of_sample_holdout_ratio: float = 0.25
     weekly_forward_days: int = 7
     weekly_forward_tolerance_days: int = 3
-    # Live-forward scan-gap diagnostic: if the last scan is older than this, the
-    # Proof page flags a possibly-missed scheduler window. Default 26h covers the
-    # daily overnight window plus generous slack for weekend/downtime.
-    live_forward_max_scan_gap_minutes: float = 1560.0
     weekly_hold_return_tolerance_pct: float = 1.0
     top_pick_limit: int = 5
     upside_prob_shrinkage_k: float = 20.0
@@ -178,7 +172,6 @@ class Settings(BaseSettings):
     weekly_apply_proof_candidate_filters: bool = True
     weekly_daily_bar_max_age_days_stock: int = 5
     weekly_daily_bar_max_age_days_crypto: int = 2
-    wf_train_days: int = 30
     wf_holdout_days: int = 7
     # Historical walk-forward proof engine (daily-bar weekly-pattern layer).
     proof_target_years: int = 3
@@ -191,9 +184,14 @@ class Settings(BaseSettings):
     proof_validation_months: int = 3
     proof_lookback_context_months_min: int = 6
     proof_lookback_context_months_max: int = 24
-    proof_pattern_min_days: int = 20
-    proof_pattern_max_days: int = 60
+    # Decision-side nested sampling step: how densely each policy's own
+    # hit-rate construction samples history. Part of decision identity.
     proof_step_days: int = 7
+    # Ruler-side walk-forward evaluation schedule: the step between replay
+    # dates the proof engine stands at. Must clear the full forward window
+    # (forward + tolerance) so consecutive evaluated predictions never share
+    # forward horizons (overlap inflates sample counts, understates drawdown).
+    proof_eval_step_days: int = 10
     proof_top_n_per_asset: int = 5
     proof_min_pattern_samples: int = 12
     # Persistent historical bar store fetch cap, kept separate from the live-scan
@@ -232,7 +230,14 @@ class Settings(BaseSettings):
     proof_volume_lookback_days: int = 20
     proof_min_volume_median_ratio: float = 0.5
     proof_require_buy_hold_baseline: bool = True
-    trade_gate_allowed_signals: str = "BUY,SELL"
+    # BUY-only decision product: SELL is a detector classification, never an
+    # actionable/executable decision. Do not re-add SELL here.
+    trade_gate_allowed_signals: str = "BUY"
+    # Champion policy id. ``hybrid_legacy`` is always allowed. Any other id is
+    # applied only when the promotion report clears its gates.
+    brain_champion_policy_id: str = "hybrid_legacy"
+    brain_promotion_min_pairs: int = 40
+    brain_min_wilson_lb_pct: float = 50.0
     trade_gate_max_notional: float = 1000.0
     trade_gate_max_qty: float = 5.0
     portfolio_risk_enabled: bool = True
@@ -265,8 +270,6 @@ class Settings(BaseSettings):
     alt_fng_api_url: str = "https://api.alternative.me/fng/?limit=1&format=json"
     sec_user_agent: str = "MarketMateScanner your-email@example.com"
     scanner_strategy_variant: str = "layered-v4"
-    scanner_shadow_enabled: bool = False
-    scanner_shadow_variant: str = "legacy"
     binance_enabled: bool = False
     deribit_enabled: bool = False
     sec_enhanced_enabled: bool = False
@@ -331,6 +334,17 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PROOF_STEP_DAYS must be >= WEEKLY_FORWARD_DAYS so walk-forward "
                 "prediction horizons do not overlap."
+            )
+        # The ruler's replay-date schedule must clear the entire resolution
+        # window (forward days + resolution tolerance): a bar used to resolve
+        # one prediction must not fall inside the next prediction's horizon.
+        if int(self.proof_eval_step_days) < int(self.weekly_forward_days) + int(
+            self.weekly_forward_tolerance_days
+        ):
+            raise ValueError(
+                "PROOF_EVAL_STEP_DAYS must be >= WEEKLY_FORWARD_DAYS + "
+                "WEEKLY_FORWARD_TOLERANCE_DAYS so evaluated walk-forward "
+                "predictions are truly non-overlapping."
             )
         return self
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.core.structural_prediction import build_structural_prediction
+from app.brain.structural_prediction import build_structural_prediction
 from app.schemas import (
     DecisionSignal,
     EvidenceQuality,

@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.clients.alpaca import AlpacaClient
 from app.clients.polygon import PolygonClient
 from app.config import Settings, get_settings
-from app.core.weekly_bar_utils import parse_bar_timestamp, sorted_bars
+from app.brain.weekly_bar_utils import parse_bar_timestamp, sorted_bars
 from app.db import SessionLocal
 from app.models.scan import DailyBarHistoryORM
 
@@ -416,6 +416,48 @@ class HistoricalBarStore:
         return await self.ensure_history(
             normalized, asset_type=resolved, years=years, force_refresh=True
         )
+
+    async def ensure_recent_tail(
+        self,
+        symbol: str,
+        *,
+        asset_type: str | None = None,
+        overlap_days: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Incrementally extend a symbol's stored history through now.
+
+        Fetches only the window from shortly before the last stored bar (the
+        overlap catches late provider revisions) to the present and persists it
+        into the point-in-time store. Falls back to a full ``ensure_history``
+        when the symbol has no stored bars yet. Serves whatever the store holds
+        when providers fail: stale data with honest staleness flags beats an
+        empty universe.
+        """
+        normalized = symbol.upper()
+        resolved = self.resolve_asset_type(normalized, asset_type)
+        existing = self.coverage(normalized, asset_type=resolved)
+        if existing.bar_count == 0 or existing.last_date is None:
+            await self.ensure_history(normalized, asset_type=resolved)
+            return self.load_bars(normalized, asset_type=resolved)
+
+        end = datetime.now(timezone.utc)
+        last = datetime.fromisoformat(existing.last_date).replace(tzinfo=timezone.utc)
+        start = last - timedelta(days=max(int(overlap_days), 1))
+        if start >= end:
+            return self.load_bars(normalized, asset_type=resolved)
+        try:
+            bars, source = await self._fetch_provider_bars(
+                normalized, asset_type=resolved, start=start, end=end
+            )
+        except Exception:
+            logger.warning(
+                "historical_bar_tail_fetch_failed",
+                extra={"symbol": normalized, "asset_type": resolved},
+                exc_info=True,
+            )
+            return self.load_bars(normalized, asset_type=resolved)
+        self._persist_bars(normalized, resolved, bars, source=source)
+        return self.load_bars(normalized, asset_type=resolved)
 
     async def ensure_history(
         self,

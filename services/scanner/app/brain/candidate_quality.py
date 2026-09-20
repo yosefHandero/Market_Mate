@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from app.core.weekly_backtest import PatternBacktestStats
-from app.core.weekly_bar_utils import (
+from app.brain.weekly_backtest import PatternBacktestStats
+from app.brain.weekly_bar_utils import (
     bars_as_of,
     close_price,
     forward_close_after,
@@ -163,11 +163,14 @@ def buy_candidate_reject_reason(
     if sma50 is not None and entry_price < sma50:
         return "below_sma50"
     relative_strength_index = rsi(closes, 14)
-    if relative_strength_index is not None and relative_strength_index >= float(settings.proof_rsi_overbought):
+    rsi_overbought = float(_setting(settings, "rsi_overbought", "proof_rsi_overbought", default=80.0))
+    if relative_strength_index is not None and relative_strength_index >= rsi_overbought:
         return "rsi_overbought"
-    if stats.sample_size < int(settings.proof_min_pattern_samples):
+    min_samples = int(_setting(settings, "min_pattern_samples", "proof_min_pattern_samples", default=12))
+    if stats.sample_size < min_samples:
         return "insufficient_pattern_samples"
-    min_hit = 50.0 + float(settings.proof_min_pattern_edge_pct)
+    min_edge = float(_setting(settings, "min_pattern_edge_pct", "proof_min_pattern_edge_pct", default=2.0))
+    min_hit = 50.0 + min_edge
     if stats.hit_rate_pct is None or stats.hit_rate_pct < min_hit:
         return "pattern_edge_below_min"
     if stats.avg_forward_return_pct is None or stats.avg_forward_return_pct <= 0:
@@ -175,13 +178,18 @@ def buy_candidate_reject_reason(
     buy_hold_avg = historical_buy_hold_avg_return(
         bars,
         as_of=as_of,
-        forward_days=int(settings.weekly_forward_days),
-        tolerance_days=int(settings.weekly_forward_tolerance_days),
+        forward_days=int(_setting(settings, "forward_days", "weekly_forward_days", default=7)),
+        tolerance_days=int(
+            _setting(settings, "forward_tolerance_days", "weekly_forward_tolerance_days", default=3)
+        ),
         warmup_bars=warmup_bars,
         step_days=step_days,
     )
+    require_baseline = bool(
+        _setting(settings, "require_buy_hold_baseline", "proof_require_buy_hold_baseline", default=True)
+    )
     if (
-        settings.proof_require_buy_hold_baseline
+        require_baseline
         and buy_hold_avg is not None
         and stats.avg_forward_return_pct is not None
         and stats.avg_forward_return_pct <= buy_hold_avg
@@ -190,8 +198,20 @@ def buy_candidate_reject_reason(
     if not volume_confirmed(
         bars,
         as_of,
-        lookback_days=int(settings.proof_volume_lookback_days),
-        min_median_ratio=float(settings.proof_min_volume_median_ratio),
+        lookback_days=int(_setting(settings, "volume_lookback_days", "proof_volume_lookback_days", default=20)),
+        min_median_ratio=float(
+            _setting(settings, "min_volume_median_ratio", "proof_min_volume_median_ratio", default=0.5)
+        ),
     ):
         return "volume_not_confirmed"
     return None
+
+
+def _setting(settings: Any, *names: str, default: Any = None) -> Any:
+    """Read a quality-gate constant from BrainConfig or host Settings names."""
+    for name in names:
+        if hasattr(settings, name):
+            value = getattr(settings, name)
+            if value is not None:
+                return value
+    return default

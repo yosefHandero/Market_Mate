@@ -1,10 +1,6 @@
 import asyncio
-import json
-import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
 
 from app.config import Settings
 from app.services.daily_bar_service import DailyBarService
@@ -24,47 +20,65 @@ def _bars_ending(*, count: int, last_day: datetime) -> list[dict]:
     ]
 
 
+class _FakeBarStore:
+    """In-memory stand-in for HistoricalBarStore (no DB, no providers)."""
+
+    def __init__(self, bars: list[dict]) -> None:
+        self.bars = bars
+        self.tail_refresh_calls = 0
+        self.load_calls = 0
+
+    def load_bars(self, symbol: str, *, asset_type: str | None = None) -> list[dict]:
+        self.load_calls += 1
+        return list(self.bars)
+
+    async def ensure_recent_tail(
+        self, symbol: str, *, asset_type: str | None = None, overlap_days: int = 5
+    ) -> list[dict]:
+        self.tail_refresh_calls += 1
+        return list(self.bars)
+
+
 class DailyBarServiceTests(unittest.TestCase):
-    def test_cache_hit_avoids_refetch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = Settings(
-                cache_dir=tmpdir,
-                weekly_daily_bar_cache_ttl_seconds=3600,
-                weekly_daily_lookback_bars_max=500,
-            )
-            service = DailyBarService(settings=settings)
-            symbol = "AAPL"
-            bars = [
-                {
-                    "t": datetime(2024, 1, 1, tzinfo=timezone.utc).isoformat(),
-                    "o": 100,
-                    "h": 101,
-                    "l": 99,
-                    "c": 100.5,
-                    "v": 10,
-                }
-            ]
-            cache_path = service._cache_path(symbol, "stock")
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(
-                json.dumps(
-                    {
-                        "symbol": symbol,
-                        "asset_type": "stock",
-                        "timeframe": "1Day",
-                        "fetched_at": datetime.now(timezone.utc).isoformat(),
-                        "bars": bars,
-                    }
-                ),
-                encoding="utf-8",
-            )
+    def test_store_backed_serving_with_ttl_memo(self) -> None:
+        settings = Settings(
+            weekly_daily_bar_cache_ttl_seconds=3600,
+            weekly_daily_lookback_bars_max=500,
+        )
+        store = _FakeBarStore(_bars_ending(count=3, last_day=datetime.now(timezone.utc)))
+        service = DailyBarService(settings=settings, bar_store=store)  # type: ignore[arg-type]
 
-            async def run() -> tuple[list[dict], str]:
-                return await service.get_daily_bars(symbol, asset_type="stock")
+        async def run() -> None:
+            first, first_source = await service.get_daily_bars("AAPL", asset_type="stock")
+            second, second_source = await service.get_daily_bars("AAPL", asset_type="stock")
+            # First call refreshes the store tail; second within TTL serves the store.
+            self.assertEqual(first_source, "store_refreshed")
+            self.assertEqual(second_source, "store")
+            self.assertEqual(store.tail_refresh_calls, 1)
+            self.assertEqual(len(first), 3)
+            self.assertEqual(len(second), 3)
+            # force_refresh bypasses the memo.
+            _, forced_source = await service.get_daily_bars(
+                "AAPL", asset_type="stock", force_refresh=True
+            )
+            self.assertEqual(forced_source, "store_refreshed")
+            self.assertEqual(store.tail_refresh_calls, 2)
 
-            loaded, source = asyncio.run(run())
-            self.assertEqual(source, "cache")
-            self.assertEqual(len(loaded), 1)
+        asyncio.run(run())
+
+    def test_trims_to_configured_lookback(self) -> None:
+        settings = Settings(
+            weekly_daily_bar_cache_ttl_seconds=3600,
+            weekly_daily_lookback_bars_max=100,
+        )
+        store = _FakeBarStore(_bars_ending(count=250, last_day=datetime.now(timezone.utc)))
+        service = DailyBarService(settings=settings, bar_store=store)  # type: ignore[arg-type]
+
+        async def run() -> None:
+            bars, _ = await service.get_daily_bars("AAPL", asset_type="stock")
+            self.assertEqual(len(bars), 100)
+
+        asyncio.run(run())
 
     def test_assess_data_quality_thresholds(self) -> None:
         settings = Settings(
@@ -128,45 +142,27 @@ class DailyBarServiceTests(unittest.TestCase):
         self.assertTrue(service.is_daily_bars_stale(bars, asset_type="crypto", as_of=now))
         self.assertEqual(service.assess_data_quality(bars, asset_type="crypto", as_of=now), "low")
 
-    def test_cache_hit_with_stale_bars_is_not_reported_fresh(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = Settings(
-                cache_dir=tmpdir,
-                weekly_daily_bar_cache_ttl_seconds=86400,
-                weekly_daily_lookback_bars_max=500,
-                weekly_daily_lookback_bars_min=1,
-                weekly_daily_lookback_bars_preferred=1,
-                weekly_daily_bar_max_age_days_stock=5,
-            )
-            service = DailyBarService(settings=settings)
-            symbol = "AAPL"
-            # Cache written now (TTL fresh) but its newest bar is two weeks old.
-            stale_last = datetime.now(timezone.utc) - timedelta(days=14)
-            bars = _bars_ending(count=3, last_day=stale_last)
-            cache_path = service._cache_path(symbol, "stock")
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(
-                json.dumps(
-                    {
-                        "symbol": symbol,
-                        "asset_type": "stock",
-                        "timeframe": "1Day",
-                        "fetched_at": datetime.now(timezone.utc).isoformat(),
-                        "bars": bars,
-                    }
-                ),
-                encoding="utf-8",
-            )
+    def test_stale_store_content_is_not_reported_fresh(self) -> None:
+        settings = Settings(
+            weekly_daily_bar_cache_ttl_seconds=86400,
+            weekly_daily_lookback_bars_max=500,
+            weekly_daily_lookback_bars_min=1,
+            weekly_daily_lookback_bars_preferred=1,
+            weekly_daily_bar_max_age_days_stock=5,
+        )
+        # Store tail refresh succeeded but the newest available bar is two
+        # weeks old (e.g. providers down, serving stored history).
+        stale_last = datetime.now(timezone.utc) - timedelta(days=14)
+        store = _FakeBarStore(_bars_ending(count=3, last_day=stale_last))
+        service = DailyBarService(settings=settings, bar_store=store)  # type: ignore[arg-type]
 
-            async def run() -> tuple[list[dict], str]:
-                return await service.get_daily_bars(symbol, asset_type="stock")
+        async def run() -> tuple[list[dict], str]:
+            return await service.get_daily_bars("AAPL", asset_type="stock")
 
-            loaded, source = asyncio.run(run())
-            # Cache still prevents a provider call (TTL fresh)...
-            self.assertEqual(source, "cache")
-            # ...but the stale content must not be reported as fresh primary data.
-            self.assertTrue(service.is_daily_bars_stale(loaded, asset_type="stock"))
-            self.assertNotEqual(service.assess_data_quality(loaded, asset_type="stock"), "ok")
+        loaded, _source = asyncio.run(run())
+        # Stale content must not be reported as fresh primary data.
+        self.assertTrue(service.is_daily_bars_stale(loaded, asset_type="stock"))
+        self.assertNotEqual(service.assess_data_quality(loaded, asset_type="stock"), "ok")
 
 
 if __name__ == "__main__":
