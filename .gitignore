@@ -56,3 +56,5 @@ services/scanner/backups/
 
 # Graphify generated knowledge graph
 graphify-out/
+# Playwright CLI output (may contain credentials)
+.playwright-cli/

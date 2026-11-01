@@ -1,81 +1,58 @@
-import { DashboardStatusBanner } from '@/components/dashboard-status-banner';
-import { DecisionServingPolicyStatus } from '@/components/decision-serving-policy-status';
 import { DecisionGrid } from '@/components/decision-grid';
+import { OperatorActions } from '@/components/operator-actions';
 import {
   getAutomationStatus,
   getLatestDecisions,
   getLatestScan,
-  getProofSummary,
   getReadyz,
-  getSystemReadiness,
 } from '@/lib/api';
+import { formatScanUpdated, isCoverageIncomplete, isScanStale } from '@/lib/decision-surface';
 
 export default async function DecisionPage() {
-  const [
-    decisionsResult,
-    automationResult,
-    healthResult,
-    systemReadinessResult,
-    latestScanResult,
-    proofSummaryResult,
-  ] = await Promise.all([
+  const [decisionsResult, automationResult, healthResult, latestScanResult] = await Promise.all([
     getLatestDecisions(50),
     getAutomationStatus(),
     getReadyz(),
-    getSystemReadiness(),
     getLatestScan(),
-    getProofSummary(),
   ]);
 
-  const errors = [
-    decisionsResult.error,
-    automationResult.error,
-    healthResult.error,
-    latestScanResult.error,
-  ].filter(Boolean) as string[];
+  const latestScan = latestScanResult.data;
+  const updatedLabel = formatScanUpdated(latestScan?.created_at);
+  const loadError = [latestScanResult.error, decisionsResult.error].filter(Boolean).join(' ');
 
   return (
     <main className="dashboard-main decision-page">
-      <section className="card system-health-card">
-        <div className="system-health-card-head">
-          <div>
-            <h1 className="system-health-title">Buy Candidates</h1>
-            <p className="muted small system-health-subtitle" style={{ margin: 0 }}>
-              Top stock and crypto buy candidates ranked by upside probability, with an
-              estimated exit window. Paper dry-run only; not financial advice.
-            </p>
-          </div>
-          <DecisionServingPolicyStatus
-            report={proofSummaryResult.data?.policy_promotion}
-            error={proofSummaryResult.error}
+      <header className="decision-toolbar">
+        <h1 className="decision-title">Buy Candidates</h1>
+        <div className="decision-toolbar-side">
+          <p className="decision-updated" data-testid="decision-updated">
+            {updatedLabel ? `Updated ${updatedLabel}` : 'Not scanned yet'}
+          </p>
+          <OperatorActions
+            mode="scan"
+            schedulerEnabled={healthResult.data?.scheduler_enabled ?? false}
+            schedulerRunning={healthResult.data?.worker_alive ?? healthResult.data?.scheduler_running ?? false}
+            nextScanDueAt={healthResult.data?.next_scan_due_at}
+            lastSchedulerRunStartedAt={healthResult.data?.last_scheduler_run_started_at}
+            lastSchedulerError={healthResult.data?.last_scheduler_error}
           />
         </div>
+      </header>
 
-        {errors.length ? (
-          <div className="system-health-errors">
-            {errors.map((error, index) => (
-              <span key={`${error}-${index}`} className="negative small">
-                {error}
-              </span>
-            ))}
-          </div>
-        ) : null}
-
-        <DashboardStatusBanner
-          health={healthResult.data}
-          automation={automationResult.data}
-          latestScan={latestScanResult.data}
-          systemReadiness={systemReadinessResult.data}
-        />
-      </section>
+      {loadError ? (
+        <p className="negative decision-load-error" role="alert" data-testid="decision-load-error">
+          {loadError}
+        </p>
+      ) : null}
 
       <DecisionGrid
-        results={latestScanResult.data?.results ?? []}
-        topStocks={latestScanResult.data?.top_stocks}
-        topCrypto={latestScanResult.data?.top_crypto}
+        results={latestScan?.results ?? []}
+        topStocks={latestScan?.top_stocks}
+        topCrypto={latestScan?.top_crypto}
         decisions={decisionsResult.data ?? []}
         automation={automationResult.data}
-        decisionsError={decisionsResult.error}
+        scanStale={isScanStale(healthResult.data, latestScan)}
+        coverageIncomplete={isCoverageIncomplete(latestScan?.coverage)}
       />
     </main>
   );

@@ -221,6 +221,9 @@ class EvidenceCampaignService:
         )
         current_commit = code_commit()
         with self._session_factory() as session:
+            from app.services.scan_lease import assert_current_scan_lease
+
+            assert_current_scan_lease(session)
             active = session.execute(
                 select(EvidenceCampaignORM)
                 .where(EvidenceCampaignORM.status == "active")
@@ -245,6 +248,12 @@ class EvidenceCampaignService:
                 active.close_reason = (
                     "config_change" if fingerprint_changed else "code_change"
                 )
+                if learned_artifacts_json is None and (
+                    learned_artifacts_fingerprint is None
+                    or learned_artifacts_fingerprint == active.learned_artifacts_fingerprint
+                ):
+                    learned_artifacts_json = active.learned_artifacts_json
+                    learned_artifacts_fingerprint = active.learned_artifacts_fingerprint
 
             campaign = EvidenceCampaignORM(
                 campaign_id=self._new_campaign_id(fingerprint, now),

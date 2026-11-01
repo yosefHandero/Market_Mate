@@ -9,6 +9,7 @@ decisions never leak into production readiness surfaces.
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -30,7 +31,7 @@ from app.models.scan import EvidenceCampaignORM, PredictionSnapshotORM
 from app.schemas import ScanResult, ScanRun, WeeklyPatternPrediction
 from app.services.brain_runtime import BrainRuntime
 from app.services.learned_inputs import LearnedInputBundle
-from app.services.repository import ScanRepository
+from app.services.repository import PredictionEvaluationUpdate, ScanRepository
 
 
 def _superior_pairs(n: int = 50) -> list[PairedOutcome]:
@@ -509,6 +510,112 @@ class ShadowPersistenceTests(unittest.TestCase):
             pairs["exclusions"].get("weekly_probability_learned_artifact_mismatch"),
             1,
         )
+
+    def test_null_hybrid_probability_stays_buy_and_is_excluded_from_brier(self) -> None:
+        _, SessionLocal = self._build_session_local()
+        created_at = datetime.now(timezone.utc)
+        run = ScanRun(
+            run_id="run-null-prob",
+            created_at=created_at,
+            market_status="bullish",
+            strategy_variant="layered-v4",
+            scan_count=1,
+            watchlist_size=1,
+            alerts_sent=0,
+            fear_greed_value=60,
+            fear_greed_label="Greed",
+            results=[_scan_result(created_at=created_at)],
+        )
+        champion = BrainDecision(
+            policy_id="hybrid_legacy",
+            policy_version="hybrid-v4.3",
+            decision_fingerprint="fp-hybrid-v43",
+            symbol="AAPL",
+            asset_type="stock",
+            as_of=created_at,
+            action="BUY",
+            p_up_calibrated=None,
+            expected_value_pct=None,
+            probability_methodology=None,
+            evidence_basis=EvidenceBasis(),
+            reasons=(),
+        )
+        repo = ScanRepository()
+        with patch.object(repository_module, "SessionLocal", SessionLocal):
+            repo.save_run(
+                run,
+                shadow_decisions=[_shadow_decision(as_of=created_at)],
+                champion_decisions=[champion],
+                champion_policy_id="hybrid_legacy",
+                champion_fingerprint="fp-hybrid-v43",
+                champion_policy_version="hybrid-v4.3",
+                learned_artifacts_fingerprint="artifact-weekly-1",
+            )
+            with SessionLocal() as session:
+                rows = session.execute(select(PredictionSnapshotORM)).scalars().all()
+            production = next(row for row in rows if row.decision_role == "production")
+            self.assertEqual(production.signal, "BUY")
+            self.assertEqual(production.status, "pending")
+            self.assertEqual(production.methodology, "unavailable")
+            metadata = json.loads(production.pattern_metadata_json)
+            self.assertIsNone(metadata["upside_probability_pct"])
+            self.assertNotIn(metadata["upside_probability_pct"], (64.0, 82.0, 0, 0.0))
+            evaluated_at = created_at + timedelta(days=7)
+            updated = repo.apply_prediction_evaluations(
+                [
+                    PredictionEvaluationUpdate(
+                        snapshot_id=row.id,
+                        status="evaluated",
+                        price=204.0,
+                        evaluated_at=evaluated_at,
+                        hold_return_pct=2.5,
+                    )
+                    for row in rows
+                    if row.status == "pending"
+                ]
+            )
+            self.assertEqual(updated, 2)
+            with SessionLocal() as session:
+                production = session.execute(
+                    select(PredictionSnapshotORM).where(
+                        PredictionSnapshotORM.decision_role == "production"
+                    )
+                ).scalar_one()
+            self.assertEqual(production.signal, "BUY")
+            self.assertEqual(production.status, "evaluated")
+            self.assertIsNone(json.loads(production.pattern_metadata_json)["upside_probability_pct"])
+            pairs = repo.list_paired_policy_outcomes(
+                champion_policy_id="hybrid_legacy",
+                champion_policy_version="hybrid-v4.3",
+                champion_decision_fingerprint="fp-hybrid-v43",
+                challenger_policy_id="weekly_probability",
+                challenger_policy_version="weekly-prob-v1",
+                challenger_decision_fingerprint="fp-weekly",
+            )
+        self.assertEqual(len(pairs["returns"]), 1)
+        self.assertIsNotNone(pairs["returns"][0].champion_return_pct)
+        self.assertNotEqual(pairs["returns"][0].champion_return_pct, 0.0)
+        self.assertEqual(pairs["brier"], [])
+        self.assertGreaterEqual(pairs["exclusions"].get("missing_probability", 0), 1)
+        report = build_promotion_report(
+            champion_policy_id="hybrid_legacy",
+            challenger_policy_id="weekly_probability",
+            challenger_replayable=True,
+            champion_decision_fingerprint="fp-hybrid-v43",
+            challenger_decision_fingerprint="fp-weekly",
+            ruler_config_payload={"promotion_min_pairs": 40},
+            walk_forward_holdout_passed=False,
+            return_pairs=pairs["returns"],
+            brier_pairs=pairs["brier"],
+            min_pairs=40,
+        )
+        calibration = next(
+            check for check in report.checks if check.name == "paired_calibration_not_worse"
+        )
+        self.assertTrue(calibration.passed)
+        self.assertIn("insufficient", calibration.detail.lower())
+        self.assertIn("excluded", calibration.detail.lower())
+        self.assertFalse(report.gates_cleared)
 
 
 if __name__ == "__main__":

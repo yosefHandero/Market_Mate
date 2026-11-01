@@ -29,6 +29,8 @@ describe('ConfidencePerformancePanel', () => {
             note: 'Higher-confidence bands are not underperforming lower bands in the resolved sample.',
           },
           calibration: {
+            scope: 'campaign',
+            campaign_id: 'camp-current',
             buckets: [
               {
                 probability_band: '70-79',
@@ -47,6 +49,7 @@ describe('ConfidencePerformancePanel', () => {
     );
     expect(screen.getByTestId('confidence-ranking-table')).toBeInTheDocument();
     expect(screen.getByTestId('confidence-calibration-table')).toBeInTheDocument();
+    expect(screen.getByText(/Ranking uses historical outcome totals/)).toHaveTextContent('Calibration covers current campaign camp-current');
     expect(screen.getByTestId('confidence-ranking-verdict')).toHaveTextContent(
       'Higher-confidence bands are not underperforming',
     );

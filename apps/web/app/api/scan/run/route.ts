@@ -18,6 +18,7 @@ export async function POST() {
       method: 'POST',
       headers: buildScannerAdminHeaders(ADMIN_TOKEN),
       cache: 'no-store',
+      signal: AbortSignal.timeout(330_000),
     });
 
     return proxyScannerResponse(response);

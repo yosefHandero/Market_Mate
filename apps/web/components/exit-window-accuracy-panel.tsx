@@ -34,6 +34,8 @@ export function ExitWindowAccuracyPanel({
       <p className="muted small" style={{ marginTop: 0 }}>
         Whether the stop-growing / exit-window prediction protected gains better than holding to
         the 1-week horizon (conservative same-bar rule).
+        {' '}This is modeled advisory stop/target research, separate from time-based paper trades;
+        no protective orders are executed. Historical totals across all campaigns.
       </p>
       {metrics.note ? (
         <p className="muted small" data-testid="exit-window-note">
@@ -70,9 +72,9 @@ export function ExitWindowAccuracyPanel({
                 <th>Asset</th>
                 <th>N</th>
                 <th>Helped%</th>
-                <th>Protected</th>
-                <th>Hold</th>
-                <th>Protected (stressed)</th>
+                <th>Modeled protected (gross)</th>
+                <th>Hold (gross)</th>
+                <th>Cost-adjusted estimate (stressed)</th>
               </tr>
             </thead>
             <tbody>

@@ -8,26 +8,13 @@ import type {
   ScanResult,
 } from '@/lib/types';
 
-function rounded(value: number) {
-  return Math.round(value * 10_000) / 10_000;
-}
-
 export function buildDryRunSetup(result: ScanResult): OrderPreviewRequest {
-  const side = 'buy';
-  const entry = Math.max(0.01, result.price);
-  const qty = Math.max(0.000001, Math.round((100 / entry) * 1_000_000) / 1_000_000);
-  const stop = entry * 0.99;
-  const target = entry * 1.02;
-
   return {
     ticker: result.ticker,
-    side,
-    qty,
+    side: 'buy',
+    requested_notional_usd: 100,
     order_type: 'market',
     mode: 'dry_run',
-    entry_price: rounded(entry),
-    stop_price: rounded(stop),
-    target_price: rounded(target),
     recommended_action_snapshot: result.recommended_action ?? null,
   };
 }
@@ -38,9 +25,11 @@ export function formatPaperSizing(setup: OrderPreviewRequest): {
   targetLabel: string;
 } {
   const entry = setup.entry_price ?? 0;
-  const notional = entry * setup.qty;
+  const notional = entry * (setup.qty ?? 0);
   return {
-    notionalLabel: `~$${notional.toFixed(2)} (${setup.qty} @ $${entry.toFixed(2)})`,
+    notionalLabel: setup.qty == null
+      ? `Up to $${(setup.requested_notional_usd ?? 100).toFixed(2)}; quantity confirmed by backend limits in preview`
+      : `~$${notional.toFixed(2)} (${setup.qty} @ $${entry.toFixed(2)})`,
     stopLabel: setup.stop_price != null ? `$${setup.stop_price.toFixed(2)}` : '--',
     targetLabel: setup.target_price != null ? `$${setup.target_price.toFixed(2)}` : '--',
   };
@@ -88,7 +77,7 @@ export function evaluatePaperActionGate({
   if (automation?.breaker?.state === 'open') reasons.push('circuit breaker is open');
   if (providerCritical) reasons.push('provider is critical');
   if (staleBars) reasons.push(`bars are stale (${Math.round(barAgeMinutes ?? 0)}m)`);
-  if (hasBadFreshnessFlags(result.freshness_flags)) reasons.push('freshness flags are blocking');
+  if (hasBadFreshnessFlags(result.freshness_flags)) reasons.push('data-quality flags are blocking');
   if (tradeReadiness.hardStop) reasons.push('hard stop is active');
   if (result.decision_signal !== 'BUY') {
     reasons.push('only BUY candidates are actionable here');

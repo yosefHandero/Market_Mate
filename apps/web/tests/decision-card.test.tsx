@@ -6,6 +6,7 @@ import userEvent from '@testing-library/user-event';
 import React from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DecisionCard } from '@/components/decision-card';
+import { ForecastContextPanel } from '@/components/forecast-context-panel';
 import type { AutomationStatusResponse, DecisionRow, ScanResult } from '@/lib/types';
 
 function sampleResult(overrides: Partial<ScanResult> = {}): ScanResult {
@@ -211,6 +212,7 @@ function orderPreviewResponse() {
       gate_result: 'allowed',
       freshness: 'fresh',
       reject_reasons: [],
+      paper_contract: paperContract,
     }),
     { status: 200, headers: { 'Content-Type': 'application/json' } },
   );
@@ -235,10 +237,18 @@ function orderPlaceResponse() {
       filled_qty: 1,
       slippage_assumption_bps: 0,
       recommended_action_snapshot: 'preview',
+      paper_contract: paperContract,
+      filled_at: '2026-04-22T18:05:00.000Z',
+      exit_due_at: '2026-04-22T19:05:00.000Z',
     }),
     { status: 200, headers: { 'Content-Type': 'application/json' } },
   );
 }
+
+const paperContract = {
+  source_run_id: 'scan-1', policy_id: 'hybrid', policy_version: 'v4', decision_fingerprint: 'decision-1',
+  holding_horizon: '1h', holding_duration_seconds: 3600, exit_method: 'time_based',
+};
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -246,7 +256,8 @@ afterEach(() => {
 });
 
 describe('DecisionCard', () => {
-  it('renders buy-candidate fields and exit window without any BUY/SELL/HOLD label', () => {
+  it('renders compact buy-candidate fields and keeps the rest behind details', async () => {
+    const user = userEvent.setup();
     render(
       <DecisionCard
         result={sampleResult()}
@@ -256,46 +267,47 @@ describe('DecisionCard', () => {
     );
 
     const card = screen.getByTestId('decision-card-AAPL');
+    const summary = card.querySelector('.candidate-summary') as HTMLElement;
     expect(card).toHaveAttribute('data-color', 'green');
-    // No BUY/SELL/HOLD signal label anywhere on the card.
     expect(within(card).queryByText(/^(BUY|SELL|HOLD)$/)).not.toBeInTheDocument();
-    // Required buy-candidate fields.
-    expect(screen.getByTestId('upside-probability')).toHaveTextContent('64%');
+    expect(within(summary).getByTestId('current-price')).toHaveTextContent('$100.00');
+    expect(within(summary).getByTestId('paper-exit-method')).toHaveTextContent('Time-based paper exit');
+    expect(within(summary).getByTestId('confidence-score')).toHaveTextContent('88/100');
+    expect(within(summary).queryByTestId('upside-probability')).not.toBeInTheDocument();
+    expect(within(summary).queryByTestId('target-stop')).not.toBeInTheDocument();
+    expect(screen.getByTestId('candidate-details')).not.toHaveAttribute('open');
+
+    await user.click(screen.getByText('Details'));
+    expect(screen.getByTestId('candidate-details')).toHaveAttribute('open');
     expect(screen.getByTestId('confidence-score')).toHaveTextContent('88');
     expect(screen.getByTestId('data-quality')).toHaveTextContent('Good');
-    expect(screen.getByTestId('current-price')).toHaveTextContent('$100.00');
     expect(screen.getByTestId('actionability-status')).toHaveTextContent(/paper preview eligible/i);
-    expect(screen.getByTestId('pattern-name')).toHaveTextContent(/breakout_20d_high/i);
     expect(screen.getByTestId('evidence-provenance')).toHaveTextContent(/historical-only/i);
-    // Exit window / stop-growing instead of a SELL label.
-    expect(screen.getByTestId('expected-growth-window')).toHaveTextContent(/week/i);
-    expect(screen.getByTestId('estimated-exit')).toHaveTextContent(/\$102\.00/);
-    expect(screen.getByTestId('projected-range')).toHaveTextContent(/\$97\.00/);
-    expect(screen.getByTestId('invalidation-level')).toHaveTextContent(/\$99\.00/);
-    expect(screen.getByTestId('risk-warning')).toBeInTheDocument();
-    expect(screen.getByTestId('blocked-reason')).toBeInTheDocument();
+    expect(screen.getByTestId('exit-window-block')).toHaveTextContent('No active stop or target orders');
+    expect(screen.getByTestId('forecast-proof-link')).toHaveAttribute('href', '/proof#forecast-AAPL');
+    expect(card).not.toHaveTextContent('64%');
+    // An eligible card states eligibility once (badge + action line); no gate echo.
+    expect(screen.queryByTestId('blocked-reason')).not.toBeInTheDocument();
+    expect(card).not.toHaveTextContent(/allowed by current safety and setup gates/i);
     expect(screen.getByRole('button', { name: /preview paper trade/i })).toBeEnabled();
   });
 
-  it('shows insufficient evidence when no upside probability is available', () => {
+  it('keeps unavailable weekly probability on Proof, separate from signal confidence', () => {
     render(
-      <DecisionCard
-        result={sampleResult({
+      <ForecastContextPanel
+        results={[sampleResult({
           upside_probability_pct: null,
           weekly_prediction: undefined,
-        })}
-        decision={sampleDecision({ upside_probability_pct: null })}
-        automation={sampleAutomation()}
+        })]}
       />,
     );
 
-    expect(screen.getByTestId('upside-probability')).toHaveTextContent(/insufficient evidence/i);
-    expect(screen.getByTestId('upside-probability').closest('.decision-card-metric')).toHaveTextContent(
-      /Upside probability\s+Insufficient evidence/i,
-    );
+    expect(screen.getByLabelText('Signal and advisory forecast context')).toHaveTextContent(/Weekly upside probability \(advisory\): Insufficient evidence/i);
+    expect(screen.getByLabelText('Signal and advisory forecast context')).toHaveTextContent('Signal confidence 88/100');
   });
 
-  it('keeps metric labels separated from values', () => {
+  it('keeps metric labels separated from values', async () => {
+    const user = userEvent.setup();
     render(
       <DecisionCard
         result={sampleResult({ price: 514.39, confidence_score: 40 })}
@@ -304,16 +316,18 @@ describe('DecisionCard', () => {
       />,
     );
 
+    expect(screen.getByTestId('current-price')).toHaveTextContent('$514.39');
+    expect(screen.getByTestId('decision-card-AAPL')).not.toHaveTextContent(/Price\$514\.39/i);
+    await user.click(screen.getByText('Details'));
     const metrics = screen
       .getByTestId('decision-card-AAPL')
-      .querySelector('.decision-card-metrics') as HTMLElement;
+      .querySelector('.candidate-summary') as HTMLElement;
     expect(metrics).toHaveTextContent(/Confidence\s+40/);
-    expect(metrics).toHaveTextContent(/Price\s+\$514\.39/);
     expect(metrics).not.toHaveTextContent(/Confidence40/i);
-    expect(metrics).not.toHaveTextContent(/Price\$514\.39/i);
   });
 
-  it('renders hard-blocked stale candidates as read-only setup details without preview action', () => {
+  it('renders hard-blocked stale candidates as blocked, with setup details behind Details', async () => {
+    const user = userEvent.setup();
     render(
       <DecisionCard
         result={sampleResult({
@@ -343,14 +357,18 @@ describe('DecisionCard', () => {
 
     const card = screen.getByTestId('decision-card-AAPL');
     expect(card).toHaveAttribute('data-color', 'gray');
-    expect(screen.getByTestId('actionability-status')).toHaveTextContent(/read-only setup/i);
+    expect(screen.getByTestId('actionability-status')).toHaveTextContent(/^Blocked$/);
+    expect(screen.getByTestId('blocked-reason')).toHaveTextContent(/provider is critical/i);
+    expect(screen.getByTestId('blocked-reason')).toHaveTextContent(/bars are stale/i);
     expect(screen.queryByRole('button', { name: /preview paper trade/i })).not.toBeInTheDocument();
+    await user.click(screen.getByText('Details'));
     expect(screen.getByTestId('setup-details')).toHaveTextContent(/view setup details/i);
     expect(screen.getByTestId('setup-details')).toHaveTextContent(/provider is critical/i);
-    expect(screen.getByTestId('setup-details')).toHaveTextContent(/bars are stale/i);
+    expect(screen.queryByRole('button', { name: /preview paper trade/i })).not.toBeInTheDocument();
   });
 
-  it('shows a live-forward-proven provenance badge when evidence is proven', () => {
+  it('shows a live-forward-proven provenance badge when evidence is proven', async () => {
+    const user = userEvent.setup();
     render(
       <DecisionCard
         result={sampleResult({ evidence_provenance: 'live_forward_proven' })}
@@ -359,6 +377,7 @@ describe('DecisionCard', () => {
       />,
     );
 
+    await user.click(screen.getByText('Details'));
     expect(screen.getByTestId('evidence-provenance')).toHaveTextContent(/live-forward evidence/i);
   });
 
@@ -378,14 +397,54 @@ describe('DecisionCard', () => {
       />,
     );
 
+    await user.click(screen.getByText('Details'));
     await user.click(screen.getByRole('button', { name: /preview paper trade/i }));
     const placeButton = await screen.findByRole('button', { name: 'Place Dry Run' });
     await user.click(placeButton);
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const [, previewInit] = fetchMock.mock.calls[0];
+    const requestedPreview = JSON.parse(String(previewInit?.body));
+    expect(requestedPreview).toEqual(expect.objectContaining({ requested_notional_usd: 100 }));
+    expect(requestedPreview.qty).toBeUndefined();
+    expect(requestedPreview.stop_price).toBeUndefined();
+    expect(requestedPreview.target_price).toBeUndefined();
     const [, placeInit] = fetchMock.mock.calls[1];
     expect(JSON.parse(String(placeInit?.body))).toEqual(
-      expect.objectContaining({ dry_run: true, mode: 'dry_run' }),
+      expect.objectContaining({ dry_run: true, mode: 'dry_run', qty: 1, requested_notional_usd: null, paper_contract: paperContract }),
     );
+
+    // After the receipt the next step is tracking, not re-placing the same setup.
+    const recorded = await screen.findByRole('button', { name: 'Dry Run Recorded' });
+    expect(recorded).toBeDisabled();
+    expect(screen.getByTestId('receipt-ledger-link')).toHaveAttribute('href', '/proof#paper-ledger');
+    expect(screen.getByTestId('paper-exit-method')).toHaveTextContent('1 hour');
+    expect(screen.getByText(/Saved exit deadline:/).parentElement).not.toHaveTextContent('--');
+    await user.click(recorded);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows advisory weekly evidence on Proof without treating it as a one-hour win probability', () => {
+    render(<ForecastContextPanel results={[sampleResult(), sampleResult({ ticker: 'SHADOW', decision_role: 'shadow' })]} />);
+    const context = screen.getByLabelText('Signal and advisory forecast context');
+    expect(context).toHaveTextContent('Weekly upside probability (advisory): 64%');
+    expect(context).toHaveTextContent('historical pattern hit rate 61% (not an upside probability)');
+    expect(context).toHaveTextContent('Advisory target: Estimated stop-growing point: $102.00');
+    expect(context).toHaveTextContent('Advisory weekly context: Projected range: $97.00');
+    expect(context).toHaveTextContent('Advisory stop: Invalidation: $99.00');
+    expect(context).toHaveTextContent('That ranking is not a one-hour profit probability');
+    expect(context).not.toHaveTextContent('SHADOW');
+  });
+
+  it('invalidates a preview when a new same-symbol scan replaces the candidate', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(orderPreviewResponse()));
+    const result = sampleResult();
+    const { rerender } = render(<DecisionCard result={result} decision={sampleDecision()} automation={sampleAutomation()} />);
+    await user.click(screen.getByText('Details'));
+    await user.click(screen.getByRole('button', { name: /preview paper trade/i }));
+    expect(await screen.findByRole('button', { name: 'Place Dry Run' })).toBeEnabled();
+    rerender(<DecisionCard result={{ ...result, created_at: '2026-04-22T18:10:00.000Z', price: 101 }} decision={sampleDecision()} automation={sampleAutomation()} />);
+    expect(screen.queryByRole('button', { name: 'Place Dry Run' })).not.toBeInTheDocument();
   });
 });

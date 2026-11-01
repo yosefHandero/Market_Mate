@@ -67,6 +67,47 @@ class OutcomeProcessingTests(unittest.TestCase):
         self.assertEqual({item.outcome_id for item in due}, {pending.id})
         self.assertEqual({item.horizon for item in due}, {"15m", "1h", "1d", "1w"})
 
+    def test_unpriceable_rows_are_closed_as_missed_without_provider_calls(self):
+        with self.factory() as session:
+            unpriceable = self.signal(ticker="SHIB/USD", asset_type="crypto", signal="HOLD", entry_price=0.0)
+            priced = self.signal(ticker="MSFT", generated_at=self.now - timedelta(days=28))
+            session.add_all([unpriceable, priced])
+            session.commit()
+        due = self.repo.list_due_signal_outcome_evaluations(observed_at=self.now, limit=1)
+        self.assertEqual({item.outcome_id for item in due}, {priced.id})
+
+        service = self.service()
+        self.assertEqual(asyncio.run(service._refresh_due_signal_outcomes(self.now, limit=1)), 4)
+        self.assertEqual(service.alpaca.get_crypto_price_on_or_after_timestamp.await_count, 0)
+        with self.factory() as session:
+            stored = session.get(SignalOutcomeORM, unpriceable.id)
+            self.assertEqual(
+                (stored.status_15m, stored.status_1h, stored.status_1d, stored.status_1w),
+                ("missed",) * 4,
+            )
+            self.assertIsNone(stored.price_after_1h)
+            self.assertIsNotNone(stored.evaluated_at_1h)
+        self.assertEqual(self.repo.get_due_outcome_counts(observed_at=self.now), {"15m": 0, "1h": 0, "1d": 0, "1w": 0})
+
+    def test_trust_window_and_gate_relevant_rows_are_evaluated_before_old_backlog(self):
+        with self.factory() as session:
+            old_buy = self.signal(ticker="OLD", generated_at=self.now - timedelta(days=60))
+            recent_hold = self.signal(ticker="HOLD", signal="HOLD", generated_at=self.now - timedelta(days=3))
+            recent_buy = self.signal(ticker="NEW", generated_at=self.now - timedelta(days=2))
+            session.add_all([old_buy, recent_hold, recent_buy])
+            session.commit()
+        ordered = [
+            self.repo.list_due_signal_outcome_evaluations(observed_at=self.now, limit=1)[0].outcome_id
+        ]
+        service = self.service()
+        for expected_next in (recent_hold.id, old_buy.id):
+            asyncio.run(service._refresh_due_signal_outcomes(self.now, limit=1))
+            ordered.append(
+                self.repo.list_due_signal_outcome_evaluations(observed_at=self.now, limit=1)[0].outcome_id
+            )
+            self.assertEqual(ordered[-1], expected_next)
+        self.assertEqual(ordered, [recent_buy.id, recent_hold.id, old_buy.id])
+
     def test_unripe_weekly_prediction_cannot_starve_due_hourly_batch(self):
         with self.factory() as session:
             session.add(self.prediction(horizon="1w", generated_at=self.now - timedelta(days=2)))
@@ -190,6 +231,9 @@ class ManualMaintenanceLoopTests(unittest.TestCase):
         repository.due_for_run.return_value = False
         service = SchedulerService(scanner_service=scanner, repository=repository)
         service.settings = service.settings.model_copy(update={"scheduler_enabled": False})
+        repository.settings = service.settings
+        repository.check_lease.return_value = True
+        repository.heartbeat.return_value = True
         with patch("app.services.scheduler.time.monotonic", return_value=100), patch(
             "app.services.scheduler.asyncio.sleep", new=AsyncMock(side_effect=[None, asyncio.CancelledError])
         ):

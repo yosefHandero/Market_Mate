@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
+import math
 
 from app.config import get_settings
 from app.core.freshness import is_stale_signal
@@ -19,6 +21,18 @@ class RiskService:
 
     def _asset_type_for_symbol(self, symbol: str) -> str:
         return "crypto" if "/" in symbol else "stock"
+
+    def suggest_paper_quantity(self, *, requested_notional_usd: float, latest_price: float) -> float:
+        """Size the existing fractional market/day paper order within current limits.
+
+        This does not decide eligibility: evaluate_trade still checks every order.
+        Round down at the existing six-decimal paper precision, never above a cap.
+        """
+        if not math.isfinite(latest_price) or latest_price <= 0:
+            return 0.0
+        budget = min(Decimal(str(requested_notional_usd)), Decimal(str(self.settings.trade_gate_max_notional)))
+        quantity = min(budget / Decimal(str(latest_price)), Decimal(str(self.settings.trade_gate_max_qty)))
+        return float(max(quantity, Decimal(0)).quantize(Decimal("0.000001"), rounding=ROUND_DOWN))
 
     def _bucket_metrics(self, *, bucket, horizon: str) -> tuple[int | None, float | None, float | None]:
         if bucket is None:

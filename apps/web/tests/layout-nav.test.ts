@@ -7,6 +7,11 @@ import { describe, expect, it, vi } from 'vitest';
 import HomePage from '@/app/page';
 import RootLayout, { metadata } from '@/app/layout';
 
+vi.mock('@/components/operator-actions', () => ({
+  OperatorActions: ({ mode }: { mode?: string }) =>
+    React.createElement('button', { type: 'button', 'data-mode': mode ?? 'full' }, 'Scan'),
+}));
+
 vi.mock('@/lib/api', () => ({
   getAutomationStatus: vi.fn(async () => ({ data: { dry_run_only: true }, error: null })),
   getLatestDecisions: vi.fn(async () => ({ data: [], error: null })),
@@ -78,14 +83,14 @@ describe('RootLayout navigation', () => {
     expect(metadata.description).not.toMatch(/SELL|HOLD/);
   });
 
-  it('renders decision page with status banner and decision grid', async () => {
+  it('renders a compact decision page without diagnostics or policy identity', async () => {
     render(await HomePage());
     expect(screen.getByRole('heading', { name: 'Buy Candidates' })).toBeInTheDocument();
-    expect(screen.getByTestId('status-banner')).toBeInTheDocument();
-    expect(screen.getByTestId('decision-policy-status')).toHaveTextContent(/Serving policy/i);
-    expect(screen.getByTestId('decision-policy-mismatch')).toHaveTextContent(
-      /Requested champion:\s+Weekly probability/i,
-    );
+    expect(screen.getByRole('button', { name: 'Scan' })).toHaveAttribute('data-mode', 'scan');
+    expect(screen.getByTestId('decision-updated')).toHaveTextContent(/Updated/i);
     expect(screen.getByTestId('decision-grid')).toBeInTheDocument();
+    expect(screen.queryByTestId('status-banner')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('decision-policy-status')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start scheduler' })).not.toBeInTheDocument();
   });
 });

@@ -152,11 +152,10 @@ class PaperLoopE2ETests(unittest.TestCase):
                     with SessionLocal() as session:
                         position = session.get(PaperPositionORM, place.ledger_id)
                         assert position is not None
-                        position.opened_at = (now - timedelta(hours=2)).replace(tzinfo=None)
-                        session.commit()
-
+                        assert position.exit_due_at is not None
+                        due_at = position.exit_due_at.replace(tzinfo=timezone.utc)
                     closed = repo.close_open_positions_past_horizon(
-                        observed_at=now,
+                        observed_at=due_at,
                         market_prices={"AAPL": 105.0},
                     )
                     self.assertEqual(closed, 1)

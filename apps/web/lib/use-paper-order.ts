@@ -45,13 +45,18 @@ export function usePaperOrder({
   const canAct = actionGate.allowed;
 
   const previewEnabled = Boolean(setup && canAct && busy == null);
+  // Once a dry run is recorded for this preview, placing again would only hit
+  // the idempotency guard; require a fresh preview instead.
+  const placed = receipt?.ok === true;
   const placeEnabled = Boolean(
     preview &&
       setup &&
       orderKey &&
       preview.gate_result !== 'blocked' &&
+      preview.paper_contract != null &&
       selectableAction(recommendedAction) &&
       canAct &&
+      !placed &&
       busy == null,
   );
 
@@ -60,7 +65,7 @@ export function usePaperOrder({
     setReceipt(null);
     setError(null);
     setOrderKey(null);
-  }, [result.asset_type, result.decision_signal, result.ticker]);
+  }, [result]);
 
   const runPreview = useCallback(async () => {
     if (!setup || !previewEnabled) return;
@@ -95,6 +100,8 @@ export function usePaperOrder({
       const nextReceipt = await placeOrder({
         ...setup,
         qty: preview.qty,
+        requested_notional_usd: null,
+        paper_contract: preview.paper_contract,
         preview_audit_id: preview.execution_audit_id,
         idempotency_key: orderKey,
         dry_run: true,
@@ -134,6 +141,7 @@ export function usePaperOrder({
     canAct,
     previewEnabled,
     placeEnabled,
+    placed,
     recommendedAction,
     runPreview,
     runPlace,

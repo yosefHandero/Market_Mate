@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { reconcilePaperLedger } from '@/lib/api';
+import { formatHoldingDuration, formatPaperTimestamp } from '@/lib/paper-contract';
 import type { PaperLedgerSummary, PaperPositionSummary } from '@/lib/types';
 
 function safeNumber(value: number | null | undefined): number | null {
@@ -42,7 +43,15 @@ function formatCount(value: number | null | undefined, fallback: number) {
 }
 
 function formatTimestamp(value: string | null | undefined) {
-  return value ? new Date(value).toLocaleString() : '--';
+  return formatPaperTimestamp(value);
+}
+
+function closureLabel(position: PaperPositionSummary): string {
+  if (position.contract_status !== 'recorded') return 'Legacy contract unknown';
+  if (position.closure_status === 'overdue_pending_quote') return 'Overdue; pending valid exit quote';
+  if (position.closure_status === 'closed_late') return `Closed late by ${position.close_delay_seconds ?? '--'} seconds`;
+  if (position.status === 'closed') return 'Closed';
+  return 'Scheduled';
 }
 
 function priceKey(position: PaperPositionSummary) {
@@ -90,11 +99,13 @@ function PositionTable({
                 <th>Ticker</th>
                 <th>Action</th>
                 <th>Qty</th>
-                <th>Fill</th>
+                <th>Actual fill</th>
+                <th>Actual close</th>
                 <th>Notional</th>
-                <th>P/L</th>
+                <th>Gross P/L</th>
+                <th>Saved exit contract</th>
                 <th>Audit</th>
-                <th>Opened</th>
+                <th>Actual fill / close times</th>
               </tr>
             </thead>
             <tbody>
@@ -114,20 +125,34 @@ function PositionTable({
                       <div className="muted small">
                         {position.strategy_version ?? '--'}
                         {position.confidence != null ? ` | confidence ${position.confidence}` : ''}
+                        <div>Source scan: {position.source_run_id ?? 'unknown'}</div>
+                        <div>Policy: {position.policy_id ?? 'unknown'}{position.policy_version ? ` (${position.policy_version})` : ''}</div>
                       </div>
                     </td>
                     <td>{position.side}</td>
                     <td>{formatQuantity(position.quantity)}</td>
                     <td>{formatCurrency(position.simulated_fill_price)}</td>
+                    <td>{position.status === 'closed' ? formatCurrency(position.close_price) : 'pending'}</td>
                     <td>{formatCurrency(position.notional_usd)}</td>
                     <td className={pnl == null ? 'muted' : pnl >= 0 ? 'positive' : 'negative'}>
-                      {pnl == null ? 'unsupported' : formatCurrency(pnl)}
+                      {pnl == null ? 'unavailable' : formatCurrency(pnl)}
+                      {position.status === 'open' ? <div className="muted small">scan-mark estimate</div> : null}
+                    </td>
+                    <td>
+                      <div>{closureLabel(position)}</div>
+                      {position.contract_status === 'recorded' ? (
+                        <div className="muted small">
+                          Time-based · {formatHoldingDuration(position.holding_duration_seconds)} from fill
+                          <div>Deadline: {formatTimestamp(position.exit_due_at)}</div>
+                        </div>
+                      ) : <div className="muted small">Original duration and deadline unavailable; automatic close is not scheduled.</div>}
                     </td>
                     <td>
                       {position.execution_audit_id ? `#${position.execution_audit_id}` : '--'}
                     </td>
                     <td>
-                      <span className="muted small">{formatTimestamp(position.opened_at)}</span>
+                      <div className="muted small">Fill: {formatTimestamp(position.opened_at)}</div>
+                      <div className="muted small">Close: {formatTimestamp(position.closed_at)}</div>
                     </td>
                   </tr>
                 );
@@ -168,10 +193,8 @@ export function PaperLedgerPanel({
   const [expanded, setExpanded] = useState(!defaultCollapsed);
   const [reconciling, setReconciling] = useState(false);
   const [reconcileStatus, setReconcileStatus] = useState<string | null>(null);
-  const estimatedUnrealized = openPositions.reduce((sum, position) => {
-    const pnl = estimateUnrealizedPnl(position, latestPrices);
-    return pnl == null ? sum : sum + pnl;
-  }, 0);
+  const supportedMarks = openPositions.map((position) => estimateUnrealizedPnl(position, latestPrices)).filter((pnl): pnl is number => pnl != null);
+  const estimatedUnrealized = supportedMarks.length ? supportedMarks.reduce((sum, pnl) => sum + pnl, 0) : null;
 
   const runReconcile = async () => {
     setReconciling(true);
@@ -195,7 +218,8 @@ export function PaperLedgerPanel({
         <div>
           <h2 style={{ marginBottom: 8 }}>Paper Ledger</h2>
           <p className="muted" style={{ margin: 0 }}>
-            Audit trail and performance review (lower priority).
+            Time-based paper positions and actual simulated outcomes. P/L is gross from saved
+            fill and close prices; scan marks are estimates. No active stop or target orders.
           </p>
           <div className="paper-ledger-summary-row small" style={{ marginTop: 10 }}>
             <span>
@@ -203,7 +227,7 @@ export function PaperLedgerPanel({
               {formatCount(summary?.open_positions, openPositions.length)}
             </span>
             <span>
-              <span className="muted">Realized P/L:</span>{' '}
+              <span className="muted">Gross realized P/L:</span>{' '}
               {formatCurrency(summary?.total_realized_pnl ?? null)}
             </span>
             <span>
@@ -256,6 +280,9 @@ export function PaperLedgerPanel({
       {expanded ? (
         <>
       <div className="detail-panel small" style={{ marginTop: 16 }}>
+        <div><span className="muted">Overdue / pending quote:</span> {summary?.overdue_positions ?? '--'}</div>
+        <div><span className="muted">Closed late:</span> {summary?.late_closed_positions ?? '--'}</div>
+        <div><span className="muted">Legacy contract unknown:</span> {summary?.legacy_unknown_positions ?? '--'}</div>
         <div>
           <span className="muted">Total trades:</span>{' '}
           {formatCount(summary?.total_count, positions.length)}
@@ -276,7 +303,7 @@ export function PaperLedgerPanel({
           {formatCurrency(summary?.total_notional_usd ?? null)}
         </div>
         <div>
-          <span className="muted">Realized P/L:</span>{' '}
+          <span className="muted">Gross realized P/L:</span>{' '}
           {formatCurrency(summary?.total_realized_pnl ?? null)}
         </div>
         <div>
@@ -287,8 +314,9 @@ export function PaperLedgerPanel({
           {formatCurrency(summary?.max_drawdown_usd ?? null)}
         </div>
         <div>
-          <span className="muted">Est. unrealized P/L:</span>{' '}
-          {openPositions.length ? formatCurrency(estimatedUnrealized) : '--'}
+          <span className="muted">Estimated gross unrealized P/L (scan marks):</span>{' '}
+          {formatCurrency(estimatedUnrealized)}
+          {supportedMarks.length < openPositions.length ? ` (${supportedMarks.length}/${openPositions.length} positions have marks)` : ''}
         </div>
         <div>
           <span className="muted">Last opened:</span> {formatTimestamp(summary?.last_opened_at)}

@@ -218,4 +218,19 @@ describe('PaperLedgerPanel', () => {
     expect(screen.getByText('AAPL').closest('tr')).toHaveAttribute('data-highlight', 'true');
     expect(screen.getByText('MSFT').closest('tr')).not.toHaveAttribute('data-highlight');
   });
+
+  it('exposes saved deadlines, actual closes, lateness and legacy contracts', () => {
+    render(<PaperLedgerPanel positions={[
+      { ...positions[0], contract_status: 'recorded', closure_status: 'overdue_pending_quote', source_run_id: 'scan-original', policy_id: 'hybrid', policy_version: 'v4', holding_duration_seconds: 3600, exit_method: 'time_based', exit_due_at: '2026-04-22T17:00:00.000Z' },
+      { ...positions[1], contract_status: 'recorded', closure_status: 'closed_late', close_delay_seconds: 120, holding_duration_seconds: 3600, exit_method: 'time_based', exit_due_at: '2026-04-22T16:58:00.000Z' },
+      { ...positions[0], id: 3, ticker: 'LEGACY', contract_status: 'legacy_unknown' },
+    ]} summary={summary} latestPrices={{}} refreshing={false} onRefresh={vi.fn()} />);
+    expect(screen.getByText('Overdue; pending valid exit quote')).toBeInTheDocument();
+    expect(screen.getByText('Closed late by 120 seconds')).toBeInTheDocument();
+    expect(screen.getByText('MSFT').closest('tr')).toHaveTextContent('$400.00');
+    expect(screen.getByText('AAPL').closest('tr')).toHaveTextContent('1 hour from fill');
+    expect(screen.getByText('AAPL').closest('tr')).toHaveTextContent('Source scan: scan-original');
+    expect(screen.getByText('LEGACY').closest('tr')).toHaveTextContent('Original duration and deadline unavailable; automatic close is not scheduled.');
+    expect(screen.getByText(/Estimated gross unrealized P\/L \(scan marks\):/).parentElement).toHaveTextContent('-- (0/2 positions have marks)');
+  });
 });

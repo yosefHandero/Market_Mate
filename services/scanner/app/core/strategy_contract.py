@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from app.schemas import DecisionSignal
+from app.config import get_settings
 
 StrategyIntent = Literal["long", "short", "flat"]
 EvidenceQualityLabel = Literal["high", "moderate", "low", "degraded"]
@@ -141,7 +142,18 @@ CURRENT_STRATEGY_CONTRACT = StrategyContract(
 
 
 def get_current_strategy_contract() -> StrategyContract:
-    return CURRENT_STRATEGY_CONTRACT
+    horizon = get_settings().trade_gate_horizon
+    return replace(
+        CURRENT_STRATEGY_CONTRACT,
+        primary_holding_horizon=horizon,
+        entry_assumption="Paper entry uses the latest valid quote at placement as the simulated fill, with zero simulated slippage.",
+        exit_assumption=(
+            f"Paper positions close by time after the agreed {horizon} duration from actual simulated fill. "
+            "The deadline is saved at placement; the next available valid quote may close late. "
+            "Stops, targets and weekly ranges are advisory; no protective orders are active. "
+            "Weekly forecast evidence and signal-return diagnostics are separate from paper P&L."
+        ),
+    )
 
 
 def assess_evidence_quality(
@@ -290,12 +302,13 @@ def build_strategy_evaluation_metadata(
         provider_status=provider_status,
         evidence_quality=quality.label,
     )
+    contract = get_current_strategy_contract()
     return StrategyEvaluationMetadata(
         strategy_id=STRATEGY_ID,
         strategy_version=STRATEGY_VERSION,
-        primary_holding_horizon=PRIMARY_HOLDING_HORIZON,
-        entry_assumption=ENTRY_ASSUMPTION,
-        exit_assumption=EXIT_ASSUMPTION,
+        primary_holding_horizon=contract.primary_holding_horizon,
+        entry_assumption=contract.entry_assumption,
+        exit_assumption=contract.exit_assumption,
         evidence_quality=quality.label,
         evidence_quality_score=quality.score,
         evidence_quality_reasons=quality.reasons,

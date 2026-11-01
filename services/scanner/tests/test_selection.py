@@ -61,8 +61,9 @@ class SelectionTests(unittest.TestCase):
             _result(ticker="DOGE/USD", asset_type="crypto", score=40.0, gate_passed=False),
         ]
         selection = select_top_picks(results, settings=self.settings, limit=3)
-        self.assertEqual([row.ticker for row in selection.stocks], ["NVDA", "AMD", "INTC"])
-        self.assertEqual([row.ticker for row in selection.crypto], ["BTC/USD", "ETH/USD", "SOL/USD"])
+        # Paper action requires readiness >= 70. AMD 68, INTC 52, and SOL 65 stay off.
+        self.assertEqual([row.ticker for row in selection.stocks], ["NVDA"])
+        self.assertEqual([row.ticker for row in selection.crypto], ["BTC/USD", "ETH/USD"])
 
     def test_apply_top_pick_selection_sets_persisted_fields(self) -> None:
         results = [
@@ -116,6 +117,44 @@ class SelectionTests(unittest.TestCase):
         picked = [row.ticker for row in selection.stocks]
         self.assertIn("NVDA", picked)
         self.assertNotIn("AMD", picked)
+
+    def test_bullish_weekly_hold_is_not_selectable(self) -> None:
+        results = [
+            _result(ticker="NVDA", score=70.0),
+            _result(
+                ticker="FIL",
+                score=99.0,
+                decision_signal="HOLD",
+                execution_eligibility="eligible",
+                recommended_action="preview",
+            ),
+        ]
+        selection = select_top_picks(results, settings=self.settings, limit=5)
+        self.assertEqual([row.ticker for row in selection.stocks], ["NVDA"])
+
+    def test_blocked_buy_is_not_selectable_even_when_action_field_says_dry_run(self) -> None:
+        results = [
+            _result(ticker="NVDA", score=70.0),
+            _result(
+                ticker="IBM",
+                score=99.0,
+                execution_eligibility="blocked",
+                recommended_action="dry_run",
+            ),
+        ]
+        selection = select_top_picks(results, settings=self.settings, limit=5)
+        self.assertEqual([row.ticker for row in selection.stocks], ["NVDA"])
+
+    def test_missing_eligibility_does_not_grant_a_slot(self) -> None:
+        results = [
+            _result(
+                ticker="IBM",
+                score=99.0,
+                execution_eligibility="not_applicable",
+            ),
+        ]
+        selection = select_top_picks(results, settings=self.settings, limit=5)
+        self.assertEqual(list(selection.stocks), [])
 
 
 if __name__ == "__main__":

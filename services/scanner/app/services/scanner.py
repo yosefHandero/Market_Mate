@@ -19,6 +19,7 @@ from app.clients.options_flow import OptionsFlowClient
 from app.clients.sec import SECClient
 from app.clients.marketaux import MarketauxClient
 from app.config import get_settings
+from app.errors import AppError
 from app.core.confidence import compute_confidence_overlay
 from app.core.decision_presentation import (
     build_decision_enrichment,
@@ -56,12 +57,16 @@ from app.services.news_cache import NewsCacheService
 from app.services.weekly_prediction_service import WeeklyPredictionService
 from app.services.daily_bar_service import DailyBarService
 from app.services.brain_runtime import BrainRuntime
+from app.services.scan_lease import assert_current_scan_lease, run_with_scan_lease
+from app.services.scan_coverage import build_scan_coverage
+from app.services.scheduler_repository import SchedulerRepository
 from app.brain.policies import WEEKLY_POLICY_ID
 
 logger = logging.getLogger(__name__)
 
 
 class ScannerService:
+    _SCAN_TIMEOUT_SECONDS = None
     _OUTCOME_LOOKUP_CONFIG = {
         "15m": {"timeframe": "1Min", "max_search_minutes": 24 * 60},
         "1h": {"timeframe": "5Min", "max_search_minutes": 3 * 24 * 60},
@@ -322,18 +327,34 @@ class ScannerService:
         signal,
         observed_at: datetime | None = None,
         pattern_name: str | None = None,
-    ) -> tuple[float, str, bool, str, list[GateCheck]]:
-        if signal.decision_signal not in {"BUY", "SELL"}:
-            return round(signal.score, 2), "raw", False, "Signal is HOLD, so trade gate is not applicable.", []
-
+    ) -> tuple[float, str, bool, str, list[GateCheck], dict]:
         horizon = self.settings.trade_gate_horizon
+        if signal.decision_signal not in {"BUY", "SELL"}:
+            return (
+                round(signal.score, 2),
+                "raw",
+                False,
+                "Signal is HOLD, so trade gate is not applicable.",
+                [],
+                {
+                    "horizon": horizon,
+                    "score_band": None,
+                    "source": "raw",
+                    "sample_count": None,
+                    "win_rate": None,
+                    "avg_return": None,
+                    "blend_weight": None,
+                    "base_score": round(signal.score, 2),
+                },
+            )
+
         if horizon == "1w" and pattern_name:
             frozen_weekly_gate = self._weekly_pattern_gate_from_learned_inputs(
                 pattern_name=pattern_name,
                 asset_type=asset_type,
                 signal=signal.decision_signal,
             )
-            calibrated_confidence, score_band, calibration_source = self.repo.calibrate_signal(
+            calibrated_confidence, _score_band, calibration_source, blend = self.repo.calibrate_signal_detail(
                 asset_type=asset_type,
                 signal=signal.decision_signal,
                 raw_score=signal.score,
@@ -348,6 +369,7 @@ class ScannerService:
                     gate_passed,
                     gate_reason,
                     gate_checks,
+                    blend,
                 )
             evaluation = self.repo.evaluate_weekly_pattern_gate(
                 pattern_name=pattern_name,
@@ -361,20 +383,21 @@ class ScannerService:
                 evaluation.passed,
                 evaluation.reason,
                 evaluation.checks,
+                blend,
             )
 
-        calibrated_confidence, score_band, calibration_source = self.repo.calibrate_signal(
+        calibrated_confidence, score_band, calibration_source, blend = self.repo.calibrate_signal_detail(
             asset_type=asset_type,
             signal=signal.decision_signal,
             raw_score=signal.score,
-            horizon=self.settings.trade_gate_horizon,
+            horizon=horizon,
             observed_at=observed_at,
         )
         evaluation = self.repo.evaluate_signal_gate(
             asset_type=asset_type,
             signal=signal.decision_signal,
             score_band=score_band,
-            horizon=self.settings.trade_gate_horizon,
+            horizon=horizon,
             observed_at=observed_at,
         )
         return (
@@ -383,6 +406,7 @@ class ScannerService:
             evaluation.passed,
             evaluation.reason,
             evaluation.checks,
+            blend,
         )
 
     def _weekly_pattern_gate_from_learned_inputs(
@@ -497,6 +521,13 @@ class ScannerService:
         *,
         limit: int | None = None,
     ) -> int:
+        closed = self.repo.mark_unpriceable_signal_outcomes_missed(observed_at=observed_at)
+        if closed:
+            logger.info(
+                "Closed %s unpriceable signal outcome horizons as missed",
+                closed,
+                extra={"event": "outcome_unpriceable_closed", "count": closed},
+            )
         pending = self.repo.list_due_signal_outcome_evaluations(
             observed_at=observed_at,
             limit=limit,
@@ -757,6 +788,7 @@ class ScannerService:
         if not due:
             return 0
         market_prices: dict[str, float] = {}
+        market_observed_at: dict[str, datetime] = {}
         for item in due:
             if item.ticker in market_prices:
                 continue
@@ -767,6 +799,7 @@ class ScannerService:
                     )
                 else:
                     market_prices[item.ticker] = float(await self.alpaca.get_latest_price(item.ticker))
+                market_observed_at[item.ticker] = datetime.now(timezone.utc)
             except Exception:
                 logger.warning(
                     "paper_horizon_close_price_unavailable",
@@ -775,6 +808,7 @@ class ScannerService:
         return self.repo.close_open_positions_past_horizon(
             observed_at=observed_at,
             market_prices=market_prices,
+            market_observed_at=market_observed_at,
         )
 
     def _compute_market_status(self, bars: dict[str, dict]) -> tuple[str, float, float]:
@@ -801,19 +835,31 @@ class ScannerService:
         marketaux_score, finnhub_score = await asyncio.gather(
             self.marketaux.get_news_sentiment_score(ticker),
             self.finnhub.get_news_sentiment_score(ticker),
+            return_exceptions=True,
         )
-        scores = [score for score in (marketaux_score, finnhub_score) if abs(score) > 0]
-        sentiment = round(sum(scores) / len(scores), 4) if scores else 0.0
-        self.news_cache.set(ticker, sentiment)
         warnings: list[str] = []
         if not self.settings.marketaux_api_token:
             warnings.append("marketaux_api_token_missing")
         if not self.settings.finnhub_api_key:
             warnings.append("finnhub_api_key_missing")
-        if not scores:
+        available = {
+            provider: float(score)
+            for provider, score in (("marketaux", marketaux_score), ("finnhub", finnhub_score))
+            if isinstance(score, (int, float))
+        }
+        for provider in ("marketaux", "finnhub"):
+            if provider not in available:
+                warnings.append(f"{provider}_unavailable")
+        if not available:
             warnings.append("directional_news_unavailable")
-            return sentiment, True, "insufficient", "Directional news providers returned no usable signal", warnings
-        return sentiment, True, "marketaux+finnhub", "Fresh directional news check", warnings
+            return 0.0, False, "unavailable", "Directional news unavailable", warnings
+        # Preserve the existing successful-input blend; genuine zero is valid
+        # availability, while failed requests never become cached neutral data.
+        scores = [score for score in available.values() if abs(score) > 0]
+        sentiment = round(sum(scores) / len(scores), 4) if scores else 0.0
+        if len(available) == 2:
+            self.news_cache.set(ticker, sentiment)
+        return sentiment, True, "+".join(available), "Fresh directional news check", warnings
 
     def _provider_health(
         self,
@@ -922,7 +968,11 @@ class ScannerService:
                 item=item,
                 observed_at=observed_at,
             ),
-            "directional_news": "fallback" if news_source in {"cache", "insufficient"} else "ok",
+            "directional_news": (
+                "missing" if news_source == "unavailable"
+                else "fallback" if news_source in {"cache", "insufficient", "finnhub", "marketaux"}
+                else "ok"
+            ),
             "options_flow": (
                 "missing"
                 if asset_type == "stock" and options_snapshot.summary.startswith("Options flow unavailable")
@@ -1202,7 +1252,14 @@ class ScannerService:
             market_daily_bars=market_daily_bars,
         )
         pattern_name = weekly_prediction.pattern_name if weekly_prediction else None
-        calibrated_confidence, calibration_source, gate_passed, gate_reason, gate_checks = self._gate_signal(
+        (
+            calibrated_confidence,
+            calibration_source,
+            gate_passed,
+            gate_reason,
+            gate_checks,
+            confidence_blend,
+        ) = self._gate_signal(
             asset_type=asset_type,
             signal=signal,
             observed_at=created_at,
@@ -1414,6 +1471,7 @@ class ScannerService:
                     "calibration_source": calibration_source,
                     "gate_passed": gate_passed,
                     "gate_reason": gate_reason,
+                    "blend": confidence_blend,
                 },
                 "evidence": {
                     "quality": strategy_metadata.evidence_quality,
@@ -1496,6 +1554,29 @@ class ScannerService:
         )
 
     async def run_scan(self) -> ScanRun:
+        if getattr(self, "settings", get_settings()).runtime_verification_mode:
+            raise AppError(
+                message="Scans are paused during local runtime verification.",
+                status_code=503,
+                code="runtime_verification_mode",
+            )
+        async def bounded_scan() -> ScanRun:
+            deadline = asyncio.timeout(self._SCAN_TIMEOUT_SECONDS)
+            try:
+                async with deadline:
+                    return await self._run_scan()
+            except TimeoutError as exc:
+                if not deadline.expired():
+                    raise
+                raise AppError(
+                    message="Scan exceeded its time limit and was cancelled. Check the latest saved scan before retrying.",
+                    status_code=504,
+                    code="scan_timeout",
+                ) from exc
+
+        return await run_with_scan_lease(bounded_scan, SchedulerRepository(), source="scan")
+
+    async def _run_scan(self) -> ScanRun:
         scan_t0 = time.monotonic()
         stock_watchlist = self.settings.watchlist_items
         crypto_watchlist = self.settings.crypto_watchlist_items
@@ -1708,7 +1789,21 @@ class ScannerService:
             results=results,
             top_stocks=top_stocks,
             top_crypto=top_crypto,
+            coverage=[
+                build_scan_coverage(
+                    asset_type=asset_type,
+                    expected_symbols=expected_symbols,
+                    market_data=market_data,
+                    provider_error=provider_error,
+                    results=results,
+                )
+                for asset_type, expected_symbols, market_data, provider_error in (
+                    ("stock", stock_watchlist, stock_bars, stock_error),
+                    ("crypto", crypto_watchlist, crypto_bars, crypto_error),
+                )
+            ],
         )
+        assert_current_scan_lease()
         try:
             await self.alerts.dispatch_for_run(run)
         except Exception as exc:
@@ -1718,6 +1813,7 @@ class ScannerService:
                 extra={"event": "alert_failure", "run_id": run.run_id},
                 exc_info=exc,
             )
+        assert_current_scan_lease()
         self.repo.save_run(
             run,
             shadow_decisions=[
@@ -1726,6 +1822,7 @@ class ScannerService:
                 if policy_id != champion_id
                 for decision in decisions
             ],
+            champion_decisions=policy_decisions.get(champion_id, []),
             champion_policy_id=champion_id,
             champion_fingerprint=(
                 self.brain.weekly.fingerprint()

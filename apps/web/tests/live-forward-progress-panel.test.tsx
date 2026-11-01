@@ -12,12 +12,21 @@ const progress: LiveForwardProgress = {
   campaign_started_at: '2026-07-01T00:00:00Z',
   config_fingerprint: 'fp1234567890abcdef',
   strategy_version: 'v4.1-integrated',
+  saved_policy_id: 'hybrid_legacy',
+  saved_policy_version: 'hybrid-v4.3',
+  saved_decision_fingerprint: 'saved-fingerprint-12345',
+  runtime_policy_id: 'hybrid_legacy',
+  runtime_policy_version: 'hybrid-v4.2',
+  runtime_decision_fingerprint: 'runtime-fingerprint-12345',
+  identity_matches_saved_campaign: false,
   code_commit: 'abcdef1234',
   selected_count: 8,
   accepted_outside_top_n_count: 3,
   rejected_count: 20,
   resolved_count: 6,
   pending_count: 5,
+  pending_due_count: 0,
+  pending_due_unknown_count: 0,
   resolved_late_count: 2,
   by_asset: [
     {
@@ -58,7 +67,21 @@ describe('LiveForwardProgressPanel', () => {
     expect(screen.getByTestId('live-forward-asset-stock')).toHaveTextContent('5');
     expect(screen.getByTestId('live-forward-asset-crypto')).toHaveTextContent('3');
     expect(screen.getByTestId('live-forward-late')).toHaveTextContent('resolved after their due date');
-    expect(screen.getByText(/Evidence accumulates while the app is running/)).toBeInTheDocument();
+    expect(screen.getByText(/Further resolutions can improve or worsen measured results/)).toBeInTheDocument();
+    expect(screen.getByTestId('live-forward-saved-policy')).toHaveTextContent('hybrid-v4.3');
+    expect(screen.getByTestId('live-forward-runtime-policy')).toHaveTextContent('hybrid-v4.2');
+    expect(screen.getByTestId('live-forward-runtime-policy')).toHaveTextContent('identities differ');
+    expect(screen.getByTestId('live-forward-campaign')).toHaveTextContent('strategy v4.1-integrated');
+    expect(screen.getByText(/Counts cover this campaign only/)).toHaveTextContent('not an executed paper trade');
+    expect(screen.getByText(/Counts cover this campaign only/)).toHaveTextContent('Prediction-snapshot progress is separate from the signal-return outcomes used by BUY gates');
+    expect(screen.getByTestId('live-forward-late')).not.toHaveTextContent('after downtime');
+    expect(screen.getByTestId('live-forward-due')).toHaveTextContent('Pending outcomes are not due yet');
+  });
+
+  it('does not label unknown due times as not due yet', () => {
+    render(<LiveForwardProgressPanel progress={{ ...progress, pending_due_unknown_count: 2 }} />);
+    expect(screen.getByTestId('live-forward-due')).toHaveTextContent('2 pending outcome(s) have no recorded due time');
+    expect(screen.getByTestId('live-forward-due')).not.toHaveTextContent('not due yet');
   });
 
   it('reports an old scan without imposing an automatic wake cadence', () => {

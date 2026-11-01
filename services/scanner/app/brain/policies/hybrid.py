@@ -18,7 +18,7 @@ from app.brain.contracts import BrainDecision, EvidenceBasis, ExitPlan, MarketSn
 from app.brain.identity import decision_fingerprint
 
 HYBRID_POLICY_ID = "hybrid_legacy"
-HYBRID_POLICY_VERSION = "hybrid-v4.2"
+HYBRID_POLICY_VERSION = "hybrid-v4.3"
 
 
 class HybridLegacyPolicy:
@@ -60,14 +60,7 @@ class HybridLegacyPolicy:
         session = symbol.session or {}
         signal = str(session.get("decision_signal") or "").upper()
         price = float(session.get("price") or 0.0)
-        p_up = session.get("calibrated_confidence")
-        if p_up is None:
-            p_up = session.get("upside_probability_pct")
-        ev = session.get("expected_value_pct")
-        weekly_bias = session.get("weekly_directional_bias")
-        if signal != "BUY" and not (
-            weekly_bias == "bullish" and session.get("upside_probability_pct") is not None
-        ):
+        if signal != "BUY":
             reason = "insufficient_session_features" if not session else "not_buy_signal"
             return BrainDecision(
                 policy_id=self.policy_id,
@@ -90,14 +83,6 @@ class HybridLegacyPolicy:
                 stop_price=session.get("stop_price"),
                 horizon_days=int(session.get("horizon_days") or 7),
             )
-        try:
-            p_up_value = float(p_up) if p_up is not None else None
-        except (TypeError, ValueError):
-            p_up_value = None
-        try:
-            ev_value = float(ev) if ev is not None else None
-        except (TypeError, ValueError):
-            ev_value = None
         return BrainDecision(
             policy_id=self.policy_id,
             policy_version=self.policy_version,
@@ -106,8 +91,8 @@ class HybridLegacyPolicy:
             asset_type=symbol.asset_type,
             as_of=snapshot.as_of,
             action="BUY",
-            p_up_calibrated=p_up_value,
-            expected_value_pct=ev_value,
+            p_up_calibrated=None,
+            expected_value_pct=None,
             exit_plan=exit_plan,
             evidence_basis=EvidenceBasis(
                 basis=str(session.get("evidence_basis") or "insufficient"),
@@ -116,7 +101,7 @@ class HybridLegacyPolicy:
             ),
             reasons=(),
             pattern_name=session.get("pattern_name"),
-            probability_methodology=str(session.get("calibration_source") or "hybrid_overlay"),
+            probability_methodology=None,
             diagnostics={
                 "session_signal": "BUY",
                 "raw_score": session.get("score"),

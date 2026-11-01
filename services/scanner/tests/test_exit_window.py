@@ -1,6 +1,6 @@
 import unittest
 
-from app.core.decision_presentation import build_exit_window
+from app.core.decision_presentation import build_exit_window, cap_confidence_by_data_quality
 from app.brain.structural_prediction import build_structural_prediction
 from app.schemas import WeeklyPatternPrediction
 
@@ -61,6 +61,8 @@ class ExitWindowTests(unittest.TestCase):
         # structural target for 1w/normal ~= 102; capped exit is the lower (more conservative) of the two.
         self.assertLessEqual(window.estimated_exit_price, 110.0)
         self.assertGreater(window.estimated_exit_price, 100.0)
+        self.assertIn("structural range", window.expected_growth_window_label)
+        self.assertIn("Source:", window.stop_growing_signal)
 
     def test_invalidation_below_entry(self) -> None:
         window = build_exit_window(
@@ -108,6 +110,10 @@ class ExitWindowTests(unittest.TestCase):
         )
         assert window is not None
         self.assertIn("live", window.confidence_change_note.lower())
+
+    def test_degraded_display_cap_does_not_replace_stored_confidence(self) -> None:
+        self.assertEqual(cap_confidence_by_data_quality(63.52, "degraded"), 40.0)
+        self.assertEqual(round(63.52, 2), 63.52)
 
 
 if __name__ == "__main__":

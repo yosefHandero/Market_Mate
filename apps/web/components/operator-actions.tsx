@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { readErrorMessage } from '@/lib/scanner-api';
-import type { HealthResponse } from '@/lib/types';
+import type { HealthResponse, ScanRun } from '@/lib/types';
 
 interface FeedbackState {
   message: string;
@@ -19,6 +19,7 @@ interface SchedulerSnapshot {
 }
 
 interface OperatorActionsProps {
+  mode?: 'full' | 'scan';
   schedulerEnabled?: boolean;
   schedulerRunning: boolean;
   nextScanDueAt?: string | null;
@@ -28,6 +29,7 @@ interface OperatorActionsProps {
   readyzPollIntervalMs?: number;
   onRefresh?: () => void;
   feedbackClearMs?: number;
+  scanTimeoutMs?: number;
 }
 
 const READYZ_POLL_ATTEMPTS = 5;
@@ -88,7 +90,7 @@ function formatTimestamp(value: string | null): string {
     return 'none';
   }
 
-  const timestamp = Date.parse(value);
+  const timestamp = Date.parse(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : `${value}Z`);
   if (!Number.isFinite(timestamp)) {
     return value;
   }
@@ -116,6 +118,7 @@ export function OperatorActions(props: OperatorActionsProps) {
 }
 
 export function OperatorActionsPanel({
+  mode = 'full',
   schedulerEnabled,
   schedulerRunning,
   nextScanDueAt,
@@ -125,6 +128,7 @@ export function OperatorActionsPanel({
   readyzPollIntervalMs = READYZ_POLL_INTERVAL_MS,
   onRefresh,
   feedbackClearMs = 3000,
+  scanTimeoutMs = 345_000,
 }: OperatorActionsProps & { onRefresh: () => void }) {
   const props = {
     schedulerEnabled,
@@ -135,13 +139,14 @@ export function OperatorActionsPanel({
     readyzPollAttempts,
     readyzPollIntervalMs,
   };
+  const [unavailable, setUnavailable] = useState(false);
   const [scanBusy, setScanBusy] = useState(false);
+  const [scanElapsedSeconds, setScanElapsedSeconds] = useState(0);
   const [schedulerBusy, setSchedulerBusy] = useState(false);
   const [schedulerSnapshot, setSchedulerSnapshot] = useState<SchedulerSnapshot>(() =>
     schedulerSnapshotFromProps(props),
   );
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
-  const [unavailable, setUnavailable] = useState(false);
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -162,12 +167,13 @@ export function OperatorActionsPanel({
     schedulerRunning,
   ]);
 
-  const showFeedback = useCallback((message: string, tone: FeedbackState['tone']) => {
+  const showFeedback = useCallback((message: string, tone: FeedbackState['tone'], persistent = false) => {
     if (feedbackTimerRef.current) {
       clearTimeout(feedbackTimerRef.current);
     }
 
     setFeedback({ message, tone });
+    if (persistent) return;
     feedbackTimerRef.current = setTimeout(() => {
       setFeedback(null);
       feedbackTimerRef.current = null;
@@ -183,33 +189,57 @@ export function OperatorActionsPanel({
     [],
   );
 
+  useEffect(() => {
+    if (!scanBusy) return;
+    const startedAt = Date.now();
+    const timer = setInterval(() => setScanElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [scanBusy]);
+
   const handleScan = useCallback(async () => {
+    setFeedback(null);
+    setScanElapsedSeconds(0);
     setScanBusy(true);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), scanTimeoutMs);
     try {
-      const res = await fetch('/api/scan/run', { method: 'POST' });
+      const res = await fetch('/api/scan/run', { method: 'POST', signal: controller.signal });
       if (res.status === 503) {
         setUnavailable(true);
-        showFeedback('Admin controls unavailable', 'muted');
+        showFeedback('Admin controls unavailable', 'muted', true);
         return;
       }
       if (!res.ok) {
-        showFeedback(await readErrorMessage(res), 'negative');
+        showFeedback(await readErrorMessage(res), 'negative', true);
         return;
       }
-      const run = (await res.json()) as { scan_count?: number };
-      showFeedback(`Scan completed: ${run.scan_count ?? 0} results`, 'positive');
+      const run = (await res.json()) as Partial<ScanRun>;
+      const incomplete = run.coverage?.some((coverage) => coverage.status === 'partial' || coverage.status === 'unavailable');
+      showFeedback(
+        incomplete
+          ? `Partial scan saved: ${run.scan_count ?? 0} results. Missing symbols were not evaluated; coverage is on Proof.`
+          : `Scan finished: ${run.scan_count ?? 0} results. Coverage and freshness are on Proof.`,
+        'muted', true,
+      );
       onRefresh();
     } catch {
-      showFeedback('Network error triggering scan', 'negative');
+      showFeedback(
+        controller.signal.aborted
+          ? 'Scan response timed out. The scanner may still be finishing; refresh before retrying.'
+          : 'Network error triggering scan. Refresh to check whether it finished before retrying.',
+        'negative',
+        true,
+      );
     } finally {
+      clearTimeout(timeout);
       setScanBusy(false);
     }
-  }, [onRefresh, showFeedback]);
+  }, [onRefresh, scanTimeoutMs, showFeedback]);
 
   const fetchReadyzSnapshot = useCallback(async (): Promise<SchedulerSnapshot | null> => {
     const readyzUrl = getReadyzUrl();
     try {
-      const res = await fetch(readyzUrl, { cache: 'no-store' });
+      const res = await fetch(readyzUrl, { cache: 'no-store', signal: AbortSignal.timeout(10_000) });
       if (!res.ok) {
         return null;
       }
@@ -250,14 +280,15 @@ export function OperatorActionsPanel({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
+        signal: AbortSignal.timeout(15_000),
       });
       if (res.status === 503) {
         setUnavailable(true);
-        showFeedback('Admin controls unavailable', 'muted');
+        showFeedback('Admin controls unavailable', 'muted', true);
         return;
       }
       if (!res.ok) {
-        showFeedback(await readErrorMessage(res), 'negative');
+        showFeedback(await readErrorMessage(res), 'negative', true);
         return;
       }
 
@@ -294,14 +325,6 @@ export function OperatorActionsPanel({
     }
   }, [onRefresh, pollSchedulerRunning, schedulerSnapshot.enabled, showFeedback]);
 
-  if (unavailable) {
-    return (
-      <p className="muted small" style={{ marginBottom: 12 }}>
-        Admin controls unavailable.
-      </p>
-    );
-  }
-
   const schedulerError = truncateSchedulerError(schedulerSnapshot.lastError);
   const showWorkerBanner = schedulerSnapshot.enabled && !schedulerSnapshot.running;
   const showWorkerRunningNoScheduler = !schedulerSnapshot.enabled && schedulerSnapshot.running;
@@ -320,6 +343,42 @@ export function OperatorActionsPanel({
       APP_START_COMMAND,
       'App startup command copied. Run it from the repository root.',
     );
+
+  if (unavailable) {
+    return (
+      <p className="muted small" style={{ marginBottom: 12 }}>
+        Admin controls unavailable.
+      </p>
+    );
+  }
+
+  if (mode === 'scan') {
+    return (
+      <div className="decision-scan-control">
+        <button
+          className="button button-primary"
+          disabled={scanBusy}
+          onClick={handleScan}
+          type="button"
+        >
+          {scanBusy ? 'Running...' : 'Scan'}
+        </button>
+        {scanBusy ? (
+          <p className="muted decision-scan-feedback" role="status">
+            Scanning ({scanElapsedSeconds}s).
+          </p>
+        ) : null}
+        {feedback ? (
+          <p
+            role={feedback.tone === 'negative' ? 'alert' : 'status'}
+            className={`decision-scan-feedback ${feedback.tone}`}
+          >
+            {feedback.message}
+          </p>
+        ) : null}
+      </div>
+    );
+  }
 
   return (
     <section className="scheduler-operator-panel" aria-label="Local operator controls">
@@ -369,13 +428,18 @@ export function OperatorActionsPanel({
         </button>
       </div>
 
-      {feedback ? <span className={`small ${feedback.tone}`}>{feedback.message}</span> : null}
+      {scanBusy ? (
+        <p className="muted small" role="status">
+          Scan in progress ({scanElapsedSeconds}s). Waiting for provider data and saved results; this can take up to five minutes.
+        </p>
+      ) : null}
+      {feedback ? <p role={feedback.tone === 'negative' ? 'alert' : 'status'} className={`small ${feedback.tone}`}>{feedback.message}</p> : null}
 
       <details className="ui-disclosure scheduler-operator-details">
         <summary className="ui-disclosure-summary muted small">Operator details</summary>
         <p className="muted small" style={{ margin: '8px 0' }}>
-          Local operator controls only. The app enables the scheduler; the worker runs scans
-          separately.
+          Scans and outcome processing run only while the manually launched app services are open.
+          The scheduler controls in-session scans; it does not wake the computer or launch the app.
         </p>
         <div className="scheduler-operator-pills">
           <span

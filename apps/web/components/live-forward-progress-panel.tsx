@@ -23,6 +23,7 @@ function AssetRow({ row }: { row: LiveForwardAssetProgress }) {
       </span>
       <span className="small">
         <strong>{row.pending}</strong> pending
+        {row.pending_due != null ? ` (${row.pending_due} due)` : ''}
       </span>
       {row.resolved_late > 0 ? (
         <span className="small negative">{row.resolved_late} late</span>
@@ -57,7 +58,7 @@ export function LiveForwardProgressPanel({
       >
         <strong>Application complete ≠ real-money ready.</strong>{' '}
         <span className="muted small">
-          This panel tracks untouched live-forward evidence accumulating over time. Real-money
+          This panel tracks live-forward prediction snapshots. Real-money
           trust is a separate, later decision that depends on the graduation criteria — not on the
           app being finished.
         </span>
@@ -71,11 +72,27 @@ export function LiveForwardProgressPanel({
         <>
           <div className="live-forward-campaign" data-testid="live-forward-campaign">
             <p className="small" style={{ margin: '0 0 4px' }}>
-              Active campaign:{' '}
+              Current campaign:{' '}
               <strong>{progress.campaign_id}</strong>
               {progress.strategy_version ? (
                 <span className="muted"> · strategy {progress.strategy_version}</span>
               ) : null}
+            </p>
+            <p className="small" data-testid="live-forward-saved-policy">
+              Saved policy: {progress.saved_policy_id ?? 'unknown'} · version{' '}
+              {progress.saved_policy_version ?? 'unknown'} · decision{' '}
+              {progress.saved_decision_fingerprint?.slice(0, 12) ?? 'unknown'}.
+              {' '}Learned artifact {progress.saved_learned_artifacts_fingerprint?.slice(0, 12) ?? 'unknown'}.
+            </p>
+            <p className="muted small" data-testid="live-forward-runtime-policy">
+              API process policy: {progress.runtime_policy_id ?? 'unknown'} · version{' '}
+              {progress.runtime_policy_version ?? 'unknown'} · decision{' '}
+              {progress.runtime_decision_fingerprint?.slice(0, 12) ?? 'unknown'}.
+              {progress.identity_matches_saved_campaign === false
+                ? ' Saved campaign and API process identities differ; counts describe the saved campaign.'
+                : progress.identity_matches_saved_campaign === true
+                  ? ' Matches the saved campaign.'
+                  : ' Identity compatibility is unverified.'}
             </p>
             <p className="muted small" style={{ margin: '0 0 8px' }}>
               config {progress.config_fingerprint?.slice(0, 12) ?? '—'}
@@ -103,6 +120,19 @@ export function LiveForwardProgressPanel({
               <strong>{progress.pending_count}</strong> pending
             </span>
           </div>
+          <p className="muted small">
+            Counts cover this campaign only. Selected means stored top-N selection, not an executed paper trade.
+            {' '}Prediction-snapshot progress is separate from the signal-return outcomes used by BUY gates.
+          </p>
+          <p className="muted small" data-testid="live-forward-due">
+            {progress.pending_due_count == null
+              ? 'Pending-due count unavailable.'
+              : `${progress.pending_due_count} pending outcome(s) due now by recorded due time.`}
+            {progress.pending_due_count === 0 && progress.pending_count > 0 && !progress.pending_due_unknown_count
+              ? ' Pending outcomes are not due yet.' : ''}
+            {(progress.pending_due_unknown_count ?? 0) > 0
+              ? ` ${progress.pending_due_unknown_count} pending outcome(s) have no recorded due time.` : ''}
+          </p>
 
           <div className="live-forward-assets" style={{ marginTop: 8 }}>
             {progress.by_asset.map((row) => (
@@ -112,8 +142,8 @@ export function LiveForwardProgressPanel({
 
           {progress.resolved_late_count > 0 ? (
             <p className="negative small" style={{ margin: '8px 0 0' }} data-testid="live-forward-late">
-              {progress.resolved_late_count} outcome(s) resolved after their due date (catch-up
-              after downtime). Counted, but flagged for reliability review.
+              {progress.resolved_late_count} outcome(s) resolved after their due date.
+              Counted, but flagged for reliability review; lateness alone does not identify its cause.
             </p>
           ) : null}
 
@@ -122,7 +152,7 @@ export function LiveForwardProgressPanel({
             {progress.last_scan_age_minutes != null
               ? `${Math.round(progress.last_scan_age_minutes)} min ago`
               : 'unknown'}
-            . Evidence accumulates while the app is running.
+            . Further resolutions can improve or worsen measured results; elapsed time and more rows do not guarantee BUY qualification.
           </p>
         </>
       )}

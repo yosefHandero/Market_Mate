@@ -1,7 +1,9 @@
 'use client';
 
+import Link from 'next/link';
 import { useMemo } from 'react';
 import { DecisionCard } from '@/components/decision-card';
+import { buildDecisionWarning, VISIBLE_CANDIDATE_LIMIT } from '@/lib/decision-surface';
 import { FRESH_BAR_MAX_MINUTES, hasBadFreshnessFlags } from '@/lib/freshness';
 import { evaluatePaperActionGate } from '@/lib/paper-order';
 import type { AutomationStatusResponse, DecisionRow, ScanResult } from '@/lib/types';
@@ -12,10 +14,7 @@ function isProductionSurfaceRow(row: { decision_role?: string | null }): boolean
 }
 
 function isBuyCandidate(row: ScanResult): boolean {
-  // Never surface SELL/HOLD rows on the BUY-candidate product surface.
-  if (row.decision_signal !== 'BUY') return false;
-  if (row.is_buy_candidate != null) return row.is_buy_candidate === true;
-  return true;
+  return row.decision_signal === 'BUY' && row.is_buy_candidate === true;
 }
 
 function rowProviderCritical(row: ScanResult): boolean {
@@ -23,109 +22,13 @@ function rowProviderCritical(row: ScanResult): boolean {
   return status === 'critical' || status === 'error';
 }
 
-function rowStale(row: ScanResult): boolean {
+function rowBarsAreStale(row: ScanResult): boolean {
   const age = row.bar_age_minutes;
-  return (typeof age === 'number' && age > FRESH_BAR_MAX_MINUTES) || hasBadFreshnessFlags(row.freshness_flags);
+  return typeof age !== 'number' || !Number.isFinite(age) || age > FRESH_BAR_MAX_MINUTES;
 }
 
-function formatCount(count: number, singular: string, plural = `${singular}s`): string {
-  return `${count} ${count === 1 ? singular : plural}`;
-}
-
-function reasonCount(count: number, reason: string): string | null {
-  return count > 0 ? `${count} ${reason}` : null;
-}
-
-function rowConfidence(row: ScanResult): number | null {
-  const value = row.confidence_score ?? row.calibrated_confidence ?? row.score;
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-function scarcityReasons(rows: ScanResult[], qualifiedVisibleCount: number): string[] {
-  const buySignals = rows.filter((row) => row.decision_signal === 'BUY');
-  const candidates = rows.filter(isBuyCandidate);
-  const reasons = [
-    reasonCount(
-      Math.max(0, candidates.length - qualifiedVisibleCount),
-      'qualified but ranked outside the visible top picks',
-    ),
-    reasonCount(rows.filter(rowProviderCritical).length, 'with provider data unavailable'),
-    reasonCount(rows.filter(rowStale).length, 'with stale or insufficient fresh bars'),
-    reasonCount(
-      rows.filter((row) => row.readiness_hard_stop === true).length,
-      'blocked by readiness hard-stops',
-    ),
-    reasonCount(
-      rows.filter((row) => row.gate_passed === false && row.decision_signal === 'BUY').length,
-      'BUY setup(s) rejected by trade gates',
-    ),
-    reasonCount(
-      buySignals.filter((row) => row.is_buy_candidate === false).length,
-      'BUY setup(s) below the candidate selector',
-    ),
-    reasonCount(
-      rows.filter((row) => (row.evidence_grade ?? '').toLowerCase() === 'weak').length,
-      'with weak evidence',
-    ),
-    reasonCount(
-      rows.filter((row) => {
-        const confidence = rowConfidence(row);
-        return confidence != null && confidence < 50;
-      }).length,
-      'with low confidence',
-    ),
-  ].filter((reason): reason is string => Boolean(reason));
-
-  if (!buySignals.length) {
-    reasons.push('no qualifying BUY signal was present');
-  }
-
-  return [...new Set(reasons)].slice(0, 3);
-}
-
-function describeCandidateScarcity(
-  rows: ScanResult[],
-  label: 'stock' | 'crypto',
-  qualifiedCount: number,
-): string {
-  const symbolSingular = label === 'crypto' ? 'crypto symbol' : 'stock symbol';
-  const symbolPlural = label === 'crypto' ? 'crypto symbols' : 'stock symbols';
-  if (!rows.length) {
-    return `No ${symbolPlural} were scanned. Run a scan or check the ${label} universe configuration.`;
-  }
-  const candidates = rows.filter(isBuyCandidate);
-  const heldBack = candidates.filter((row) => row.readiness_hard_stop === true);
-  const staleCount = rows.filter(rowStale).length;
-  const providerCritical = rows.filter(rowProviderCritical).length;
-
-  if (candidates.length && heldBack.length === candidates.length) {
-    const reason = heldBack[0]?.readiness_reason?.trim();
-    const detail =
-      reason && reason.length
-        ? reason.replace(/^Hard stop:\s*/i, '')
-        : staleCount === rows.length
-          ? `market data is stale for all ${rows.length} ${label}s`
-          : 'safety gates are active';
-    return `${formatCount(candidates.length, `${label} buy candidate`)} held back: ${detail}. They reappear once fresh market data returns.`;
-  }
-
-  if (providerCritical === rows.length || staleCount === rows.length) {
-    return `Market data for all ${formatCount(rows.length, symbolSingular, symbolPlural)} is stale or unavailable right now (provider critical or bars beyond ${FRESH_BAR_MAX_MINUTES}m). Candidates return when fresh data is available.`;
-  }
-
-  const opening =
-    qualifiedCount === 0
-      ? `No ${label} buy candidates qualified from ${formatCount(rows.length, symbolSingular, symbolPlural)}.`
-      : `Only ${formatCount(qualifiedCount, `${label} buy candidate`)} qualified from ${formatCount(
-          rows.length,
-          symbolSingular,
-          symbolPlural,
-        )}.`;
-  const reasons = scarcityReasons(rows, qualifiedCount);
-  if (!reasons.length) {
-    return `${opening} The remaining scanned symbols did not pass the BUY-candidate selector.`;
-  }
-  return `${opening} Likely blockers: ${reasons.join('; ')}.`;
+function rowHasContextQualityWarning(row: ScanResult): boolean {
+  return rowProviderCritical(row) || hasBadFreshnessFlags(row.freshness_flags);
 }
 
 function officialTopPicks(
@@ -133,32 +36,13 @@ function officialTopPicks(
   topFromRun: ScanResult[] | undefined,
   assetType: 'stock' | 'crypto',
 ): ScanResult[] {
-  const source =
-    topFromRun?.length
-      ? topFromRun
-      : results
-          .filter((row) => row.asset_type === assetType && row.is_top_pick)
-          .sort((left, right) => (left.selection_rank ?? 999) - (right.selection_rank ?? 999));
+  const source = topFromRun?.length
+    ? topFromRun
+    : results
+        .filter((row) => row.asset_type === assetType && row.is_top_pick)
+        .sort((left, right) => (left.selection_rank ?? 999) - (right.selection_rank ?? 999));
 
   return source.filter((row) => isProductionSurfaceRow(row) && isBuyCandidate(row));
-}
-
-/**
- * When no executable picks exist (e.g. the market is closed and stock bars are stale),
- * still surface the last-session ranked buy candidates as READ-ONLY reference so the
- * product surface is not blank. These cards remain non-executable: each DecisionCard gates its
- * own Preview/Place on the backend hard-stop/eligibility, so nothing here bypasses safety.
- */
-function referenceCandidates(results: ScanResult[], assetType: 'stock' | 'crypto'): ScanResult[] {
-  return results
-    .filter((row) => row.asset_type === assetType && isProductionSurfaceRow(row) && isBuyCandidate(row))
-    .sort((left, right) => {
-      const rankLeft = left.selection_rank ?? 999;
-      const rankRight = right.selection_rank ?? 999;
-      if (rankLeft !== rankRight) return rankLeft - rankRight;
-      return (right.upside_probability_pct ?? 0) - (left.upside_probability_pct ?? 0);
-    })
-    .slice(0, 5);
 }
 
 function candidateKey(row: ScanResult): string {
@@ -173,20 +57,75 @@ function paperActionAllowed(
   return evaluatePaperActionGate({ result, decision, automation }).allowed;
 }
 
-function readOnlySetups(
-  official: ScanResult[],
-  results: ScanResult[],
-  assetType: 'stock' | 'crypto',
-  actionable: ScanResult[],
-  decisionsBySymbol: Map<string, DecisionRow>,
+const HELD_BACK_PREVIEW_LIMIT = 3;
+
+function heldBackReason(
+  result: ScanResult,
+  decision: DecisionRow | null | undefined,
   automation: AutomationStatusResponse | null | undefined,
-): ScanResult[] {
-  const actionableKeys = new Set(actionable.map(candidateKey));
-  const heldBackOfficial = official.filter((row) => !actionableKeys.has(candidateKey(row)));
-  if (heldBackOfficial.length) return heldBackOfficial;
-  if (actionable.length) return [];
-  return referenceCandidates(results, assetType).filter(
-    (row) => !paperActionAllowed(row, decisionsBySymbol.get(row.ticker), automation),
+): string {
+  // Prefer the scanner's own verdict so the Decision page and Proof agree.
+  const readiness = String(result.readiness_reason ?? '').trim();
+  if (readiness && !/^actionable/i.test(readiness)) return readiness;
+  const gate = String(result.gate_reason ?? '').trim();
+  if (result.gate_passed === false && gate) return gate;
+  return evaluatePaperActionGate({ result, decision, automation }).reason;
+}
+
+function describeSignalMix(rows: ScanResult[]): string {
+  const counts = rows.reduce(
+    (acc, row) => {
+      const key = row.decision_signal === 'SELL' ? 'sell' : 'hold';
+      acc[key] += 1;
+      return acc;
+    },
+    { hold: 0, sell: 0 },
+  );
+  const parts: string[] = [];
+  if (counts.hold) parts.push(`${counts.hold} HOLD`);
+  if (counts.sell) parts.push(`${counts.sell} SELL`);
+  return parts.length ? ` The latest scan produced no BUY signals (${parts.join(', ')}).` : '';
+}
+
+function CandidateColumn({
+  label,
+  ariaLabel,
+  emptyTestId,
+  emptyText,
+  gridTestId,
+  picks,
+  decisionsBySymbol,
+  automation,
+}: {
+  label: string;
+  ariaLabel: string;
+  emptyTestId: string;
+  emptyText: string;
+  gridTestId: string;
+  picks: ScanResult[];
+  decisionsBySymbol: Map<string, DecisionRow>;
+  automation?: AutomationStatusResponse | null;
+}) {
+  return (
+    <section className="decision-column" role="region" aria-label={ariaLabel}>
+      <h2 className="decision-column-heading">{label}</h2>
+      {picks.length ? (
+        <div className="candidate-list" data-testid={gridTestId}>
+          {picks.map((result) => (
+            <DecisionCard
+              key={result.ticker}
+              result={result}
+              decision={decisionsBySymbol.get(result.ticker) ?? null}
+              automation={automation}
+            />
+          ))}
+        </div>
+      ) : (
+        <p className="muted decision-column-empty" data-testid={emptyTestId}>
+          {emptyText}
+        </p>
+      )}
+    </section>
   );
 }
 
@@ -197,6 +136,8 @@ export function DecisionGrid({
   decisions,
   automation,
   decisionsError,
+  scanStale = false,
+  coverageIncomplete = false,
 }: {
   results: ScanResult[];
   topStocks?: ScanResult[];
@@ -204,6 +145,8 @@ export function DecisionGrid({
   decisions: DecisionRow[];
   automation?: AutomationStatusResponse | null;
   decisionsError?: string | null;
+  scanStale?: boolean;
+  coverageIncomplete?: boolean;
 }) {
   const productionResults = useMemo(
     () => results.filter(isProductionSurfaceRow),
@@ -227,190 +170,143 @@ export function DecisionGrid({
     () => officialTopPicks(productionResults, topCrypto, 'crypto'),
     [productionResults, topCrypto],
   );
-  const stockPicks = useMemo(
+  const stockQualified = useMemo(
     () =>
       officialStockPicks.filter((row) =>
         paperActionAllowed(row, decisionsBySymbol.get(row.ticker), automation),
       ),
     [automation, decisionsBySymbol, officialStockPicks],
   );
-  const cryptoPicks = useMemo(
+  const cryptoQualified = useMemo(
     () =>
       officialCryptoPicks.filter((row) =>
         paperActionAllowed(row, decisionsBySymbol.get(row.ticker), automation),
       ),
     [automation, decisionsBySymbol, officialCryptoPicks],
   );
-  const stockShortfall = useMemo(
-    () =>
-      describeCandidateScarcity(
-        productionResults.filter((row) => row.asset_type === 'stock'),
-        'stock',
-        stockPicks.length,
-      ),
-    [productionResults, stockPicks.length],
-  );
-  const cryptoShortfall = useMemo(
-    () =>
-      describeCandidateScarcity(
-        productionResults.filter((row) => row.asset_type === 'crypto'),
-        'crypto',
-        cryptoPicks.length,
-      ),
-    [productionResults, cryptoPicks.length],
-  );
-  const stockReadOnly = useMemo(
-    () =>
-      readOnlySetups(
-        officialStockPicks,
-        productionResults,
-        'stock',
-        stockPicks,
-        decisionsBySymbol,
-        automation,
-      ),
-    [automation, decisionsBySymbol, officialStockPicks, productionResults, stockPicks],
-  );
-  const cryptoReadOnly = useMemo(
-    () =>
-      readOnlySetups(
-        officialCryptoPicks,
-        productionResults,
-        'crypto',
-        cryptoPicks,
-        decisionsBySymbol,
-        automation,
-      ),
-    [automation, cryptoPicks, decisionsBySymbol, officialCryptoPicks, productionResults],
-  );
+  const stockPicks = stockQualified.slice(0, VISIBLE_CANDIDATE_LIMIT);
+  const cryptoPicks = cryptoQualified.slice(0, VISIBLE_CANDIDATE_LIMIT);
+  const displayedPicks = useMemo(() => [...stockPicks, ...cryptoPicks], [cryptoPicks, stockPicks]);
+  // BUY signals the scanner produced but that did not clear the paper-action
+  // gate. These explain an empty list and are the only non-displayed rows whose
+  // data quality is worth flagging here.
+  const heldBack = useMemo(() => {
+    const shown = new Set(displayedPicks.map(candidateKey));
+    const seen = new Set<string>();
+    return [...officialStockPicks, ...officialCryptoPicks, ...productionResults].filter((row) => {
+      const key = candidateKey(row);
+      if (row.decision_signal !== 'BUY' || shown.has(key) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [displayedPicks, officialCryptoPicks, officialStockPicks, productionResults]);
+  const heldBackCount = heldBack.length;
+  const bothEmpty = displayedPicks.length === 0;
+  // Data-quality warnings describe what the reader is looking at: the displayed
+  // picks, or, when the list is empty, the held-back setups (or the whole scan
+  // when there were no BUY signals at all).
+  const warningScope = displayedPicks.length
+    ? displayedPicks
+    : heldBack.length
+      ? heldBack
+      : productionResults;
+  const barsStale = warningScope.some((row) => rowBarsAreStale(row));
+  const marketDataDegraded = warningScope.some((row) => rowHasContextQualityWarning(row));
+  const warning = buildDecisionWarning({
+    killSwitchOn: automation?.kill_switch_enabled === true,
+    breakerOpen: automation?.breaker?.state === 'open',
+    scanStale,
+    barsStale,
+    coverageIncomplete,
+    marketDataDegraded,
+    heldBackCount,
+  });
+  const emptyMessage = productionResults.length
+    ? 'No qualifying buy candidates in the latest scan.'
+    : 'No scan results yet.';
+  const heldBackPreview = heldBack.slice(0, HELD_BACK_PREVIEW_LIMIT);
+  const heldBackOverflow = heldBack.length - heldBackPreview.length;
 
   return (
     <div className="decision-grid" data-testid="decision-grid">
       {decisionsError ? (
-        <p className="negative small" role="alert">
+        <p className="negative decision-load-error" role="alert">
           {decisionsError}
         </p>
       ) : null}
 
-      <section className="decision-grid-section" role="region" aria-label="Top stock buy candidates">
-        <h2 className="decision-grid-heading">Top Stock Buy Candidates</h2>
-        {stockPicks.length ? (
-          <>
-            {stockPicks.length < 3 ? (
-              <p className="muted small" role="status" data-testid="stock-sparse-state">
-                {stockShortfall}
-              </p>
-            ) : null}
-            <div className="decision-card-grid" data-testid="stock-actionable-grid">
-              {stockPicks.map((result) => (
-                <DecisionCard
-                  key={result.ticker}
-                  result={result}
-                  decision={decisionsBySymbol.get(result.ticker) ?? null}
-                  automation={automation}
-                />
-              ))}
-            </div>
-          </>
-        ) : stockReadOnly.length ? (
-          <>
-            <p className="muted small" role="status" data-testid="stock-reference-note">
-              Reference only - not executable right now. {stockShortfall}
-            </p>
-            <div className="decision-card-grid decision-readonly-grid" data-testid="stock-reference-grid">
-              {stockReadOnly.map((result) => (
-                <DecisionCard
-                  key={result.ticker}
-                  result={result}
-                  decision={decisionsBySymbol.get(result.ticker) ?? null}
-                  automation={automation}
-                />
-              ))}
-            </div>
-          </>
-        ) : (
-          <p className="muted" data-testid="stock-empty-state">
-            {stockShortfall}
-          </p>
-        )}
-        {stockPicks.length && stockReadOnly.length ? (
-          <div className="decision-readonly-setups">
-            <p className="muted small" role="status" data-testid="stock-readonly-note">
-              Read-only setup details - paper preview is blocked by current safety or freshness gates.
-            </p>
-            <div className="decision-card-grid decision-readonly-grid" data-testid="stock-readonly-grid">
-              {stockReadOnly.map((result) => (
-                <DecisionCard
-                  key={result.ticker}
-                  result={result}
-                  decision={decisionsBySymbol.get(result.ticker) ?? null}
-                  automation={automation}
-                />
-              ))}
-            </div>
-          </div>
-        ) : null}
-      </section>
+      {warning && !bothEmpty ? (
+        <p
+          className={`decision-warning${warning.tone === 'safety' ? ' decision-warning-safety' : ''}`}
+          role="status"
+          data-testid="decision-data-warning"
+        >
+          {warning.message}
+        </p>
+      ) : null}
 
-      <section className="decision-grid-section" role="region" aria-label="Top crypto buy candidates">
-        <h2 className="decision-grid-heading">Top Crypto Buy Candidates</h2>
-        {cryptoPicks.length ? (
-          <>
-            {cryptoPicks.length < 3 ? (
-              <p className="muted small" role="status" data-testid="crypto-sparse-state">
-                {cryptoShortfall}
-              </p>
-            ) : null}
-            <div className="decision-card-grid" data-testid="crypto-actionable-grid">
-              {cryptoPicks.map((result) => (
-                <DecisionCard
-                  key={result.ticker}
-                  result={result}
-                  decision={decisionsBySymbol.get(result.ticker) ?? null}
-                  automation={automation}
-                />
-              ))}
-            </div>
-          </>
-        ) : cryptoReadOnly.length ? (
-          <>
-            <p className="muted small" role="status" data-testid="crypto-reference-note">
-              Reference only - not executable right now. {cryptoShortfall}
-            </p>
-            <div className="decision-card-grid decision-readonly-grid" data-testid="crypto-reference-grid">
-              {cryptoReadOnly.map((result) => (
-                <DecisionCard
-                  key={result.ticker}
-                  result={result}
-                  decision={decisionsBySymbol.get(result.ticker) ?? null}
-                  automation={automation}
-                />
-              ))}
-            </div>
-          </>
-        ) : (
-          <p className="muted" data-testid="crypto-empty-state">
-            {cryptoShortfall}
+      {bothEmpty ? (
+        <div className="decision-empty" data-testid="decision-empty-state">
+          <p style={{ margin: 0 }}>
+            {emptyMessage}
+            {productionResults.length > 0 && heldBack.length === 0
+              ? describeSignalMix(productionResults)
+              : null}{' '}
+            {warning ? <span data-testid="decision-data-warning">{warning.message} </span> : null}
+            <Link href="/proof" data-testid="decision-proof-link">
+              See Proof
+            </Link>{' '}
+            for coverage and evidence.
           </p>
-        )}
-        {cryptoPicks.length && cryptoReadOnly.length ? (
-          <div className="decision-readonly-setups">
-            <p className="muted small" role="status" data-testid="crypto-readonly-note">
-              Read-only setup details - paper preview is blocked by current safety or freshness gates.
-            </p>
-            <div className="decision-card-grid decision-readonly-grid" data-testid="crypto-readonly-grid">
-              {cryptoReadOnly.map((result) => (
-                <DecisionCard
-                  key={result.ticker}
-                  result={result}
-                  decision={decisionsBySymbol.get(result.ticker) ?? null}
-                  automation={automation}
-                />
-              ))}
+          {heldBackPreview.length ? (
+            <div className="decision-held-back" data-testid="decision-held-back">
+              <p className="muted small" style={{ margin: '8px 0 4px' }}>
+                {heldBack.length === 1
+                  ? '1 BUY signal was held back:'
+                  : `${heldBack.length} BUY signals were held back:`}
+              </p>
+              <ul className="decision-reason-list small">
+                {heldBackPreview.map((row) => (
+                  <li key={candidateKey(row)} data-testid={`held-back-${row.ticker}`}>
+                    <strong>{row.ticker}</strong>{' '}
+                    <span className="muted">
+                      {heldBackReason(row, decisionsBySymbol.get(row.ticker), automation)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {heldBackOverflow > 0 ? (
+                <p className="muted small" style={{ margin: '4px 0 0' }}>
+                  +{heldBackOverflow} more on Proof.
+                </p>
+              ) : null}
             </div>
-          </div>
-        ) : null}
-      </section>
+          ) : null}
+        </div>
+      ) : (
+        <div className="decision-columns">
+          <CandidateColumn
+            label="Stocks"
+            ariaLabel="Stock buy candidates"
+            emptyTestId="stock-empty-state"
+            emptyText="No qualifying stocks."
+            gridTestId="stock-actionable-grid"
+            picks={stockPicks}
+            decisionsBySymbol={decisionsBySymbol}
+            automation={automation}
+          />
+          <CandidateColumn
+            label="Crypto"
+            ariaLabel="Crypto buy candidates"
+            emptyTestId="crypto-empty-state"
+            emptyText="No qualifying crypto."
+            gridTestId="crypto-actionable-grid"
+            picks={cryptoPicks}
+            decisionsBySymbol={decisionsBySymbol}
+            automation={automation}
+          />
+        </div>
+      )}
     </div>
   );
 }

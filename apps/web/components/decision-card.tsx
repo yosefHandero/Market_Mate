@@ -1,24 +1,16 @@
 'use client';
 
+import Link from 'next/link';
 import {
   cardColor,
   cardColorClass,
   confidenceScore,
   dataQualityLabel,
-  evidenceGrade,
-  formatEstimatedExit,
-  formatExpectedGrowthWindow,
-  formatInvalidationLevel,
-  formatProjectedRange,
-  formatUpsideProbability,
   isLiveForwardProven,
-  patternName,
   provenanceLabel,
-  resolveExitWindow,
-  riskLevel,
-  topReasons,
 } from '@/lib/decision-presentation';
 import { formatPaperSizing, recommendedActionLine } from '@/lib/paper-order';
+import { forecastAnchor, formatHoldingDuration, formatPaperTimestamp } from '@/lib/paper-contract';
 import { SIGNAL_DECISION_SUPPORT_DISCLAIMER } from '@/lib/signal-copy';
 import { usePaperOrder } from '@/lib/use-paper-order';
 import type { AutomationStatusResponse, DecisionRow, ScanResult } from '@/lib/types';
@@ -73,6 +65,7 @@ export function DecisionCard({
     canAct,
     previewEnabled,
     placeEnabled,
+    placed,
     recommendedAction,
     runPreview,
     runPlace,
@@ -80,139 +73,91 @@ export function DecisionCard({
 
   const blocked = actionGate.blocked;
   const color = cardColor(blocked);
-  const reasons = topReasons(result, decision);
-  const grade = evidenceGrade(result, decision);
-  const risk = riskLevel(result, decision);
-  const upside = formatUpsideProbability(result, decision);
   const confidence = confidenceScore(result, decision);
   const dataQuality = dataQualityLabel(result, decision);
-  const pattern = patternName(result, decision);
-  const exitWindow = resolveExitWindow(result, decision);
   const liveProven = isLiveForwardProven(result, decision);
   const provenance = provenanceLabel(result, decision);
   const sizing = formatPaperSizing(setup);
-  const previewDisabledReason = !previewEnabled
-    ? actionGate.reason.replace(/^Blocked:\s*/i, '')
-    : undefined;
+  const contract = receipt?.paper_contract ?? preview?.paper_contract;
   const blockedReason = actionGate.reason.replace(/^Blocked:\s*/i, '');
+  // Only a real gate block is a "reason"; a busy request is not.
+  const previewDisabledReason = !canAct ? blockedReason : undefined;
 
   return (
     <article
       className={cardColorClass(color)}
-      aria-label={`${result.ticker} buy candidate card`}
+      aria-label={`${result.ticker} buy candidate`}
       data-testid={`decision-card-${result.ticker}`}
       data-color={color}
     >
-      <header className="decision-card-header">
-        <div>
-          <h3 className="decision-card-symbol">{result.ticker}</h3>
-          <p className="muted small decision-card-asset-type">
-            {result.asset_type === 'crypto' ? 'Crypto' : 'Stock'}
-          </p>
-        </div>
-        <div className="decision-card-header-badges">
-          <span
-            className={`badge ${blocked ? 'amber' : 'green'}`}
-            data-testid="actionability-status"
-          >
-            {blocked ? 'Read-only setup' : 'Paper preview eligible'}
+      <div className="candidate-row">
+        <div className="candidate-summary">
+          <strong className="candidate-symbol">{result.ticker}</strong>
+          <span data-testid="current-price">{formatCurrency(result.price)}</span>
+          <span className="candidate-field">
+            <span className="muted">Confidence </span>
+            <span data-testid="confidence-score">{confidence}/100</span>
           </span>
-          <span
-            className={`badge ${liveProven ? 'green' : ''}`.trim()}
-            data-testid="evidence-provenance"
-            title="Whether this candidate has live paper-forward evidence or only historical evidence."
-          >
-            {provenance}
+          <span data-testid="paper-exit-method">
+            Time-based paper exit{contract ? `: ${formatHoldingDuration(contract.holding_duration_seconds)}` : ''}
           </span>
+          {blocked ? (
+            <>
+              <span className="badge red" data-testid="actionability-status">
+                Blocked
+              </span>
+              <span className="negative candidate-blocked-reason" data-testid="blocked-reason">
+                {blockedReason}
+              </span>
+            </>
+          ) : null}
         </div>
-      </header>
-
-      <div className="decision-card-metrics">
-        <Metric label="Upside probability" value={upside} testId="upside-probability" />
-        <Metric label="Confidence" value={confidence} testId="confidence-score" />
-        <Metric label="Data quality" value={dataQuality} testId="data-quality" />
-        <Metric label="Price" value={formatCurrency(result.price)} testId="current-price" />
+        <details className="candidate-details" data-testid="candidate-details">
+          <summary className="candidate-details-summary">Details</summary>
+          <div className="candidate-details-body">
+      <div className="decision-card-header-badges">
+        <span
+          className={`badge ${blocked ? 'amber' : 'green'}`}
+          data-testid={blocked ? undefined : 'actionability-status'}
+        >
+          {blocked ? 'Read-only setup' : 'Paper preview eligible'}
+        </span>
+        <span
+          className={`badge ${liveProven ? 'green' : ''}`.trim()}
+          data-testid="evidence-provenance"
+          title="Whether this candidate has live paper-forward evidence or only historical evidence."
+        >
+          {provenance}
+        </span>
       </div>
 
-      <p className="muted small decision-card-pattern" data-testid="pattern-name">
-        Pattern: {pattern} · Evidence {grade} · Risk {risk}
-      </p>
-
-      <div className="decision-card-reasons" data-testid="decision-reasons">
-        <p className="muted small" style={{ margin: '0 0 4px' }}>
-          Why (historical pattern evidence)
-        </p>
-        {reasons.length ? (
-          <ul className="decision-reason-list">
-            {reasons.map((reason) => (
-              <li key={reason}>{reason}</li>
-            ))}
-          </ul>
-        ) : (
-          <p className="muted small" style={{ margin: 0 }}>
-            No short reasons available.
-          </p>
-        )}
+      <div className="decision-card-metrics">
+        <Metric label="Data quality" value={dataQuality} testId="data-quality" />
       </div>
 
       <div className="decision-card-prediction muted small" data-testid="exit-window-block">
-        <p className="small" style={{ margin: '0 0 4px', fontWeight: 600 }}>
-          When to consider exiting
+        <p style={{ margin: '0 0 4px' }}>
+          {contract
+            ? `Closes after ${formatHoldingDuration(contract.holding_duration_seconds)} from the actual simulated fill, when a valid quote is available.`
+            : 'Holding duration is confirmed in preview and frozen when placed. Closure uses a valid quote after the saved deadline.'}
         </p>
-        <p style={{ margin: '0 0 4px' }} data-testid="expected-growth-window">
-          {formatExpectedGrowthWindow(exitWindow)}
+        <p style={{ margin: '0 0 4px' }}>
+          No active stop or target orders. Weekly probability and ranges are advisory context;
+          they do not describe the one-hour paper outcome.
         </p>
-        <p style={{ margin: '0 0 4px' }} data-testid="estimated-exit">
-          {formatEstimatedExit(exitWindow)}
+        <p style={{ margin: 0 }}>
+          <Link href={`/proof#${forecastAnchor(result.ticker)}`} data-testid="forecast-proof-link">
+            See signal reasons, confidence inputs and advisory forecasts on Proof
+          </Link>
         </p>
-        <p style={{ margin: '0 0 4px' }} data-testid="projected-range">
-          {formatProjectedRange(exitWindow)}
-        </p>
-        <p style={{ margin: '0 0 4px' }} data-testid="invalidation-level">
-          {formatInvalidationLevel(exitWindow)}
-        </p>
-        {exitWindow?.stop_growing_signal ? (
-          <p style={{ margin: '0 0 4px' }} data-testid="stop-growing-signal">
-            {exitWindow.stop_growing_signal}
-          </p>
-        ) : null}
-        {exitWindow?.stop_growing_conditions?.length ? (
-          <ul className="decision-reason-list" data-testid="stop-growing-conditions">
-            {exitWindow.stop_growing_conditions.map((condition) => (
-              <li key={condition}>{condition}</li>
-            ))}
-          </ul>
-        ) : null}
-        {exitWindow?.risk_warning ? (
-          <p className="negative small" style={{ margin: '4px 0 0' }} data-testid="risk-warning">
-            {exitWindow.risk_warning}
-          </p>
-        ) : null}
-        {exitWindow?.confidence_change_note ? (
-          <p style={{ margin: '4px 0 0' }} data-testid="confidence-change-note">
-            {exitWindow.confidence_change_note}
-          </p>
-        ) : null}
       </div>
 
       <div className="decision-card-sizing muted small">
         <p style={{ margin: '0 0 4px' }}>
-          <span className="muted">Paper size (default):</span> {sizing.notionalLabel}
-        </p>
-        <p style={{ margin: '0 0 4px' }}>
-          <span className="muted">Stop:</span> {sizing.stopLabel}
-        </p>
-        <p style={{ margin: 0 }}>
-          <span className="muted">Exit target:</span> {sizing.targetLabel}
+          <span className="muted">Paper size:</span>{' '}
+          {preview ? `${preview.qty} units; ${formatCurrency(preview.notional_estimate)} estimated notional` : sizing.notionalLabel}
         </p>
       </div>
-
-      <p
-        className={`decision-card-blocked small${blocked ? ' negative' : ' muted'}`}
-        data-testid="blocked-reason"
-      >
-        {actionGate.reason}
-      </p>
 
       <p className="muted small decision-card-action-line">
         {recommendedActionLine(recommendedAction, result.decision_signal)}
@@ -258,8 +203,10 @@ export function DecisionCard({
               className="button button-secondary"
               onClick={() => void runPlace()}
               disabled={!placeEnabled}
+              aria-disabled={!placeEnabled}
+              title={placed ? 'Dry run already recorded. Preview again to place another.' : undefined}
             >
-              {busy === 'place' ? 'Placing...' : 'Place Dry Run'}
+              {busy === 'place' ? 'Placing...' : placed ? 'Dry Run Recorded' : 'Place Dry Run'}
             </button>
           ) : null}
         </div>
@@ -277,6 +224,10 @@ export function DecisionCard({
             </div>
             <div>
               <span className="muted">Est. cost:</span> {formatCurrency(preview.notional_estimate)}
+            </div>
+            <div>
+              <span className="muted">Agreed exit:</span>{' '}
+              {preview.paper_contract ? `Time-based; ${formatHoldingDuration(preview.paper_contract.holding_duration_seconds)} from fill` : 'Contract unavailable; preview again after updating the scanner.'}
             </div>
             {(preview.reject_reasons?.length ?? 0) > 0 ? (
               <div className="negative">
@@ -303,6 +254,19 @@ export function DecisionCard({
             <div>
               <span className="muted">Audit id:</span> {receipt.execution_audit_id ?? '--'}
             </div>
+            {receipt.ok ? (
+              <>
+                <div><span className="muted">Actual simulated fill:</span> {formatCurrency(receipt.fill_price)} at {formatPaperTimestamp(receipt.filled_at)}</div>
+                <div><span className="muted">Saved exit deadline:</span> {formatPaperTimestamp(receipt.exit_due_at)}</div>
+              </>
+            ) : null}
+            {receipt.ok ? (
+              <div>
+                <Link href="/proof#paper-ledger" data-testid="receipt-ledger-link">
+                  Track this position in the Proof ledger
+                </Link>
+              </div>
+            ) : null}
           </div>
         </details>
       ) : null}
@@ -312,6 +276,9 @@ export function DecisionCard({
       <p className="muted small decision-card-disclaimer">
         Paper only. {SIGNAL_DECISION_SUPPORT_DISCLAIMER}
       </p>
+          </div>
+        </details>
+      </div>
     </article>
   );
 }

@@ -123,6 +123,7 @@ function scanResult(overrides: Partial<ScanResult>): ScanResult {
     data_grade: 'decision',
     execution_eligibility: 'eligible',
     decision_signal: 'BUY',
+    is_buy_candidate: true,
     explanation: 'Momentum and relative strength are aligned.',
     price: 100,
     price_change_pct: 2.4,

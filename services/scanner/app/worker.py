@@ -12,6 +12,7 @@ from typing import Callable
 from app.config import get_settings
 from app.dependencies import coinbase_market_data_service, scheduler_service
 from app.logging_utils import configure_logging
+from app.services.runtime_identity import log_runtime_identity
 
 
 WORKER_PID_FILE = Path(__file__).resolve().parent.parent / "var" / "run" / "worker.pid"
@@ -275,6 +276,10 @@ async def _worker_heartbeat_loop() -> None:
 
 async def main() -> None:
     configure_logging()
+    settings = get_settings()
+    log_runtime_identity("worker")
+    if settings.runtime_verification_mode:
+        scheduler_service.stop()
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
     previous_break_handler = None
@@ -288,13 +293,19 @@ async def main() -> None:
         _worker_heartbeat_loop(),
         name="scheduler-worker-heartbeat",
     )
-    if coinbase_market_data_service.enabled:
+    if coinbase_market_data_service.enabled and not settings.runtime_verification_mode:
         market_data_task = asyncio.create_task(
             coinbase_market_data_service.run_forever(),
             name="coinbase-advanced-trade-ws-worker",
         )
     try:
-        await scheduler_service.run_forever()
+        if settings.runtime_verification_mode:
+            # Keep the worker liveness signal without any provider/maintenance
+            # tasks. In particular, a disabled scheduler normally does maintain
+            # outcomes; that work must not bypass a verification request budget.
+            await asyncio.Event().wait()
+        else:
+            await scheduler_service.run_forever()
     finally:
         if previous_break_handler is not None:
             signal.signal(signal.SIGBREAK, previous_break_handler)

@@ -10,17 +10,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 import app.services.learned_inputs as learned_inputs_module
 from app.brain.calibration import ReliabilityBin, reliability_map_to_payload
-from app.brain.identity import learned_artifact_identity
+from app.brain.identity import decision_fingerprint, learned_artifact_identity
+from app.brain.policies.hybrid import HybridLegacyPolicy
 from app.brain.policies.weekly import weekly_learned_artifacts_payload
 from app.brain.weekly_backtest import PatternBacktestStats
 from app.config import Settings
 from app.db import Base
 from app.models.scan import EvidenceCampaignORM
+from app.services.evidence_campaign import EvidenceCampaignService
 from app.services.learned_inputs import LearnedInputService
 
 
@@ -133,6 +135,91 @@ class LearnedInputPinningTests(unittest.TestCase):
             bundle.extra_stats[("uptrend_ma_stack", "stock", "historical")].sample_size,
             41,
         )
+
+    def test_policy_version_rotation_keeps_pinned_artifact_after_restart(self) -> None:
+        pinned_maps = {
+            "stock": [
+                ReliabilityBin(low=50.0, high=100.0, realized_rate_pct=61.0, count=41)
+            ]
+        }
+        pinned_stats = {
+            ("uptrend_ma_stack", "stock", "historical"): PatternBacktestStats(
+                pattern_name="uptrend_ma_stack",
+                sample_size=41,
+                hit_rate_pct=61.0,
+                avg_forward_return_pct=1.1,
+            )
+        }
+        pinned_identity = learned_artifact_identity(
+            artifact_type="weekly_probability_inputs",
+            content_payload=weekly_learned_artifacts_payload(
+                reliability_maps=pinned_maps,
+                extra_stats=pinned_stats,
+            ),
+            reference_payload={"run_id": "wf-pinned"},
+        )
+        artifact_hash = pinned_identity["content_hash"]
+        payload = json.dumps(pinned_identity, sort_keys=True)
+        current = HybridLegacyPolicy(learned_artifacts_fingerprint=artifact_hash)
+        previous_fingerprint = decision_fingerprint(
+            policy_id=current.policy_id,
+            policy_version="hybrid-v4.2",
+            config_payload=current.config_payload(),
+            learned_artifacts={"session_weekly_inputs": artifact_hash},
+        )
+        self.assertNotEqual(previous_fingerprint, current.fingerprint())
+        settings = Settings(_env_file=None)
+        campaigns = EvidenceCampaignService(settings=settings, session_factory=self.SessionLocal)
+        first = campaigns.get_or_create_active_campaign(
+            effective_policy_id="hybrid_legacy",
+            effective_policy_version="hybrid-v4.2",
+            effective_decision_fingerprint=previous_fingerprint,
+            learned_artifacts_fingerprint=artifact_hash,
+            learned_artifacts_json=payload,
+        )
+        rotated = campaigns.get_or_create_active_campaign(
+            effective_policy_id="hybrid_legacy",
+            effective_policy_version="hybrid-v4.3",
+            effective_decision_fingerprint=current.fingerprint(),
+            learned_artifacts_fingerprint=artifact_hash,
+            learned_artifacts_json=None,
+        )
+        self.assertNotEqual(first.campaign_id, rotated.campaign_id)
+        self.assertEqual(rotated.effective_policy_version, "hybrid-v4.3")
+        self.assertEqual(rotated.effective_decision_fingerprint, current.fingerprint())
+        self.assertNotEqual(rotated.effective_decision_fingerprint, previous_fingerprint)
+        self.assertEqual(rotated.learned_artifacts_fingerprint, artifact_hash)
+        self.assertEqual(rotated.learned_artifacts_json, payload)
+
+        def serving_bundle():
+            service = LearnedInputService(
+                settings=settings,
+                repository=FakeRepository(),  # type: ignore[arg-type]
+                walk_forward_repository=FakeWalkForwardRepository(),  # type: ignore[arg-type]
+                session_factory=self.SessionLocal,
+            )
+            with patch.object(learned_inputs_module, "engine", self.engine):
+                return service.load_for_serving()
+
+        first_load = serving_bundle()
+        restarted = serving_bundle()
+        self.assertEqual(first_load.fingerprint, artifact_hash)
+        self.assertEqual(restarted.fingerprint, artifact_hash)
+        self.assertEqual(
+            restarted.extra_stats[("uptrend_ma_stack", "stock", "historical")].sample_size,
+            41,
+        )
+        self.assertEqual(
+            reliability_map_to_payload(restarted.reliability_maps["stock"])[0]["realized_rate_pct"],
+            61.0,
+        )
+        with self.SessionLocal() as session:
+            closed = session.execute(
+                select(EvidenceCampaignORM).where(EvidenceCampaignORM.status == "closed")
+            ).scalars().one()
+        self.assertEqual(closed.effective_policy_version, "hybrid-v4.2")
+        self.assertEqual(closed.learned_artifacts_fingerprint, artifact_hash)
+        self.assertEqual(closed.learned_artifacts_json, payload)
 
 
 if __name__ == "__main__":

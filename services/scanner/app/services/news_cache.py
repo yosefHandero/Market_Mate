@@ -1,48 +1,35 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-import json
+import math
+import time
 
 from app.config import get_settings
+from app.services.provider_coordination import ProviderCoordination, content_key
 
 
 class NewsCacheService:
     def __init__(self) -> None:
         self.settings = get_settings()
-        self.settings.cache_dir_path.mkdir(parents=True, exist_ok=True)
-        self.cache_file = self.settings.cache_dir_path / "news_cache.json"
+        self.coordination = ProviderCoordination(self.settings.cache_dir_path)
 
-    def _load(self) -> dict:
-        if not self.cache_file.exists():
-            return {}
-        try:
-            return json.loads(self.cache_file.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-    def _save(self, data: dict) -> None:
-        self.cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    def _key(self, ticker: str) -> str:
+        # Legacy JSON can contain failures encoded as neutral; leave it intact
+        # and exclude it from the new success-only cache.
+        return content_key(["combined-news-v2", ticker.upper(), self.settings.marketaux_api_token,
+                            self.settings.finnhub_api_key, "en", 10, 7])
 
     def get(self, ticker: str) -> tuple[float | None, str | None]:
-        data = self._load()
-        item = data.get(ticker)
-        if not item:
+        item = self.coordination.read_cache(self._key(ticker))
+        if item is None:
             return None, None
-
-        checked_at = datetime.fromisoformat(item["checked_at"])
-        age = datetime.now(timezone.utc) - checked_at
-        if age > timedelta(minutes=self.settings.news_cache_minutes):
-            return None, None
-
-        age_minutes = int(age.total_seconds() // 60)
+        age_minutes = max(0, int((time.time() - item["checked_at"]) // 60))
         label = f"Cached news from {age_minutes} minute(s) ago"
         return float(item["sentiment_score"]), label
 
     def set(self, ticker: str, sentiment_score: float) -> None:
-        data = self._load()
-        data[ticker] = {
+        if sentiment_score is None or not math.isfinite(sentiment_score):
+            raise ValueError("Only successful finite sentiment results may be cached")
+        self.coordination.write_cache(self._key(ticker), {
             "sentiment_score": sentiment_score,
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self._save(data)
+            "checked_at": time.time(),
+        }, self.settings.news_cache_minutes * 60)

@@ -5,7 +5,7 @@ import { render, screen } from '@testing-library/react';
 import React from 'react';
 import { describe, expect, it } from 'vitest';
 import { EvidenceTracksPanel } from '@/components/evidence-tracks-panel';
-import type { EvidenceTrackDescriptor } from '@/lib/types';
+import type { EvidenceTrackDescriptor, WeeklyEvidenceProgress } from '@/lib/types';
 
 const contract: EvidenceTrackDescriptor[] = [
   {
@@ -25,6 +25,11 @@ const contract: EvidenceTrackDescriptor[] = [
 ];
 
 describe('EvidenceTracksPanel', () => {
+  it('labels totals across campaigns without implying current campaign evidence', () => {
+    render(<EvidenceTracksPanel evidence={{ live_forward_samples: 100, min_live_forward_samples: 20, out_of_sample_samples: 5, min_out_of_sample_samples: 10, historical_samples: 500, min_historical_samples: 30, backfilled_replay_samples: 400, min_backfilled_replay_samples: 20, trust_sample_gate_met: false, calibration_sample_gate_met: true } as WeeklyEvidenceProgress} />);
+    expect(screen.getByText(/Historical totals across all campaigns/)).toHaveTextContent('not current-campaign counts');
+    expect(screen.getByTestId('trust-sample-gate')).toHaveTextContent('Real-money trust blocked');
+  });
   it('renders the shared evidence contract legend with pilot-eligibility labels', () => {
     render(<EvidenceTracksPanel evidence={null} contract={contract} />);
     expect(screen.getByTestId('evidence-contract-legend')).toBeInTheDocument();

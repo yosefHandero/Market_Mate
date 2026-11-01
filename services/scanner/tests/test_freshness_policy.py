@@ -6,6 +6,8 @@ from app.core.freshness_policy import (
     enrich_scan_run_freshness,
     row_has_bad_freshness_flags,
     row_is_bar_stale,
+    row_is_severely_stale,
+    row_is_unusable_or_stale,
     unified_bar_freshness_max_age_minutes,
     unified_freshness_max_age_minutes,
 )
@@ -48,6 +50,25 @@ class FreshnessPolicyTests(unittest.TestCase):
         # while scan-run freshness still uses the tighter health_max_stale_minutes (30m).
         settings = Settings(health_max_stale_minutes=30, provider_max_bar_age_minutes=45)
         self.assertFalse(row_is_bar_stale(_row_with_bar_age(31), settings))
+
+    def test_missing_directional_news_does_not_make_fresh_bars_stale(self) -> None:
+        settings = Settings(health_max_stale_minutes=30, provider_max_bar_age_minutes=45)
+        row = _row_with_bar_age(6)
+        row.freshness_flags = {"market_bars": "ok", "directional_news": "missing"}
+        row.provider_status = "critical"
+        self.assertTrue(row_has_bad_freshness_flags(row))
+        self.assertFalse(row_is_bar_stale(row, settings))
+        self.assertFalse(row_is_severely_stale(row, settings))
+        self.assertFalse(row_is_unusable_or_stale(row, settings))
+
+    def test_old_bars_remain_stale_without_news_flags(self) -> None:
+        settings = Settings(health_max_stale_minutes=30, provider_max_bar_age_minutes=45)
+        stale = _row_with_bar_age(50)
+        severe = _row_with_bar_age(400)
+        self.assertTrue(row_is_bar_stale(stale, settings))
+        self.assertFalse(row_is_severely_stale(stale, settings))
+        self.assertTrue(row_is_unusable_or_stale(stale, settings))
+        self.assertTrue(row_is_severely_stale(severe, settings))
 
     def test_ws_override_flag_is_healthy(self) -> None:
         row = _row_with_bar_age(5)

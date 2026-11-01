@@ -304,6 +304,22 @@ export function formatExpectedGrowthWindow(window: ExitWindow | null): string {
   return `Expected growth window: ${window.expected_growth_window_label}`;
 }
 
+export function formatHoldingWindow(window: ExitWindow | null): string {
+  const label = window?.expected_growth_window_label?.trim();
+  return label || 'Unavailable';
+}
+
+export function formatCompactTargetStop(window: ExitWindow | null): string {
+  if (!window) return 'Target pending / Stop pending';
+  const target =
+    window.estimated_exit_price == null
+      ? 'pending'
+      : formatCurrencyValue(window.estimated_exit_price);
+  const stop =
+    window.invalidation_level == null ? 'pending' : formatCurrencyValue(window.invalidation_level);
+  return `Target ${target} / Stop ${stop}`;
+}
+
 export function formatEstimatedExit(window: ExitWindow | null): string {
   if (!window || window.estimated_exit_price == null) {
     return 'Estimated stop-growing point: pending';

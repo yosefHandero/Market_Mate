@@ -116,7 +116,7 @@ describe('OperatorActions', () => {
     vi.stubGlobal('fetch', fetchMock);
     renderOperatorActions();
     await user.click(screen.getByRole('button', { name: 'Run scan now' }));
-    expect(await screen.findByText('Scan completed: 20 results')).toBeInTheDocument();
+    expect(await screen.findByText(/Scan finished: 20 results\. Coverage and freshness are on Proof\./)).toBeInTheDocument();
     expect(refreshMock).toHaveBeenCalledOnce();
   });
 

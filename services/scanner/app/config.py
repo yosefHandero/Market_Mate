@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     read_api_token: str = ""
     admin_api_token: str = ""
     startup_check_timeout_seconds: int = 5
+    # Read-only operational verification: no startup repairs, scans, outcome
+    # catch-up or worker WebSocket stream. Does not affect decision identity.
+    runtime_verification_mode: bool = False
     health_max_stale_minutes: int = 30
     stale_signal_max_age_minutes: int = 10
     signal_buy_threshold: float = 52.0
@@ -254,6 +257,8 @@ class Settings(BaseSettings):
     )
     marketdata_options_enabled: bool = False
     marketaux_api_token: str = ""
+    # Optional local UTC-day cap, not an assertion about the account allowance.
+    marketaux_daily_attempt_budget: int | None = Field(default=None, ge=0)
     finnhub_api_key: str = ""
     polygon_api_key: str = ""
     polygon_base_url: str = "https://api.polygon.io"

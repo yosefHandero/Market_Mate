@@ -52,13 +52,24 @@ def row_is_bar_stale(row: ScanResult, settings: Settings) -> bool:
 
 
 def row_is_severely_stale(row: ScanResult, settings: Settings) -> bool:
+    """True only when the stored bar age itself is severely old.
+
+    Missing directional news and other context flags are data-quality warnings.
+    They do not make a fresh bar stale.
+    """
     age = row_bar_age_minutes(row)
-    severe = unified_severe_stale_minutes(settings)
-    return (age is not None and age > severe) or row_has_bad_freshness_flags(row)
+    if age is None:
+        return False
+    return age > unified_severe_stale_minutes(settings)
 
 
 def row_is_unusable_or_stale(row: ScanResult, settings: Settings) -> bool:
-    return row_is_bar_stale(row, settings) or row_has_bad_freshness_flags(row)
+    """True when bar age is missing or older than the bar-freshness threshold.
+
+    Context flags stay on ``row_has_bad_freshness_flags`` so readiness reporting
+    does not collapse news or provider gaps into staleness.
+    """
+    return row_is_bar_stale(row, settings)
 
 
 def enrich_scan_run_freshness(

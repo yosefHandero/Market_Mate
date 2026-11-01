@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import sys
 import types
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 if "yahooquery" not in sys.modules:
     yahooquery_stub = types.ModuleType("yahooquery")
@@ -12,11 +12,30 @@ if "yahooquery" not in sys.modules:
     sys.modules["yahooquery"] = yahooquery_stub
 
 from app.http_client import ProviderRequestError
+from app.config import get_settings
 from app.schemas import GateCheck, ScanResult
 from app.services.scanner import ScannerService
 
 
 class ScannerServiceHardeningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        settings = get_settings()
+        for name in ("watchlist", "crypto_watchlist", "alpaca_api_key", "alpaca_api_secret", "polygon_api_key"):
+            self.addCleanup(setattr, settings, name, getattr(settings, name))
+        # Scanner orchestration always gathers these providers, including on an
+        # Alpaca failure. Keep that failure test entirely local and deterministic.
+        for target, result in (
+            ("FearGreedClient.get_index", (50, "neutral")),
+            ("CoinGeckoClient.get_market_context", {}),
+            ("BinanceClient.get_microstructure_batch", {}),
+            ("DeribitClient.get_positioning_batch", {}),
+            ("FREDClient.get_macro_snapshot", None),
+            ("DefiLlamaClient.get_macro_snapshot", None),
+        ):
+            provider_patch = patch(f"app.services.scanner.{target}", new=AsyncMock(return_value=result))
+            provider_patch.start()
+            self.addCleanup(provider_patch.stop)
+
     def _freshness_kwargs(self, *, asset_type: str) -> dict:
         return {
             "asset_type": asset_type,
@@ -36,6 +55,18 @@ class ScannerServiceHardeningTests(unittest.TestCase):
             "news_warnings": [],
         }
 
+    def test_directional_news_failure_and_partial_results_are_not_labeled_fresh(self):
+        service = ScannerService()
+        now = datetime.now(timezone.utc)
+        kwargs = self._freshness_kwargs(asset_type="stock")
+        for source, expected in (("unavailable", "missing"), ("finnhub", "fallback"),
+                                 ("marketaux", "fallback"), ("marketaux+finnhub", "ok")):
+            with self.subTest(source=source):
+                kwargs["news_source"] = source
+                flags = service._freshness_flags(item={"bars": [{"t": now.isoformat()}]},
+                                                 observed_at=now, **kwargs)
+                self.assertEqual(flags["directional_news"], expected)
+
     def _use_provider_max_bar_age(self, service: ScannerService, minutes: int) -> None:
         original_max_age = service.settings.provider_max_bar_age_minutes
         service.settings.provider_max_bar_age_minutes = minutes
@@ -43,7 +74,23 @@ class ScannerServiceHardeningTests(unittest.TestCase):
 
     def test_gate_signal_uses_shared_evidence_evaluator(self) -> None:
         service = ScannerService()
-        service.repo.calibrate_signal = MagicMock(return_value=(72.0, "60-69", "signal"))
+        service.repo.calibrate_signal_detail = MagicMock(
+            return_value=(
+                72.0,
+                "60-69",
+                "signal",
+                {
+                    "horizon": "1h",
+                    "score_band": "60-69",
+                    "source": "signal",
+                    "sample_count": 20,
+                    "win_rate": 60.0,
+                    "avg_return": 0.4,
+                    "blend_weight": 0.5,
+                    "base_score": 68.0,
+                },
+            )
+        )
         checks = [GateCheck(name="sample_size", passed=True, detail="20 vs 20")]
         service.repo.evaluate_signal_gate = MagicMock(
             return_value=SimpleNamespace(
@@ -58,7 +105,8 @@ class ScannerServiceHardeningTests(unittest.TestCase):
             signal=SimpleNamespace(decision_signal="BUY", score=68.0),
         )
 
-        self.assertEqual(gated, (72.0, "signal", True, "Shared gate passed.", checks))
+        self.assertEqual(gated[:5], (72.0, "signal", True, "Shared gate passed.", checks))
+        self.assertEqual(gated[5]["source"], "signal")
         service.repo.evaluate_signal_gate.assert_called_once_with(
             asset_type="stock",
             signal="BUY",
@@ -540,6 +588,9 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         service = ScannerService()
         service.settings.alpaca_api_key = ""
         service.settings.alpaca_api_secret = ""
+        service.settings.polygon_api_key = ""
+        service._refresh_due_signal_outcomes = AsyncMock(return_value=0)
+        service._refresh_due_prediction_snapshots = AsyncMock(return_value=0)
         with self.assertRaises(RuntimeError):
             asyncio.run(service.run_scan())
 
@@ -548,6 +599,8 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         service.settings.watchlist = "AAPL"
         service.settings.crypto_watchlist = ""
         service.settings.polygon_api_key = ""
+        service._refresh_due_signal_outcomes = AsyncMock(return_value=0)
+        service._refresh_due_prediction_snapshots = AsyncMock(return_value=0)
         service.alpaca.get_latest_bars = AsyncMock(
             side_effect=ProviderRequestError(
                 "alpaca returned HTTP 401",

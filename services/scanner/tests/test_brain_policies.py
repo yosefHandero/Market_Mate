@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from app.brain.calibration import ReliabilityBin
 from app.brain.config import HybridPolicyConfig, WeeklyPolicyConfig
 from app.brain.contracts import MarketSnapshot, SymbolSnapshot
+from app.brain.identity import decision_fingerprint
 from app.brain.policies import HybridLegacyPolicy, WeeklyProbabilityPolicy
 from app.brain.weekly_backtest import PatternBacktestStats
 from app.brain.weekly_patterns import BULLISH_PATTERN_NAMES
@@ -253,10 +254,43 @@ class HybridPolicyTests(unittest.TestCase):
             )
         )[0]
         self.assertEqual(decision.action, "BUY")
-        self.assertEqual(decision.p_up_calibrated, 71.5)
+        self.assertIsNone(decision.p_up_calibrated)
+        self.assertIsNone(decision.expected_value_pct)
+        self.assertIsNone(decision.probability_methodology)
+        self.assertEqual(decision.policy_version, "hybrid-v4.3")
         self.assertEqual(decision.exit_plan.target_price, 210.0)
         self.assertEqual(decision.exit_plan.stop_price, 194.0)
         self.assertEqual(decision.decision_fingerprint, self.policy.fingerprint())
+
+    def test_bullish_hold_abstains_without_copying_weekly_probability(self) -> None:
+        decision = self.policy.decide_all(
+            _hybrid_snapshot(
+                {
+                    "decision_signal": "HOLD",
+                    "price": 200.0,
+                    "weekly_directional_bias": "bullish",
+                    "upside_probability_pct": 64.0,
+                    "calibrated_confidence": 71.5,
+                }
+            )
+        )[0]
+        self.assertEqual(decision.action, "ABSTAIN")
+        self.assertIsNone(decision.p_up_calibrated)
+        self.assertIsNone(decision.expected_value_pct)
+        self.assertIsNone(decision.probability_methodology)
+
+    def test_version_bump_changes_fingerprint_for_the_same_artifact(self) -> None:
+        artifact_hash = "artifact-pinned"
+        current = HybridLegacyPolicy(learned_artifacts_fingerprint=artifact_hash)
+        previous = decision_fingerprint(
+            policy_id=current.policy_id,
+            policy_version="hybrid-v4.2",
+            config_payload=current.config_payload(),
+            learned_artifacts={"session_weekly_inputs": artifact_hash},
+        )
+        self.assertEqual(current.policy_version, "hybrid-v4.3")
+        self.assertNotEqual(previous, current.fingerprint())
+        self.assertEqual(current.learned_artifacts_fingerprint, artifact_hash)
 
     def test_hold_session_abstains(self) -> None:
         decision = self.policy.decide_all(

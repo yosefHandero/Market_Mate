@@ -101,11 +101,23 @@ def _humanize_key(value: str) -> str:
     return value.replace("_", " ")
 
 
+_EVIDENCE_BASIS_SUFFIX = re.compile(r"\s*Evidence basis=.*$", re.IGNORECASE | re.DOTALL)
+_BLOCKED_BY_PREFIX = re.compile(r"^blocked(?: by)?:?\s+", re.IGNORECASE)
+
+
 def _clean_gate_message(value: str | None) -> str | None:
+    """Reduce a gate reason to the sentence a reader needs.
+
+    The evidence-window provenance suffix stays available on ``gate_reason``
+    for Proof; the readiness reason only carries the failing check so it is not
+    rendered as "Blocked: Blocked by ... Evidence basis=...".
+    """
     trimmed = (value or "").strip()
     if not trimmed or trimmed.lower() == "passed":
         return None
-    return trimmed
+    trimmed = _EVIDENCE_BASIS_SUFFIX.sub("", trimmed).strip()
+    trimmed = _BLOCKED_BY_PREFIX.sub("", trimmed).strip()
+    return trimmed or None
 
 
 def _bad_freshness_entries(flags: dict[str, str] | None) -> list[tuple[str, str]]:
@@ -590,7 +602,7 @@ def _pick_readiness_reason(
     if _is_hold_gate_not_applicable(result, decision):
         return "Low actionability: HOLD signal with usable data."
 
-    if action == "blocked" or result.gate_passed is False:
+    if result.gate_passed is False:
         if _is_sample_size_only_blocked(result):
             return "Low trust: blocked only by sample size, not by a hard safety stop."
         failed = _failed_gate_checks(result)
@@ -600,6 +612,18 @@ def _pick_readiness_reason(
             or "Gate checks did not pass."
         )
         return f"Blocked: {msg}"
+
+    if action == "blocked":
+        # The evidence gate passed, so its text must not be echoed as the block
+        # reason. Name the operational blocker instead.
+        if _is_provider_critical(provider):
+            return f"Blocked: provider {provider}."
+        if bar_age is not None and bar_age > FRESH_BAR_MAX_MINUTES:
+            return f"Blocked: bars {round(bar_age)}m old."
+        bad_fresh = _first_bad_freshness_entry(flags)
+        if bad_fresh:
+            return f"Blocked: {_humanize_key(bad_fresh[0])}: {bad_fresh[1]}."
+        return "Blocked: execution eligibility is blocked by evidence or provider state."
 
     if result.decision_signal == "HOLD":
         return "Low actionability: HOLD signal with usable data."
@@ -619,7 +643,7 @@ def _pick_readiness_reason(
 
     bad_fresh = _first_bad_freshness_entry(flags)
     if bad_fresh:
-        return f"Stale data: {_humanize_key(bad_fresh[0])}: {bad_fresh[1]}."
+        return f"Data quality: {_humanize_key(bad_fresh[0])}: {bad_fresh[1]}."
 
     return "Actionable: gates passed and data is fresh."
 

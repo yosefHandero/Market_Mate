@@ -31,8 +31,10 @@ export function ProofSummaryPanel({ summary }: { summary: ProofSummary | null })
     <section className="card proof-summary-panel" aria-label="Paper loop proof summary">
       <h2 className="proof-section-title">Paper loop proof</h2>
       <p className="muted small" style={{ marginTop: 0 }}>
-        Dry-run trades, ledger P&amp;L, and audit activity. Scan fresh:{' '}
+        Historical paper ledger across campaigns and recent audit activity. Scan fresh:{' '}
         {summary.scan_fresh == null ? 'unknown' : summary.scan_fresh ? 'yes' : 'no'}.
+        {' '}Paper P/L is gross from simulated fill and close prices, separate from signal-return
+        evidence and weekly forecast accuracy. No fee-adjusted paper result is reported.
       </p>
       {summary.note ? (
         <p className="muted small" data-testid="proof-summary-note">
@@ -42,11 +44,11 @@ export function ProofSummaryPanel({ summary }: { summary: ProofSummary | null })
 
       <div className="proof-summary-grid">
         <div>
-          <span className="muted small">Realized P/L</span>
+          <span className="muted small">Gross realized P/L</span>
           <strong>{formatCurrency(ledger.total_realized_pnl)}</strong>
         </div>
         <div>
-          <span className="muted small">Unrealized P/L</span>
+          <span className="muted small">Estimated gross unrealized P/L</span>
           <strong data-testid="proof-unrealized-pnl">
             {formatCurrency(ledger.total_unrealized_pnl ?? null)}
           </strong>

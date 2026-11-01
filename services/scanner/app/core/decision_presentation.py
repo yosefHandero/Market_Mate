@@ -111,15 +111,49 @@ def build_exit_window(
 
     forward = max(1, int(forward_days))
     weeks = max(1, round(forward / 7))
-    window_label = f"~{weeks} week{'s' if weeks != 1 else ''} ({forward} trading-day horizon)"
+    structural_horizon = (
+        price_prediction.horizon_label if price_prediction is not None else None
+    )
+    weekly_horizon = (
+        weekly_prediction.horizon_label if weekly_prediction is not None else None
+    )
+    used_weekly = (
+        weekly_high is not None
+        and estimated_exit_price is not None
+        and estimated_exit_price == round(float(weekly_high), 4)
+    )
+    used_structural = (
+        structural_target is not None
+        and estimated_exit_price is not None
+        and estimated_exit_price == round(float(structural_target), 4)
+    )
+    weekly_name = weekly_horizon or f"{forward} trading days"
+    structural_name = structural_horizon or "gate horizon"
+    if used_weekly and used_structural:
+        price_source = (
+            f"tighter of weekly forecast ({weekly_name}) and structural range ({structural_name})"
+        )
+    elif used_structural:
+        price_source = f"structural range ({structural_name})"
+    elif used_weekly:
+        price_source = f"weekly forecast ({weekly_name})"
+    else:
+        price_source = "projected range"
+    window_label = (
+        f"{price_source}; ~{weeks} week{'s' if weeks != 1 else ''} "
+        f"({forward} calendar-day horizon; advisory only)"
+    )
 
     if estimated_exit_price is not None and estimated_exit_price > entry:
         stop_growing_signal = (
             f"Growth likely to slow near ${estimated_exit_price:.2f} "
-            f"(about +{((estimated_exit_price - entry) / entry) * 100:.1f}%)."
+            f"(about +{((estimated_exit_price - entry) / entry) * 100:.1f}%). "
+            f"Source: {price_source}."
         )
     else:
-        stop_growing_signal = "Growth expected to slow near the projected range high."
+        stop_growing_signal = (
+            f"Growth expected to slow near the projected range high. Source: {price_source}."
+        )
 
     sample_size = weekly_prediction.sample_size if weekly_prediction is not None else 0
     evidence_basis = weekly_prediction.evidence_basis if weekly_prediction is not None else None

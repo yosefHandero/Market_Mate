@@ -6,11 +6,12 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+import math
 from statistics import median, quantiles
 import time
 from typing import Any
 
-from sqlalchemy import and_, desc, func, inspect, or_, select, update
+from sqlalchemy import and_, case, desc, func, inspect, or_, select, update
 from sqlalchemy.exc import OperationalError
 
 from app.config import get_settings
@@ -30,6 +31,7 @@ from app.core.ranking import display_sort_key
 from app.core.signals import map_score_to_decision_signal
 from app.core.strategy_contract import build_strategy_evaluation_metadata, determine_recommended_action
 from app.db import SessionLocal, engine
+from app.services.scan_lease import ScanLeaseLost, assert_current_scan_lease
 from app.models.journal import JournalEntryORM
 from app.models.scan import (
     AutomationIntentORM,
@@ -1117,7 +1119,8 @@ class ScanRepository:
                 name="win_rate",
                 passed=(signal_win_rate or 0) >= min_win_rate,
                 detail=(
-                    f"{asset_type} win rate {signal_win_rate or 0:.2f}% vs "
+                    f"{asset_type} win rate "
+                    f"{f'{signal_win_rate:.2f}%' if signal_win_rate is not None else 'unavailable (no evaluated outcomes)'} vs "
                     f"min {min_win_rate:.2f}%"
                 ),
             ),
@@ -1125,7 +1128,8 @@ class ScanRepository:
                 name="avg_return",
                 passed=(signal_avg_return or 0) >= min_avg_return,
                 detail=(
-                    f"{asset_type} avg return {signal_avg_return or 0:.4f}% vs "
+                    f"{asset_type} avg return "
+                    f"{f'{signal_avg_return:.4f}%' if signal_avg_return is not None else 'unavailable (no evaluated outcomes)'} vs "
                     f"min {min_avg_return:.4f}%"
                 ),
             ),
@@ -1187,7 +1191,7 @@ class ScanRepository:
         raw_score: float,
         summary: SignalOutcomeSummary,
         horizon: str = "1h",
-    ) -> tuple[float, str, str]:
+    ) -> tuple[float, str, str, dict]:
         score_band = self._score_band(raw_score)
         band_bucket = next(
             (bucket for bucket in summary.by_signal_score_bucket if bucket.key == f"{signal}:{score_band}"),
@@ -1222,19 +1226,99 @@ class ScanRepository:
                 2,
             )
 
+        def inputs(
+            *,
+            source: str,
+            count: int | None,
+            win_rate: float | None,
+            avg_return: float | None,
+            weight: float | None,
+        ) -> dict:
+            return {
+                "horizon": horizon,
+                "score_band": score_band,
+                "source": source,
+                "sample_count": count,
+                "win_rate": win_rate,
+                "avg_return": avg_return,
+                "blend_weight": weight,
+                "base_score": round(raw_score, 2),
+            }
+
         if (band_count or 0) >= self.settings.calibration_min_score_band_samples and band_win_rate is not None:
             return (
                 blend(base_score=raw_score, win_rate=band_win_rate, avg_return=band_avg_return, weight=0.65),
                 score_band,
                 "score_band",
+                inputs(
+                    source="score_band",
+                    count=band_count,
+                    win_rate=band_win_rate,
+                    avg_return=band_avg_return,
+                    weight=0.65,
+                ),
             )
         if (signal_count or 0) >= self.settings.calibration_min_signal_samples and signal_win_rate is not None:
             return (
                 blend(base_score=raw_score, win_rate=signal_win_rate, avg_return=signal_avg_return, weight=0.5),
                 score_band,
                 "signal",
+                inputs(
+                    source="signal",
+                    count=signal_count,
+                    win_rate=signal_win_rate,
+                    avg_return=signal_avg_return,
+                    weight=0.5,
+                ),
             )
-        return round(raw_score, 2), score_band, "raw"
+        return (
+            round(raw_score, 2),
+            score_band,
+            "raw",
+            inputs(
+                source="raw",
+                count=signal_count,
+                win_rate=signal_win_rate,
+                avg_return=signal_avg_return,
+                weight=None,
+            ),
+        )
+
+    def calibrate_signal_detail(
+        self,
+        *,
+        asset_type: AssetType,
+        signal: DecisionSignal,
+        raw_score: float,
+        horizon: str = "1h",
+        observed_at: datetime | None = None,
+    ) -> tuple[float, str, str, dict]:
+        window = self._trust_window_bounds(observed_at=observed_at, horizon=horizon)
+        summary = self.get_signal_outcome_summary(
+            asset_type=asset_type,
+            generated_at_start=window.start,
+            generated_at_end=window.end,
+        )
+        calibrated_confidence, score_band, source, blend = self._calibrate_confidence(
+            signal=signal,
+            raw_score=raw_score,
+            summary=summary,
+            horizon=horizon,
+        )
+        if source != "raw":
+            return calibrated_confidence, score_band, source, blend
+        fallback_summary = self.get_signal_outcome_summary(
+            generated_at_start=window.start,
+            generated_at_end=window.end,
+        )
+        if fallback_summary.total_signals == summary.total_signals:
+            return calibrated_confidence, score_band, source, blend
+        return self._calibrate_confidence(
+            signal=signal,
+            raw_score=raw_score,
+            summary=fallback_summary,
+            horizon=horizon,
+        )
 
     def calibrate_signal(
         self,
@@ -1245,32 +1329,14 @@ class ScanRepository:
         horizon: str = "1h",
         observed_at: datetime | None = None,
     ) -> tuple[float, str, str]:
-        window = self._trust_window_bounds(observed_at=observed_at, horizon=horizon)
-        summary = self.get_signal_outcome_summary(
+        calibrated_confidence, score_band, source, _blend = self.calibrate_signal_detail(
             asset_type=asset_type,
-            generated_at_start=window.start,
-            generated_at_end=window.end,
-        )
-        calibrated_confidence, score_band, source = self._calibrate_confidence(
             signal=signal,
             raw_score=raw_score,
-            summary=summary,
             horizon=horizon,
+            observed_at=observed_at,
         )
-        if source != "raw":
-            return calibrated_confidence, score_band, source
-        fallback_summary = self.get_signal_outcome_summary(
-            generated_at_start=window.start,
-            generated_at_end=window.end,
-        )
-        if fallback_summary.total_signals == summary.total_signals:
-            return calibrated_confidence, score_band, source
-        return self._calibrate_confidence(
-            signal=signal,
-            raw_score=raw_score,
-            summary=fallback_summary,
-            horizon=horizon,
-        )
+        return calibrated_confidence, score_band, source
 
     def _resolve_decision_signal(self, result: ScanResultORM) -> DecisionSignal:
         return map_score_to_decision_signal(
@@ -1434,13 +1500,6 @@ class ScanRepository:
         strategy_metadata = self._strategy_metadata_from_row(result)
         calibrated_confidence = round(getattr(result, "calibrated_confidence", result.score) or result.score, 2)
         calibration_source = getattr(result, "calibration_source", "raw") or "raw"
-        if summary is not None and self._is_actionable_signal(decision_signal):
-            calibrated_confidence, _, calibration_source = self._calibrate_confidence(
-                signal=decision_signal,
-                raw_score=result.score,
-                summary=summary,
-                horizon=horizon,
-            )
         execution_eligibility = strategy_metadata.execution_eligibility
         evidence_quality = strategy_metadata.evidence_quality
         recommended_action = determine_recommended_action(
@@ -1592,6 +1651,7 @@ class ScanRepository:
         run: ScanRun,
         *,
         shadow_decisions: list | None = None,
+        champion_decisions: list | None = None,
         champion_policy_id: str = "hybrid_legacy",
         champion_fingerprint: str | None = None,
         champion_policy_version: str | None = None,
@@ -1603,6 +1663,7 @@ class ScanRepository:
                 self._save_run_once(
                     run,
                     shadow_decisions=shadow_decisions,
+                    champion_decisions=champion_decisions,
                     champion_policy_id=champion_policy_id,
                     champion_fingerprint=champion_fingerprint,
                     champion_policy_version=champion_policy_version,
@@ -1646,6 +1707,8 @@ class ScanRepository:
                 learned_artifacts_fingerprint=learned_artifacts_fingerprint,
                 learned_artifacts_json=learned_artifacts_json,
             )
+        except ScanLeaseLost:
+            raise
         except Exception:  # pragma: no cover - campaign is best-effort provenance
             logger.exception("failed to resolve evidence campaign for scan run")
             return None
@@ -1655,12 +1718,14 @@ class ScanRepository:
         run: ScanRun,
         *,
         shadow_decisions: list | None = None,
+        champion_decisions: list | None = None,
         champion_policy_id: str = "hybrid_legacy",
         champion_fingerprint: str | None = None,
         champion_policy_version: str | None = None,
         learned_artifacts_fingerprint: str | None = None,
         learned_artifacts_json: str | None = None,
     ) -> None:
+        assert_current_scan_lease()
         campaign = self._campaign_provenance(
             effective_policy_id=champion_policy_id,
             effective_policy_version=champion_policy_version,
@@ -1669,6 +1734,7 @@ class ScanRepository:
             learned_artifacts_json=learned_artifacts_json,
         )
         with SessionLocal.begin() as session:
+            assert_current_scan_lease(session)
             session.add(
                 ScanRunORM(
                     run_id=run.run_id,
@@ -1680,9 +1746,16 @@ class ScanRepository:
                     alerts_sent=run.alerts_sent,
                     fear_greed_value=run.fear_greed_value,
                     fear_greed_label=run.fear_greed_label,
+                    coverage_json=(
+                        json.dumps([row.model_dump(mode="json") for row in run.coverage])
+                        if run.coverage is not None else None
+                    ),
                 )
             )
 
+            champion_by_symbol = {
+                decision.symbol: decision for decision in (champion_decisions or [])
+            }
             for result in run.results:
                 session.add(
                     ScanResultORM(
@@ -1797,6 +1870,14 @@ class ScanRepository:
                     metadata = None
                     if getattr(result, "weekly_prediction", None) is not None:
                         metadata = result.weekly_prediction.model_dump(mode="json")
+                    champion_decision = (champion_by_symbol or {}).get(result.ticker)
+                    if champion_decision is not None:
+                        metadata = dict(metadata or {})
+                        metadata["upside_probability_pct"] = champion_decision.p_up_calibrated
+                        metadata["expected_value_pct"] = champion_decision.expected_value_pct
+                        metadata["policy_probability_methodology"] = (
+                            champion_decision.probability_methodology
+                        )
                     exit_window = getattr(result, "exit_window", None)
                     snapshot_kwargs: dict = {
                         "run_id": run.run_id,
@@ -1809,7 +1890,11 @@ class ScanRepository:
                         "range_high": prediction.range_high,
                         "horizon": getattr(prediction, "horizon", "1w"),
                         "invalidation": getattr(prediction, "invalidation", ""),
-                        "methodology": getattr(prediction, "methodology", "pattern_recognition"),
+                        "methodology": (
+                            "unavailable"
+                            if champion_decision is not None and champion_decision.p_up_calibrated is None
+                            else getattr(prediction, "methodology", "pattern_recognition")
+                        ),
                         "generated_at": result.created_at,
                         "status": "pending",
                         "sample_source": self._live_forward_sample_source(result.ticker),
@@ -1942,7 +2027,15 @@ class ScanRepository:
                 "range_high": range_high,
                 "horizon": "1w",
                 "invalidation": "",
-                "methodology": decision.probability_methodology or "weekly_probability",
+                "methodology": (
+                    decision.probability_methodology
+                    if decision.probability_methodology
+                    else (
+                        "unavailable"
+                        if decision.p_up_calibrated is None
+                        else "weekly_probability"
+                    )
+                ),
                 "generated_at": result.created_at,
                 "status": "pending" if is_buy else "rejected_no_outcome",
                 "sample_source": self._live_forward_sample_source(decision.symbol),
@@ -2143,14 +2236,17 @@ class ScanRepository:
             )
             c_brier = self._snapshot_brier_score(c_row)
             h_brier = self._snapshot_brier_score(h_row)
-            briers.append(
-                PairedOutcome(
-                    key=key,
-                    champion_return_pct=None if c_brier is None else -c_brier * 100.0,
-                    challenger_return_pct=None if h_brier is None else -h_brier * 100.0,
-                    resolution_week=resolution_week,
+            if c_brier is None or h_brier is None:
+                exclusions["missing_probability"] += 1
+            else:
+                briers.append(
+                    PairedOutcome(
+                        key=key,
+                        champion_return_pct=-c_brier * 100.0,
+                        challenger_return_pct=-h_brier * 100.0,
+                        resolution_week=resolution_week,
+                    )
                 )
-            )
         return {"returns": returns, "brier": briers, "exclusions": dict(exclusions)}
 
     def _map_run(self, run: ScanRunORM, results: list[ScanResultORM]) -> ScanRun:
@@ -2289,6 +2385,7 @@ class ScanRepository:
             alerts_sent=run.alerts_sent,
             fear_greed_value=getattr(run, "fear_greed_value", None),
             fear_greed_label=getattr(run, "fear_greed_label", None),
+            coverage=(json.loads(run.coverage_json) if run.coverage_json is not None else None),
             scan_age_minutes=scan_age_minutes,
             scan_fresh=scan_fresh,
             results=mapped_results,
@@ -2364,6 +2461,29 @@ class ScanRepository:
                 )
             return history
 
+    def _order_results_for_decision_limit(self, results: list, *, limit: int) -> list:
+        """Prefer selected rows inside the caller's limit. Never return more than limit."""
+        display_sorted = self._sort_results_for_display(results)
+        selected = [row for row in display_sorted if getattr(row, "is_top_pick", False)]
+        selected.sort(
+            key=lambda row: (
+                getattr(row, "selection_rank", None) if getattr(row, "selection_rank", None) is not None else 999,
+                getattr(row, "ticker", ""),
+            )
+        )
+        rest = [row for row in display_sorted if not getattr(row, "is_top_pick", False)]
+        seen: set[str] = set()
+        ordered: list = []
+        for row in selected + rest:
+            ticker = getattr(row, "ticker", "")
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            ordered.append(row)
+            if len(ordered) >= limit:
+                break
+        return ordered
+
     def get_latest_decisions(self, limit: int = 20) -> list[DecisionRow]:
         with SessionLocal() as session:
             latest = session.execute(
@@ -2378,7 +2498,7 @@ class ScanRepository:
                 .where(ScanResultORM.run_id == latest.run_id)
             ).scalars().all()
 
-            sorted_rows = self._sort_results_for_display(results)[:limit]
+            sorted_rows = self._order_results_for_decision_limit(results, limit=limit)
             trust_window_start, trust_window_end = self.trust_window_bounds_for(observed_at=latest.created_at)
             summaries = {
                 "stock": self.get_signal_outcome_summary(
@@ -2472,13 +2592,6 @@ class ScanRepository:
                     .order_by(desc(SignalOutcomeORM.generated_at), desc(SignalOutcomeORM.id))
                     .limit(1)
                 ).scalar_one_or_none()
-                calibrated_confidence, score_band, calibration_source = self.calibrate_signal(
-                    asset_type=getattr(row, "asset_type", self._asset_type_for_symbol(symbol)),
-                    signal=signal,
-                    raw_score=row.score,
-                    horizon=self.settings.trade_gate_horizon,
-                    observed_at=row.created_at,
-                )
             signal_window = self._trust_window_bounds(observed_at=row.created_at)
             stored_gate_passed = bool(
                 getattr(outcome_row, "gate_passed", getattr(row, "gate_passed", False))
@@ -2757,6 +2870,28 @@ class ScanRepository:
                 for row in rows
             ]
 
+    @staticmethod
+    def _paper_contract_metadata(row: PaperPositionORM, observed_at: datetime) -> dict:
+        def as_utc(value: datetime) -> datetime:
+            return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+        recorded = (
+            row.exit_method == "time_based"
+            and row.exit_due_at is not None
+            and row.holding_duration_seconds is not None
+            and row.holding_duration_seconds > 0
+            and row.holding_horizon in {"15m", "1h", "1d", "1w"}
+        )
+        if not recorded:
+            return {"contract_status": "legacy_unknown", "closure_status": "legacy_unknown", "close_delay_seconds": None}
+        due_at = as_utc(row.exit_due_at)
+        delay = max(0.0, (as_utc(row.closed_at) - due_at).total_seconds()) if row.closed_at else None
+        if row.status == "closed":
+            closure_status = "closed_late" if delay and delay > 0 else "closed"
+        else:
+            closure_status = "overdue_pending_quote" if as_utc(observed_at) >= due_at else "scheduled"
+        return {"contract_status": "recorded", "closure_status": closure_status, "close_delay_seconds": delay}
+
     def list_paper_positions(
         self,
         *,
@@ -2764,6 +2899,7 @@ class ScanRepository:
         offset: int = 0,
         status: str | None = None,
         symbol: str | None = None,
+        observed_at: datetime | None = None,
     ) -> list[PaperPositionSummary]:
         with SessionLocal() as session:
             query = select(PaperPositionORM).order_by(desc(PaperPositionORM.opened_at), desc(PaperPositionORM.id))
@@ -2791,6 +2927,15 @@ class ScanRepository:
                     closed_at=row.closed_at,
                     strategy_version=row.strategy_version,
                     confidence=row.confidence,
+                    source_run_id=row.source_run_id,
+                    policy_id=row.policy_id,
+                    policy_version=row.policy_version,
+                    decision_fingerprint=row.decision_fingerprint,
+                    holding_horizon=row.holding_horizon,
+                    holding_duration_seconds=row.holding_duration_seconds,
+                    exit_method=row.exit_method,
+                    exit_due_at=row.exit_due_at,
+                    **self._paper_contract_metadata(row, observed_at or datetime.now(timezone.utc)),
                 )
                 for row in rows
             ]
@@ -2814,11 +2959,16 @@ class ScanRepository:
         self,
         *,
         mark_prices: dict[str, float] | None = None,
+        observed_at: datetime | None = None,
     ) -> PaperLedgerSummaryResponse:
         with SessionLocal() as session:
             rows = session.execute(select(PaperPositionORM)).scalars().all()
         open_rows = [row for row in rows if (row.status or "open") == "open"]
         closed_rows = [row for row in rows if (row.status or "open") == "closed"]
+        contract_metadata = {
+            row.id: self._paper_contract_metadata(row, observed_at or datetime.now(timezone.utc))
+            for row in rows
+        }
         winning_closed = [row for row in closed_rows if float(row.realized_pnl or 0.0) > 0]
         cumulative = 0.0
         peak = 0.0
@@ -2832,7 +2982,7 @@ class ScanRepository:
         if mark_prices:
             for row in open_rows:
                 mark = mark_prices.get(row.ticker)
-                if mark is None or mark <= 0:
+                if mark is None or not math.isfinite(mark) or mark <= 0:
                     continue
                 side_multiplier = 1.0 if (row.side or "buy") == "buy" else -1.0
                 total_unrealized += (
@@ -2856,6 +3006,9 @@ class ScanRepository:
             gross_pnl_usd=round(sum(float(row.realized_pnl or 0.0) for row in closed_rows), 2),
             max_drawdown_usd=round(max_drawdown, 2),
             total_unrealized_pnl=round(total_unrealized, 2) if has_unrealized else None,
+            overdue_positions=sum(1 for row in open_rows if contract_metadata[row.id]["closure_status"] == "overdue_pending_quote"),
+            legacy_unknown_positions=sum(1 for row in rows if contract_metadata[row.id]["contract_status"] == "legacy_unknown"),
+            late_closed_positions=sum(1 for row in closed_rows if contract_metadata[row.id]["closure_status"] == "closed_late"),
         )
 
     def reconcile_paper_loop(self) -> ReconciliationReportResponse:
@@ -3028,12 +3181,22 @@ class ScanRepository:
                     expected_keys.add(audit.idempotency_key.strip())
                 if any(key in positions for key in expected_keys):
                     continue
-                fill_price = float(audit.latest_price or 0.0)
-                if fill_price <= 0:
+                # Only an actual persisted fill receipt can reconstruct a fill.
+                # Legacy preview prices/timestamps are not historical executions.
+                try:
+                    receipt = json.loads(audit.broker_payload or "{}")
+                    fill_price = float(receipt.get("fill_price") or 0.0)
+                    filled_at = datetime.fromisoformat(receipt["filled_at"])
+                except (json.JSONDecodeError, TypeError, ValueError, KeyError, AttributeError):
+                    continue
+                if not math.isfinite(fill_price) or fill_price <= 0:
+                    continue
+                if not automation._position_contract(audit, filled_at):
                     continue
                 automation.record_paper_position_from_audit(
                     audit_id=audit.id,
                     simulated_fill_price=fill_price,
+                    filled_at=filled_at,
                 )
         return self.reconcile_paper_loop()
 
@@ -3067,90 +3230,79 @@ class ScanRepository:
         *,
         observed_at: datetime | None = None,
     ) -> list[PaperPositionDueForClose]:
-        now = observed_at or datetime.now(timezone.utc)
-        horizon = self.settings.trade_gate_horizon
-        horizon_delta = {
-            "15m": timedelta(minutes=15),
-            "1h": timedelta(hours=1),
-            "1d": timedelta(days=1),
-            "1w": timedelta(days=self.settings.weekly_forward_days),
-        }[horizon]
-        due: list[PaperPositionDueForClose] = []
+        now = self._normalize_report_datetime(observed_at or datetime.now(timezone.utc))
         with SessionLocal() as session:
-            open_rows = session.execute(
+            due_rows = session.execute(
                 select(PaperPositionORM).where(
                     PaperPositionORM.status == "open",
                     PaperPositionORM.side == "buy",
+                    PaperPositionORM.exit_method == "time_based",
+                    PaperPositionORM.holding_duration_seconds > 0,
+                    PaperPositionORM.holding_horizon.in_(("15m", "1h", "1d", "1w")),
+                    PaperPositionORM.exit_due_at <= now,
                 )
             ).scalars().all()
-            for row in open_rows:
-                opened_at = row.opened_at
-                if opened_at.tzinfo is None:
-                    opened_at = opened_at.replace(tzinfo=timezone.utc)
-                if now - opened_at < horizon_delta:
-                    continue
-                due.append(
-                    PaperPositionDueForClose(
-                        id=row.id,
-                        ticker=row.ticker,
-                        asset_type=row.asset_type or "stock",
-                    )
+            return [
+                PaperPositionDueForClose(
+                    id=row.id,
+                    ticker=row.ticker,
+                    asset_type=row.asset_type or "stock",
                 )
-        return due
+                for row in due_rows
+            ]
 
     def close_open_positions_past_horizon(
         self,
         *,
         observed_at: datetime | None = None,
         market_prices: dict[str, float] | None = None,
+        market_observed_at: dict[str, datetime] | None = None,
     ) -> int:
-        """Close open BUY paper positions that exceeded the primary trade-gate horizon."""
+        """Close saved deadlines at the usable quote's actual observation time.
+
+        Missing contract terms are deliberately excluded. No missing quote is
+        substituted with an entry price, and current configuration is irrelevant.
+        """
         now = observed_at or datetime.now(timezone.utc)
-        horizon = self.settings.trade_gate_horizon
-        horizon_delta = {
-            "15m": timedelta(minutes=15),
-            "1h": timedelta(hours=1),
-            "1d": timedelta(days=1),
-            "1w": timedelta(days=self.settings.weekly_forward_days),
-        }[horizon]
+        if not market_prices:
+            return 0
         closed = 0
         with SessionLocal() as session:
-            open_rows = session.execute(
+            due_rows = session.execute(
                 select(PaperPositionORM).where(
                     PaperPositionORM.status == "open",
                     PaperPositionORM.side == "buy",
+                    PaperPositionORM.exit_method == "time_based",
+                    PaperPositionORM.holding_duration_seconds > 0,
+                    PaperPositionORM.holding_horizon.in_(("15m", "1h", "1d", "1w")),
+                    PaperPositionORM.exit_due_at <= self._normalize_report_datetime(now),
                 )
             ).scalars().all()
-            for row in open_rows:
-                opened_at = row.opened_at
-                if opened_at.tzinfo is None:
-                    opened_at = opened_at.replace(tzinfo=timezone.utc)
-                if now - opened_at < horizon_delta:
+            for row in due_rows:
+                quote = market_prices.get(row.ticker)
+                if quote is None or not math.isfinite(quote) or quote <= 0:
                     continue
-                entry_fill = float(row.simulated_fill_price or 0.0)
-                if entry_fill <= 0:
+                close_price = float(quote)
+                closed_at = (market_observed_at or {}).get(row.ticker, now)
+                comparable_close = self._normalize_report_datetime(closed_at)
+                if comparable_close < self._normalize_report_datetime(row.exit_due_at):
                     continue
-                if market_prices is not None:
-                    close_price = market_prices.get(row.ticker)
-                    if close_price is None or close_price <= 0:
-                        continue
-                    close_price = float(close_price)
-                else:
-                    close_price = entry_fill
-                with SessionLocal() as close_session:
-                    position = close_session.get(PaperPositionORM, row.id)
-                    if position is None or position.status != "open":
-                        continue
-                    quantity = float(position.quantity or 0.0)
-                    basis = float(position.cost_basis_usd or position.notional_usd or 0.0)
-                    proceeds = round(quantity * close_price, 2)
-                    position.close_price = close_price
-                    position.realized_pnl = round(proceeds - basis, 2)
-                    position.closed_at = now
-                    position.status = "closed"
-                    position.updated_at = now
-                    close_session.commit()
-                    closed += 1
+                quantity = float(row.quantity or 0.0)
+                basis = float(row.cost_basis_usd or row.notional_usd or 0.0)
+                proceeds = round(quantity * close_price, 2)
+                result = session.execute(
+                    update(PaperPositionORM)
+                    .where(PaperPositionORM.id == row.id, PaperPositionORM.status == "open")
+                    .values(
+                        close_price=close_price,
+                        realized_pnl=round(proceeds - basis, 2),
+                        closed_at=comparable_close,
+                        status="closed",
+                        updated_at=comparable_close,
+                    )
+                )
+                closed += result.rowcount
+            session.commit()
         return closed
 
     def get_portfolio_guardrail_snapshot(
@@ -3250,7 +3402,48 @@ class ScanRepository:
             getattr(SignalOutcomeORM, f"price_after_{horizon}").is_(None),
             getattr(SignalOutcomeORM, f"status_{horizon}") == "pending",
             SignalOutcomeORM.generated_at <= observed_at - self._OUTCOME_HORIZONS[horizon],
+            # Rows without a usable entry price can never produce a return;
+            # apply_signal_outcome_evaluations skips them, so keep them out of
+            # the due queue instead of letting them hold its head forever.
+            SignalOutcomeORM.entry_price > 0,
         )
+
+    def _due_signal_outcome_priority(self, observed_at: datetime) -> tuple:
+        """Trust-window rows first, then gate-relevant signals, then FIFO.
+
+        The trade gate reads only the recent trust window, so an old unresolved
+        backlog must never starve the outcomes that can open it. Evaluation
+        values are unchanged; only the processing order is.
+        """
+        window_start = observed_at - timedelta(days=self.settings.trust_recent_window_days)
+        return (
+            case((SignalOutcomeORM.generated_at >= window_start, 0), else_=1),
+            case((SignalOutcomeORM.signal.in_(("BUY", "SELL")), 0), else_=1),
+        )
+
+    def mark_unpriceable_signal_outcomes_missed(self, *, observed_at: datetime) -> int:
+        """Close out pending horizons on rows with no usable entry price.
+
+        Such rows (for example symbols whose price rounded to 0) cannot be
+        evaluated, so leaving them pending only inflates due counts.
+        """
+        evaluated_at = self._outcome_query_time(observed_at)
+        updated = 0
+        with SessionLocal() as session:
+            for horizon in self._OUTCOME_HORIZONS:
+                status_column = getattr(SignalOutcomeORM, f"status_{horizon}")
+                result = session.execute(
+                    update(SignalOutcomeORM)
+                    .where(
+                        status_column == "pending",
+                        or_(SignalOutcomeORM.entry_price.is_(None), SignalOutcomeORM.entry_price <= 0),
+                    )
+                    .values({f"status_{horizon}": "missed", f"evaluated_at_{horizon}": evaluated_at})
+                )
+                updated += int(result.rowcount or 0)
+            if updated:
+                session.commit()
+        return updated
 
     def list_due_signal_outcome_evaluations(
         self,
@@ -3260,17 +3453,22 @@ class ScanRepository:
         exclude_ids: set[int] | None = None,
     ) -> list[PendingSignalOutcomeEvaluation]:
         batch_limit = limit or self.settings.outcome_evaluation_batch_limit
+        query_time = self._outcome_query_time(observed_at)
         with SessionLocal() as session:
             rows = session.execute(
                 select(SignalOutcomeORM)
                 .where(
                     or_(
-                        *(self._pending_signal_horizon_filter(horizon, self._outcome_query_time(observed_at))
+                        *(self._pending_signal_horizon_filter(horizon, query_time)
                           for horizon in self._OUTCOME_HORIZONS)
                     ),
                     SignalOutcomeORM.id.not_in(exclude_ids or ()),
                 )
-                .order_by(SignalOutcomeORM.generated_at, SignalOutcomeORM.id)
+                .order_by(
+                    *self._due_signal_outcome_priority(query_time),
+                    SignalOutcomeORM.generated_at,
+                    SignalOutcomeORM.id,
+                )
                 .limit(batch_limit)
             ).scalars().all()
 
@@ -4387,8 +4585,13 @@ class ScanRepository:
                     PredictionSnapshotORM.invalidation_level,
                 ]
             )
+        active_campaign = (
+            self._active_campaign_id()
+            if self._has_provenance_columns() and self._has_policy_columns()
+            else None
+        )
         with SessionLocal() as session:
-            rows = session.execute(
+            query = (
                 select(*due_columns)
                 .where(
                     PredictionSnapshotORM.status == "pending",
@@ -4399,8 +4602,34 @@ class ScanRepository:
                     ) for horizon, delta in self._OUTCOME_HORIZONS.items())),
                 )
                 .order_by(PredictionSnapshotORM.generated_at, PredictionSnapshotORM.id)
-                .limit(batch_limit)
-            ).all()
+            )
+            if active_campaign is None:
+                rows = session.execute(query.limit(batch_limit)).all()
+            else:
+                # Share the existing slots, preserving FIFO within each lane.
+                # Rotation also serves every lane when the caller uses limit=1.
+                role = func.coalesce(func.nullif(PredictionSnapshotORM.decision_role, ""), "production")
+                lanes = (
+                    and_(PredictionSnapshotORM.campaign_id == active_campaign, role == "production"),
+                    and_(PredictionSnapshotORM.campaign_id == active_campaign, role == "shadow"),
+                    or_(func.coalesce(PredictionSnapshotORM.campaign_id, "") != active_campaign,
+                        role.not_in(("production", "shadow"))),
+                )
+                candidates = [session.execute(query.where(lane).limit(batch_limit)).all() for lane in lanes]
+                offsets = [0, 0, 0]
+                cursor = getattr(self, "_prediction_queue_lane", 0)
+                rows = []
+                while len(rows) < batch_limit:
+                    for step in range(len(lanes)):
+                        lane = (cursor + step) % len(lanes)
+                        if offsets[lane] < len(candidates[lane]):
+                            rows.append(candidates[lane][offsets[lane]])
+                            offsets[lane] += 1
+                            cursor = (lane + 1) % len(lanes)
+                            break
+                    else:
+                        break
+                self._prediction_queue_lane = cursor
 
             due: list[PendingPredictionEvaluation] = []
             for row in rows:
@@ -4548,13 +4777,16 @@ class ScanRepository:
                 or 0
             )
 
-    def get_live_forward_progress(self):
+    def get_live_forward_progress(self, *, now: datetime | None = None):
         """Campaign-scoped live-forward accumulation for the Proof page.
 
         Counts selected / accepted-outside-top-N / rejected snapshots and their
         resolution state for the active campaign, plus the last scan's age.
         This is transparency/completion progress, not real-money readiness."""
         from app.schemas import LiveForwardAssetProgress, LiveForwardProgress
+
+        now = now or datetime.now(timezone.utc)
+        now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
 
         if not self._has_provenance_columns():
             return LiveForwardProgress(
@@ -4584,6 +4816,10 @@ class ScanRepository:
             progress.config_fingerprint = active.config_fingerprint
             progress.strategy_version = active.strategy_version
             progress.code_commit = active.code_commit
+            progress.saved_policy_id = active.effective_policy_id
+            progress.saved_policy_version = active.effective_policy_version
+            progress.saved_decision_fingerprint = active.effective_decision_fingerprint
+            progress.saved_learned_artifacts_fingerprint = active.learned_artifacts_fingerprint
 
         if active is None:
             progress.note = "No active evidence campaign yet. Progress starts after the next scan."
@@ -4595,6 +4831,7 @@ class ScanRepository:
                 PredictionSnapshotORM.selection_status,
                 PredictionSnapshotORM.status,
                 PredictionSnapshotORM.resolved_late,
+                PredictionSnapshotORM.resolve_due_at,
             ).where(PredictionSnapshotORM.campaign_id == active.campaign_id)
             if self._has_policy_columns():
                 query = query.where(
@@ -4619,6 +4856,13 @@ class ScanRepository:
             if selection != "rejected":
                 if row.status == "pending":
                     bucket.pending += 1
+                    if row.resolve_due_at is None:
+                        bucket.pending_due_unknown += 1
+                    else:
+                        due_at = row.resolve_due_at
+                        due_utc = due_at.replace(tzinfo=timezone.utc) if due_at.tzinfo is None else due_at.astimezone(timezone.utc)
+                        if due_utc <= now_utc:
+                            bucket.pending_due += 1
                 elif row.status not in ("rejected_no_outcome",):
                     bucket.resolved += 1
             if row.resolved_late:
@@ -4630,6 +4874,8 @@ class ScanRepository:
         progress.rejected_count = sum(b.rejected for b in progress.by_asset)
         progress.resolved_count = sum(b.resolved for b in progress.by_asset)
         progress.pending_count = sum(b.pending for b in progress.by_asset)
+        progress.pending_due_count = sum(b.pending_due for b in progress.by_asset)
+        progress.pending_due_unknown_count = sum(b.pending_due_unknown for b in progress.by_asset)
         progress.resolved_late_count = sum(b.resolved_late for b in progress.by_asset)
         return progress
 

@@ -243,6 +243,20 @@ class ScanResult(BaseModel):
     created_at: datetime
 
 
+class ScanMissingSymbol(BaseModel):
+    ticker: str
+    reason: Literal["provider_unavailable", "market_data_missing", "benchmark_only", "analysis_skipped"]
+    detail: str
+
+
+class ScanAssetCoverage(BaseModel):
+    asset_type: AssetType
+    expected_symbols: list[str]
+    returned_symbols: list[str]
+    missing_symbols: list[ScanMissingSymbol]
+    status: Literal["complete", "partial", "unavailable", "not_requested"]
+
+
 class ScanRun(BaseModel):
     run_id: str
     created_at: datetime
@@ -258,6 +272,9 @@ class ScanRun(BaseModel):
     results: list[ScanResult]
     top_stocks: list[ScanResult] = []
     top_crypto: list[ScanResult] = []
+    # Null means not recorded, particularly for legacy runs. Never reconstruct
+    # historical missing-symbol reasons from today's watchlist or providers.
+    coverage: list[ScanAssetCoverage] | None = None
 
 
 class CryptoMarketPrice(BaseModel):
@@ -315,10 +332,28 @@ class HealthResponse(BaseModel):
     request_id: str | None = None
 
 
+class PaperTradeContract(BaseModel):
+    source_run_id: str | None = None
+    policy_id: str | None = None
+    policy_version: str | None = None
+    decision_fingerprint: str | None = None
+    holding_horizon: OutcomeHorizon
+    holding_duration_seconds: int = Field(gt=0)
+    exit_method: Literal["time_based"] = "time_based"
+
+    @model_validator(mode="after")
+    def validate_duration(self) -> "PaperTradeContract":
+        seconds = {"15m": 900, "1h": 3600, "1d": 86400, "1w": 604800}
+        if self.holding_duration_seconds != seconds[self.holding_horizon]:
+            raise ValueError("holding_duration_seconds must match holding_horizon")
+        return self
+
+
 class OrderPreviewRequest(BaseModel):
     ticker: str
     side: OrderSide
-    qty: float = Field(gt=0)
+    qty: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    requested_notional_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     order_type: OrderType = "market"
     limit_price: float | None = Field(default=None, gt=0)
     preview_audit_id: int | None = None
@@ -330,6 +365,7 @@ class OrderPreviewRequest(BaseModel):
     stop_price: float | None = Field(default=None, gt=0)
     target_price: float | None = Field(default=None, gt=0)
     recommended_action_snapshot: str | None = None
+    paper_contract: PaperTradeContract | None = None
 
     @field_validator("ticker")
     @classmethod
@@ -338,6 +374,8 @@ class OrderPreviewRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_limit_order_price(self) -> "OrderPreviewRequest":
+        if (self.qty is None) == (self.requested_notional_usd is None):
+            raise ValueError("Supply either qty or requested_notional_usd")
         if self.order_type == "limit" and self.limit_price is None:
             raise ValueError("limit_price is required for limit orders")
         return self
@@ -363,12 +401,19 @@ class OrderPreviewResponse(BaseModel):
     gate_result: str | None = None
     freshness: str | None = None
     reject_reasons: list[str] = []
+    paper_contract: PaperTradeContract | None = None
 
 
 class OrderPlaceRequest(OrderPreviewRequest):
     # Paper-only build: dry_run is structurally fixed to True. A request with
     # dry_run=false is rejected at the schema boundary (422) before the service.
     dry_run: Literal[True] = True
+
+    @model_validator(mode="after")
+    def require_agreed_quantity(self) -> "OrderPlaceRequest":
+        if self.qty is None or self.requested_notional_usd is not None:
+            raise ValueError("Placement requires the explicit preview quantity")
+        return self
 
 
 class OrderPlaceResponse(BaseModel):
@@ -388,6 +433,9 @@ class OrderPlaceResponse(BaseModel):
     filled_qty: float | None = None
     slippage_assumption_bps: float | None = None
     recommended_action_snapshot: str | None = None
+    paper_contract: PaperTradeContract | None = None
+    filled_at: datetime | None = None
+    exit_due_at: datetime | None = None
 
 
 class ExecutionAuditSummary(BaseModel):
@@ -1022,6 +1070,17 @@ class PaperPositionSummary(BaseModel):
     closed_at: datetime | None = None
     strategy_version: str | None = None
     confidence: float | None = None
+    source_run_id: str | None = None
+    policy_id: str | None = None
+    policy_version: str | None = None
+    decision_fingerprint: str | None = None
+    holding_horizon: str | None = None
+    holding_duration_seconds: int | None = None
+    exit_method: Literal["time_based"] | None = None
+    exit_due_at: datetime | None = None
+    contract_status: Literal["recorded", "legacy_unknown"] = "legacy_unknown"
+    closure_status: Literal["scheduled", "overdue_pending_quote", "closed", "closed_late", "legacy_unknown"] = "legacy_unknown"
+    close_delay_seconds: float | None = None
 
 
 class PaperLedgerSummaryResponse(BaseModel):
@@ -1039,6 +1098,9 @@ class PaperLedgerSummaryResponse(BaseModel):
     gross_pnl_usd: float = 0.0
     max_drawdown_usd: float = 0.0
     total_unrealized_pnl: float | None = None
+    overdue_positions: int = 0
+    legacy_unknown_positions: int = 0
+    late_closed_positions: int = 0
 
 
 class ProofLoopMetrics(BaseModel):
@@ -1093,6 +1155,8 @@ class LiveForwardAssetProgress(BaseModel):
     rejected: int = 0
     resolved: int = 0
     pending: int = 0
+    pending_due: int = 0
+    pending_due_unknown: int = 0
     resolved_late: int = 0
 
 
@@ -1105,11 +1169,21 @@ class LiveForwardProgress(BaseModel):
     config_fingerprint: str | None = None
     strategy_version: str | None = None
     code_commit: str | None = None
+    saved_policy_id: str | None = None
+    saved_policy_version: str | None = None
+    saved_decision_fingerprint: str | None = None
+    saved_learned_artifacts_fingerprint: str | None = None
+    runtime_policy_id: str | None = None
+    runtime_policy_version: str | None = None
+    runtime_decision_fingerprint: str | None = None
+    identity_matches_saved_campaign: bool | None = None
     selected_count: int = 0
     accepted_outside_top_n_count: int = 0
     rejected_count: int = 0
     resolved_count: int = 0
     pending_count: int = 0
+    pending_due_count: int = 0
+    pending_due_unknown_count: int = 0
     resolved_late_count: int = 0
     by_asset: list[LiveForwardAssetProgress] = []
     last_scan_at: datetime | None = None
@@ -1385,6 +1459,8 @@ class PolicyPromotionReport(BaseModel):
     paired_returns_resolution_clusters: int = 0
     paired_returns_cluster_metadata_complete: bool = False
     paired_returns_superior: bool = False
+    calibration_eligible_pair_count: int = 0
+    calibration_min_pairs: int = 0
     pair_exclusion_counts: dict[str, int] = {}
     effective_champion_policy_id: str
     requested_champion_policy_id: str

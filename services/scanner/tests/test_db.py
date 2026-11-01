@@ -163,6 +163,64 @@ class SchemaMigrationTests(unittest.TestCase):
             finally:
                 engine.dispose()
 
+    def test_paper_contract_migration_preserves_legacy_values_without_backfill(self) -> None:
+        database_path = self._isolated_root / "legacy-paper.db"
+        database_url = f"sqlite:///{database_path.as_posix()}"
+        config = Config("alembic.ini")
+        config.set_main_option("sqlalchemy.url", database_url)
+        command.upgrade(config, "20260928_0024")
+        engine = create_engine(database_url)
+        self.addCleanup(engine.dispose)
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO paper_positions "
+                "(created_at, updated_at, intent_key, ticker, asset_type, side, quantity, "
+                "simulated_fill_price, notional_usd, cost_basis_usd, status, opened_at) "
+                "VALUES ('2026-09-01 12:00:00', '2026-09-01 12:00:00', 'legacy-paper', "
+                "'AAPL', 'stock', 'buy', 2, 100, 200, 200, 'open', '2026-09-01 12:00:00')"
+            ))
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            row = connection.execute(text(
+                "SELECT quantity, simulated_fill_price, opened_at, status, source_run_id, "
+                "policy_id, policy_version, decision_fingerprint, holding_horizon, "
+                "holding_duration_seconds, exit_method, exit_due_at FROM paper_positions"
+            )).one()
+        self.assertEqual(tuple(row[:4]), (2, 100, "2026-09-01 12:00:00", "open"))
+        self.assertEqual(tuple(row[4:]), (None,) * 8)
+        for column in inspect(engine).get_columns("paper_positions"):
+            if column["name"] in {
+                "source_run_id", "policy_id", "policy_version", "decision_fingerprint",
+                "holding_horizon", "holding_duration_seconds", "exit_method", "exit_due_at",
+            }:
+                self.assertTrue(column["nullable"])
+
+    def test_coverage_upgrade_preserves_legacy_scan_and_unknown_missing_reasons(self) -> None:
+        database_path = self._isolated_root / "legacy-coverage.db"
+        database_url = f"sqlite:///{database_path.as_posix()}"
+        config = Config("alembic.ini")
+        config.set_main_option("sqlalchemy.url", database_url)
+        command.upgrade(config, "20260906_0023")
+        engine = create_engine(database_url)
+        self.addCleanup(engine.dispose)
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO scan_runs (run_id, created_at, market_status, scan_count, watchlist_size) "
+                "VALUES ('historical', '2026-09-28 14:22:00', 'neutral', 67, 69)"
+            ))
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            saved = connection.execute(text(
+                "SELECT scan_count, watchlist_size, coverage_json FROM scan_runs WHERE run_id = 'historical'"
+            )).one()
+        self.assertEqual((saved.scan_count, saved.watchlist_size), (67, 69))
+        self.assertIsNone(saved.coverage_json)
+        coverage_column = next(
+            column for column in inspect(engine).get_columns("scan_runs")
+            if column["name"] == "coverage_json"
+        )
+        self.assertTrue(coverage_column["nullable"])
+
     def test_scan_save_retries_after_real_transient_sqlite_write_lock(self) -> None:
         with tempfile.TemporaryDirectory(dir=self._isolated_root) as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"

@@ -62,6 +62,7 @@ export async function fetchScannerJson<T>(path: string, init: RequestInit = {}):
       ...init,
       cache: 'no-store',
       headers,
+      signal: init.signal ?? AbortSignal.timeout(30_000),
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : 'Unknown network error.';

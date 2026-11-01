@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.config import Settings
-from app.brain.gates import buy_candidate_rank_score, row_is_buy_candidate
+from app.brain.gates import buy_candidate_rank_score
 from app.core.ranking import display_sort_key
+from app.core.paper_action import paper_action_checks
 from app.core.readiness import compute_trade_readiness
 from app.schemas import ScanResult
 
@@ -37,14 +38,8 @@ def _sort_key_for_selection(
 
 
 def _is_selectable_buy_candidate(row: ScanResult) -> bool:
-    """Buy-only, and never a hard-gated row (kill switch, breaker, critical provider,
-    severe stale). Hard-gated rows are excluded from the top picks."""
-    if not row_is_buy_candidate(row):
-        return False
-    readiness = compute_trade_readiness(row)
-    if readiness.hard_stop:
-        return False
-    return True
+    """Shortlist only BUYs the existing Decision paper-action checks allow."""
+    return all(check.passed for check in paper_action_checks(row))
 
 
 def select_top_picks(

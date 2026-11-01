@@ -170,6 +170,8 @@ async def request_json(
     url: str,
     provider: str = "external_provider",
     on_backoff: Callable[..., Awaitable[None] | None] | None = None,
+    before_attempt: Callable[[], Awaitable[None] | None] | None = None,
+    on_response: Callable[[httpx.Response], Awaitable[None] | None] | None = None,
     **kwargs: Any,
 ) -> Any:
     settings = get_settings()
@@ -177,7 +179,15 @@ async def request_json(
     max_attempts = settings.provider_retry_attempts + 1
     for attempt in range(1, max_attempts + 2):
         try:
+            if before_attempt is not None:
+                pending = before_attempt()
+                if asyncio.iscoroutine(pending):
+                    await pending
             response = await client.request(method, url, **kwargs)
+            if on_response is not None:
+                pending = on_response(response)
+                if asyncio.iscoroutine(pending):
+                    await pending
             return parse_json_response(response, provider=provider, url=url)
         except ProviderRequestError as exc:
             last_error = exc

@@ -1,10 +1,8 @@
 import type { ExecutionAuditSummary } from '@/lib/types';
+import { formatPaperTimestamp } from '@/lib/paper-contract';
 
 function formatDateTime(value: string | null | undefined): string {
-  if (!value) return '--';
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) return value;
-  return new Date(parsed).toLocaleString();
+  return formatPaperTimestamp(value);
 }
 
 export function ExecutionAuditList({ audits }: { audits: ExecutionAuditSummary[] }) {

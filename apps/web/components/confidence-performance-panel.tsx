@@ -34,8 +34,11 @@ export function ConfidencePerformancePanel({
     <section className="card" aria-label="Confidence proof">
       <h2 className="proof-section-title">Confidence proof</h2>
       <p className="muted small" style={{ marginTop: 0 }}>
-        Ranking: higher-confidence bands should outperform lower bands. Calibration: predicted
-        upside probability vs realized up-rate.
+        Signal ranking: higher-confidence bands should outperform lower bands on weekly
+        signal returns, independently of paper positions. Weekly calibration: predicted
+        weekly upside probability vs realized weekly up-rate. Neither is paper-trade P/L.
+        {' '}Ranking uses historical outcome totals across campaigns.
+        {' '}{calibration.scope === 'campaign' ? `Calibration covers current campaign ${calibration.campaign_id}.` : 'Calibration uses historical totals across all campaigns.'}
       </p>
 
       {ranking.note ? (
@@ -64,8 +67,8 @@ export function ConfidencePerformancePanel({
                 <th>Signal</th>
                 <th>N</th>
                 <th>Win%</th>
-                <th>Avg</th>
-                <th>After friction</th>
+                <th>Avg gross signal return (1w)</th>
+                <th>Cost-adjusted estimate</th>
               </tr>
             </thead>
             <tbody>
@@ -103,7 +106,7 @@ export function ConfidencePerformancePanel({
           <table className="proof-table" data-testid="confidence-calibration-table">
             <thead>
               <tr>
-                <th>Predicted band</th>
+                <th>Weekly predicted band</th>
                 <th>Asset</th>
                 <th>N</th>
                 <th>Predicted</th>

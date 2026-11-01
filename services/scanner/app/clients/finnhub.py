@@ -14,9 +14,9 @@ class FinnhubClient:
         self._client = httpx.AsyncClient(timeout=self.settings.provider_timeout_seconds)
         self._guard = AsyncProviderGuard("finnhub", pace_seconds=0.5)
 
-    async def get_news_sentiment_score(self, ticker: str) -> float:
+    async def get_news_sentiment_score(self, ticker: str) -> float | None:
         if not self.settings.finnhub_api_key:
-            return 0.0
+            return None
 
         to_date = date.today()
         from_date = to_date - timedelta(days=7)
@@ -31,11 +31,11 @@ class FinnhubClient:
             return await self._guard.cached_call(
                 key=("news_sentiment", ticker.upper(), from_date.isoformat(), to_date.isoformat()),
                 ttl_seconds=max(self.settings.news_cache_minutes * 60, 60),
-                stale_ttl_seconds=max(self.settings.news_cache_minutes * 120, 300),
+                stale_ttl_seconds=0,
                 fetcher=lambda: self._fetch_news_sentiment(ticker=ticker, params=params),
             )
         except Exception:
-            return 0.0
+            return None
 
     async def _fetch_news_sentiment(self, *, ticker: str, params: dict[str, str]) -> float:
         await self._guard.throttle()
@@ -56,6 +56,14 @@ class FinnhubClient:
             provider="finnhub",
             on_backoff=self._guard.register_backoff,
         )
+
+        if (not isinstance(news, list) or not isinstance(sentiment_payload, dict)
+                or sentiment_payload.get("error")
+                or not any(value is not None for value in (
+                    sentiment_payload.get("companyNewsScore"),
+                    (sentiment_payload.get("sentiment") or {}).get("companyNewsScore"),
+                ))):
+            raise ValueError("Finnhub sentiment inputs unavailable")
 
         company_news_score = float(sentiment_payload.get("companyNewsScore") or 0)
         article_sentiment = float(sentiment_payload.get("sentiment", {}).get("companyNewsScore") or 0)

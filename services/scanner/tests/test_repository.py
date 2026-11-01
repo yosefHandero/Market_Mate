@@ -182,7 +182,7 @@ class RepositoryCalibrationTests(unittest.TestCase):
             by_signal_score_bucket=[self._bucket("BUY:60-69", count=9, win_rate=62.0, avg_return=0.22)],
         )
 
-        calibrated, score_band, source = self.repo._calibrate_confidence(
+        calibrated, score_band, source, blend = self.repo._calibrate_confidence(
             signal="BUY",
             raw_score=68.0,
             summary=summary,
@@ -192,6 +192,8 @@ class RepositoryCalibrationTests(unittest.TestCase):
         self.assertEqual(score_band, "60-69")
         self.assertEqual(calibrated, 68.0)
         self.assertEqual(source, "raw")
+        self.assertEqual(blend["base_score"], 68.0)
+        self.assertEqual(blend["source"], "raw")
 
     def test_calibration_uses_signal_bucket_when_samples_are_mature(self) -> None:
         summary = SignalOutcomeSummary(
@@ -206,7 +208,7 @@ class RepositoryCalibrationTests(unittest.TestCase):
             by_signal_score_bucket=[self._bucket("BUY:60-69", count=10, win_rate=70.0, avg_return=0.5)],
         )
 
-        calibrated, score_band, source = self.repo._calibrate_confidence(
+        calibrated, score_band, source, blend = self.repo._calibrate_confidence(
             signal="BUY",
             raw_score=68.0,
             summary=summary,
@@ -216,6 +218,8 @@ class RepositoryCalibrationTests(unittest.TestCase):
         self.assertEqual(score_band, "60-69")
         self.assertGreater(calibrated, 68.0)
         self.assertEqual(source, "score_band")
+        self.assertEqual(blend["source"], "score_band")
+        self.assertEqual(blend["base_score"], 68.0)
 
     def test_validation_bucket_uses_configured_thresholds(self) -> None:
         rows = [
@@ -1849,6 +1853,23 @@ class WeeklyPatternResolutionTests(unittest.TestCase):
         )
         self.assertEqual(pattern_name, "range_neutral")
         self.assertIsNone(trust_blocked)
+
+
+class DecisionLimitContractTests(unittest.TestCase):
+    def test_selected_rows_stay_inside_the_limit(self) -> None:
+        repo = ScanRepository()
+        rows = [
+            SimpleNamespace(ticker="AAA", is_top_pick=False, selection_rank=None),
+            SimpleNamespace(ticker="BBB", is_top_pick=False, selection_rank=None),
+            SimpleNamespace(ticker="PICK", is_top_pick=True, selection_rank=1),
+        ]
+        with patch.object(repo, "_sort_results_for_display", return_value=list(rows)):
+            ordered = repo._order_results_for_decision_limit(rows, limit=1)
+            wider = repo._order_results_for_decision_limit(rows, limit=2)
+        self.assertEqual([row.ticker for row in ordered], ["PICK"])
+        self.assertEqual(len(wider), 2)
+        self.assertEqual(wider[0].ticker, "PICK")
+        self.assertLessEqual(len(wider), 2)
 
 
 if __name__ == "__main__":

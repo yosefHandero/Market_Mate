@@ -230,6 +230,36 @@ class ReadinessTests(unittest.TestCase):
         self.assertTrue(readiness.reason.startswith("Blocked:"))
         self.assertIn("0.6 multiplier", " ".join(readiness.reasons))
 
+    def test_blocked_action_with_passed_gate_names_the_operational_blocker(self) -> None:
+        scan = _base_scan(
+            decision_signal="BUY",
+            recommended_action="blocked",
+            gate_passed=True,
+            gate_reason="Stock signal passed signal-level and score-band evidence gates.",
+            provider_status="critical",
+        )
+        readiness = compute_trade_readiness(scan, _sample_decision(recommended_action="blocked"))
+        self.assertEqual(readiness.reason, "Blocked: provider critical.")
+        self.assertNotIn("passed", readiness.reason)
+
+    def test_blocked_gate_reason_drops_provenance_suffix_and_duplicate_prefix(self) -> None:
+        scan = _base_scan(
+            decision_signal="BUY",
+            recommended_action="blocked",
+            gate_passed=False,
+            gate_reason=(
+                "Blocked by win_rate: crypto win rate 40.00% vs min 55.00%. "
+                "Evidence basis=recent_window:14d:generated_at horizon=1h "
+                "window=2026-09-20T11:18:45..2026-10-04T11:18:45."
+            ),
+            gate_checks=[
+                GateCheck(name="sample_size", passed=True, detail="ok"),
+                GateCheck(name="win_rate", passed=False, detail="crypto win rate 40.00% vs min 55.00%"),
+            ],
+        )
+        readiness = compute_trade_readiness(scan, _sample_decision(recommended_action="blocked"))
+        self.assertEqual(readiness.reason, "Blocked: win_rate: crypto win rate 40.00% vs min 55.00%.")
+
     def test_penalizes_provider_degraded_without_zeroing(self) -> None:
         healthy = compute_trade_readiness(_base_scan(), _sample_decision())
         degraded = compute_trade_readiness(
@@ -255,6 +285,30 @@ class ReadinessTests(unittest.TestCase):
         )
         self.assertLessEqual(readiness.score, 30)
         self.assertRegex(readiness.reason.lower(), r"stale|bars")
+
+    def test_missing_directional_news_is_data_quality_not_stale_bars(self) -> None:
+        healthy = compute_trade_readiness(_base_scan(), _sample_decision())
+        missing_news = compute_trade_readiness(
+            _base_scan(
+                bar_age_minutes=6.0,
+                freshness_flags={"market_bars": "ok", "directional_news": "missing"},
+            ),
+            _sample_decision(bar_age_minutes=6.0),
+        )
+        critical_fresh = compute_trade_readiness(
+            _base_scan(
+                bar_age_minutes=6.0,
+                provider_status="critical",
+                freshness_flags={"market_bars": "ok"},
+                recommended_action="preview",
+            ),
+            _sample_decision(bar_age_minutes=6.0, provider_status="critical"),
+        )
+        self.assertLess(missing_news.score, healthy.score)
+        self.assertNotIn("stale", missing_news.reason.lower())
+        self.assertIn("directional news", missing_news.reason.lower())
+        self.assertNotIn("stale", critical_fresh.reason.lower())
+        self.assertIn("provider", critical_fresh.reason.lower())
 
     def test_hard_stops_provider_critical_when_bars_stale_over_six_hours(self) -> None:
         readiness = compute_trade_readiness(

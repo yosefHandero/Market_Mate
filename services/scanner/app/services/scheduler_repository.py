@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 
 from app.config import get_settings
 from app.db import SessionLocal
@@ -28,8 +29,12 @@ class SchedulerState:
 class SchedulerRepository:
     _KEY = "scanner"
 
-    def __init__(self) -> None:
+    def __init__(self, *, session_factory=None) -> None:
         self.settings = get_settings()
+        self._session_factory = session_factory
+
+    def _session(self):
+        return (self._session_factory or SessionLocal)()
 
     def _utc_now(self) -> datetime:
         return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -81,8 +86,7 @@ class SchedulerRepository:
         last_run_started_at = self._as_utc(row.last_run_started_at)
         last_run_finished_at = self._as_utc(row.last_run_finished_at)
         running = bool(
-            row.enabled
-            and row.lease_owner
+            row.lease_owner
             and row.lease_expires_at
             and self._as_comparable_utc(row.lease_expires_at) >= now
         )
@@ -116,7 +120,7 @@ class SchedulerRepository:
         return row
 
     def get_state(self) -> SchedulerState:
-        with SessionLocal() as session:
+        with self._session() as session:
             row = session.get(SchedulerStateORM, self._KEY)
             if row is None:
                 default = self._default_state()
@@ -137,7 +141,7 @@ class SchedulerRepository:
 
     def set_enabled(self, *, enabled: bool) -> bool:
         now = self._utc_now()
-        with SessionLocal() as session:
+        with self._session() as session:
             row = session.execute(
                 text(
                     """
@@ -206,8 +210,7 @@ class SchedulerRepository:
             ]
             if enabled and row["next_run_at"] is None:
                 set_columns.append("next_run_at = :now")
-            if not enabled:
-                set_columns.extend(["lease_owner = NULL", "lease_expires_at = NULL"])
+            # Pausing future scans must not revoke a scan already doing work.
             session.execute(
                 text(
                     f"""
@@ -224,11 +227,14 @@ class SchedulerRepository:
     def acquire_lease(self, instance_id: str, *, for_maintenance: bool = False) -> bool:
         now = self._utc_now()
         lease_until = now + timedelta(seconds=self.settings.scheduler_lease_seconds)
-        with SessionLocal() as session:
-            row = self._get_or_create_row(session)
-            if not row.enabled and not for_maintenance:
+        # Bootstrap separately so concurrent first callers cannot both insert.
+        try:
+            with self._session() as session:
+                self._get_or_create_row(session)
                 session.commit()
-                return False
+        except IntegrityError:
+            pass
+        with self._session() as session:
             result = session.execute(
                 update(SchedulerStateORM)
                 .where(
@@ -237,7 +243,6 @@ class SchedulerRepository:
                     or_(
                         SchedulerStateORM.lease_expires_at.is_(None),
                         SchedulerStateORM.lease_expires_at < now,
-                        SchedulerStateORM.lease_owner == instance_id,
                     ),
                 )
                 .values(
@@ -252,7 +257,7 @@ class SchedulerRepository:
 
     def record_worker_heartbeat(self, instance_id: str) -> None:
         now = self._utc_now()
-        with SessionLocal() as session:
+        with self._session() as session:
             self._get_or_create_row(session)
             session.execute(
                 update(SchedulerStateORM)
@@ -263,7 +268,7 @@ class SchedulerRepository:
 
     def recover_stale_run(self, *, max_stale_seconds: int = 7200) -> bool:
         now = self._utc_now()
-        with SessionLocal() as session:
+        with self._session() as session:
             row = session.get(SchedulerStateORM, self._KEY)
             if row is None:
                 return False
@@ -275,6 +280,8 @@ class SchedulerRepository:
                 return False
             started_at = self._as_comparable_utc(row.last_run_started_at)
             lease_expires_at = self._as_comparable_utc(row.lease_expires_at)
+            if row.lease_owner and lease_expires_at is not None and lease_expires_at > now:
+                return False
             stale_by_time = bool(
                 started_at is not None and (now - started_at).total_seconds() > max_stale_seconds
             )
@@ -282,44 +289,85 @@ class SchedulerRepository:
             if not stale_by_time and not stale_by_lease:
                 session.commit()
                 return False
-            row.last_run_finished_at = now
-            row.last_error = row.last_error or "Recovered stale scheduler run"
-            row.updated_at = now
+            result = session.execute(
+                update(SchedulerStateORM)
+                .where(
+                    SchedulerStateORM.scheduler_key == self._KEY,
+                    SchedulerStateORM.lease_owner == row.lease_owner,
+                    SchedulerStateORM.lease_expires_at == row.lease_expires_at,
+                    SchedulerStateORM.last_run_started_at == row.last_run_started_at,
+                    SchedulerStateORM.last_run_finished_at == row.last_run_finished_at,
+                )
+                .values(
+                    last_run_finished_at=now,
+                    last_error=row.last_error or "Recovered stale scheduler run",
+                    updated_at=now,
+                )
+            )
             session.commit()
-            return True
+            return bool(result.rowcount)
 
     def release_lease(self, instance_id: str) -> None:
-        with SessionLocal() as session:
-            row = self._get_or_create_row(session)
-            if row.lease_owner == instance_id:
-                row.lease_owner = None
-                row.lease_expires_at = None
-                row.updated_at = self._utc_now()
-                session.commit()
-            else:
-                session.commit()
-
-    def heartbeat(self, instance_id: str) -> None:
-        with SessionLocal() as session:
-            row = self._get_or_create_row(session)
-            if row.lease_owner == instance_id:
-                row.lease_expires_at = self._utc_now() + timedelta(
-                    seconds=self.settings.scheduler_lease_seconds
+        with self._session() as session:
+            session.execute(
+                update(SchedulerStateORM)
+                .where(
+                    SchedulerStateORM.scheduler_key == self._KEY,
+                    SchedulerStateORM.lease_owner == instance_id,
                 )
-                row.updated_at = self._utc_now()
+                .values(lease_owner=None, lease_expires_at=None, updated_at=self._utc_now())
+            )
             session.commit()
 
+    def _owned_live_lease(self, instance_id: str, now: datetime):
+        return (
+            SchedulerStateORM.scheduler_key == self._KEY,
+            SchedulerStateORM.lease_owner == instance_id,
+            SchedulerStateORM.lease_expires_at > now,
+        )
+
+    def heartbeat(self, instance_id: str) -> bool:
+        now = self._utc_now()
+        with self._session() as session:
+            result = session.execute(
+                update(SchedulerStateORM)
+                .where(*self._owned_live_lease(instance_id, now))
+                .values(
+                    lease_expires_at=now + timedelta(seconds=self.settings.scheduler_lease_seconds),
+                    updated_at=now,
+                )
+            )
+            session.commit()
+            return bool(result.rowcount)
+
+    def check_lease(self, instance_id: str, *, session=None) -> bool:
+        now = self._utc_now()
+        if session is not None:
+            result = session.execute(
+                update(SchedulerStateORM)
+                .where(*self._owned_live_lease(instance_id, now))
+                .values(updated_at=now)
+            )
+            return bool(result.rowcount)
+        with self._session() as own_session:
+            return own_session.execute(
+                select(SchedulerStateORM.scheduler_key).where(*self._owned_live_lease(instance_id, now))
+            ).scalar_one_or_none() is not None
+
     def clear_error(self, instance_id: str) -> None:
-        with SessionLocal() as session:
-            row = self._get_or_create_row(session)
-            if row.lease_owner == instance_id and row.enabled and row.last_error is not None:
-                row.last_error = None
-                row.updated_at = self._utc_now()
+        now = self._utc_now()
+        with self._session() as session:
+            session.execute(
+                update(SchedulerStateORM)
+                .where(*self._owned_live_lease(instance_id, now), SchedulerStateORM.enabled.is_(True))
+                .values(last_error=None, updated_at=now)
+            )
             session.commit()
 
     def due_for_run(self) -> bool:
+        self.recover_stale_run(max_stale_seconds=self.settings.scheduler_lease_seconds * 4)
         now = self._utc_now()
-        with SessionLocal() as session:
+        with self._session() as session:
             row = session.get(SchedulerStateORM, self._KEY)
             if row is None:
                 return False
@@ -327,19 +375,7 @@ class SchedulerRepository:
                 last_run_started_at=row.last_run_started_at,
                 last_run_finished_at=row.last_run_finished_at,
             ):
-                started_at = self._as_comparable_utc(row.last_run_started_at)
-                lease_expires_at = self._as_comparable_utc(row.lease_expires_at)
-                if (
-                    started_at is not None
-                    and (now - started_at).total_seconds() > self.settings.scheduler_lease_seconds * 4
-                ) or (lease_expires_at is not None and lease_expires_at < now):
-                    row.last_run_finished_at = now
-                    row.last_error = row.last_error or "Recovered stale scheduler run"
-                    row.updated_at = now
-                    session.commit()
-                else:
-                    session.commit()
-                    return False
+                return False
             next_run_at = self._as_comparable_utc(row.next_run_at)
             return bool(row.enabled and (next_run_at is None or next_run_at <= now))
 
@@ -350,7 +386,7 @@ class SchedulerRepository:
         now: datetime | None = None,
     ) -> bool:
         now_value = self._as_comparable_utc(now) if now is not None else self._utc_now()
-        with SessionLocal() as session:
+        with self._session() as session:
             row = session.get(SchedulerStateORM, self._KEY)
             if row is None or not row.enabled:
                 return False
@@ -369,27 +405,28 @@ class SchedulerRepository:
             session.commit()
             return True
 
-    def mark_run_started(self, instance_id: str) -> None:
+    def mark_run_started(self, instance_id: str) -> bool:
         now = self._utc_now()
-        with SessionLocal() as session:
-            row = self._get_or_create_row(session)
-            row.lease_owner = instance_id
-            row.lease_expires_at = now + timedelta(seconds=self.settings.scheduler_lease_seconds)
-            row.last_run_started_at = now
-            row.updated_at = now
+        with self._session() as session:
+            result = session.execute(
+                update(SchedulerStateORM)
+                .where(*self._owned_live_lease(instance_id, now))
+                .values(last_run_started_at=now, updated_at=now)
+            )
             session.commit()
+            return bool(result.rowcount)
 
     def mark_run_finished(self, instance_id: str, *, error: str | None = None) -> None:
         now = self._utc_now()
-        with SessionLocal() as session:
-            row = self._get_or_create_row(session)
-            if row.lease_owner not in {None, instance_id}:
-                session.commit()
-                return
-            row.last_run_finished_at = now
-            row.last_error = error
-            row.next_run_at = now + timedelta(seconds=self.settings.scan_interval_seconds)
-            row.updated_at = now
-            row.lease_owner = instance_id
-            row.lease_expires_at = now + timedelta(seconds=self.settings.scheduler_lease_seconds)
+        with self._session() as session:
+            session.execute(
+                update(SchedulerStateORM)
+                .where(*self._owned_live_lease(instance_id, now))
+                .values(
+                    last_run_finished_at=now,
+                    last_error=error,
+                    next_run_at=now + timedelta(seconds=self.settings.scan_interval_seconds),
+                    updated_at=now,
+                )
+            )
             session.commit()

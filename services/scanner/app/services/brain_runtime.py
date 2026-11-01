@@ -196,6 +196,8 @@ class BrainRuntime:
                 report.paired_returns.resolution_cluster_metadata_complete
             ),
             paired_returns_superior=report.paired_returns.challenger_superior,
+            calibration_eligible_pair_count=(report.paired_brier.n_pairs_informative if report.paired_brier is not None else 0),
+            calibration_min_pairs=(report.paired_brier.min_pairs_required if report.paired_brier is not None else report.paired_returns.min_pairs_required),
             pair_exclusion_counts=report.diagnostics.get("pair_exclusion_counts", {}),
             effective_champion_policy_id=self.effective_champion_id(report=report),
             requested_champion_policy_id=self.requested_champion_id(),

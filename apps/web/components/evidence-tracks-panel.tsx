@@ -78,6 +78,7 @@ export function EvidenceTracksPanel({
       ) : (
         <>
           <p className="muted small" style={{ marginTop: 0 }}>
+            Historical totals across all campaigns; these are not current-campaign counts.{' '}
             Real-money trust stays blocked until live-forward evidence clears both sample-count and
             per-candidate performance thresholds. Walk-forward research and historical replay
             support calibration only and never count as live proof.

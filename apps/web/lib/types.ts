@@ -137,8 +137,30 @@ export interface ScanResult {
   readiness_reason?: string | null;
   selection_rank?: number | null;
   is_top_pick?: boolean;
+  layer_details?: {
+    confidence?: {
+      blend?: {
+        horizon?: string | null;
+        score_band?: string | null;
+        source?: string | null;
+        sample_count?: number | null;
+        win_rate?: number | null;
+        avg_return?: number | null;
+        blend_weight?: number | null;
+        base_score?: number | null;
+      };
+    };
+  };
   decision_role?: string | null;
   created_at: string;
+}
+
+export interface ScanAssetCoverage {
+  asset_type: AssetType;
+  expected_symbols: string[];
+  returned_symbols: string[];
+  missing_symbols: { ticker: string; reason: string; detail: string }[];
+  status: 'complete' | 'partial' | 'unavailable' | 'not_requested';
 }
 
 export interface ScanRun {
@@ -155,6 +177,7 @@ export interface ScanRun {
   results: ScanResult[];
   top_stocks?: ScanResult[];
   top_crypto?: ScanResult[];
+  coverage?: ScanAssetCoverage[] | null;
 }
 
 export interface DecisionRow {
@@ -372,7 +395,8 @@ export interface TradeEligibility {
 export interface OrderPreviewRequest {
   ticker: string;
   side: OrderSide;
-  qty: number;
+  qty?: number | null;
+  requested_notional_usd?: number | null;
   order_type?: OrderType;
   limit_price?: number | null;
   preview_audit_id?: number | null;
@@ -382,6 +406,17 @@ export interface OrderPreviewRequest {
   stop_price?: number | null;
   target_price?: number | null;
   recommended_action_snapshot?: string | null;
+  paper_contract?: PaperTradeContract | null;
+}
+
+export interface PaperTradeContract {
+  source_run_id: string | null;
+  policy_id: string | null;
+  policy_version: string | null;
+  decision_fingerprint: string | null;
+  holding_horizon: string;
+  holding_duration_seconds: number;
+  exit_method: 'time_based';
 }
 
 export interface OrderPreviewResponse {
@@ -404,6 +439,7 @@ export interface OrderPreviewResponse {
   gate_result: string | null;
   freshness: string | null;
   reject_reasons: string[];
+  paper_contract?: PaperTradeContract | null;
 }
 
 export interface OrderPlaceRequest extends OrderPreviewRequest {
@@ -427,6 +463,9 @@ export interface OrderPlaceResponse {
   filled_qty: number | null;
   slippage_assumption_bps: number | null;
   recommended_action_snapshot: string | null;
+  paper_contract?: PaperTradeContract | null;
+  filled_at?: string | null;
+  exit_due_at?: string | null;
 }
 
 export interface AutomationIntentSummary {
@@ -518,6 +557,17 @@ export interface PaperPositionSummary {
   closed_at: string | null;
   strategy_version: string | null;
   confidence: number | null;
+  source_run_id?: string | null;
+  policy_id?: string | null;
+  policy_version?: string | null;
+  decision_fingerprint?: string | null;
+  holding_horizon?: string | null;
+  holding_duration_seconds?: number | null;
+  exit_method?: 'time_based' | null;
+  exit_due_at?: string | null;
+  contract_status?: 'recorded' | 'legacy_unknown';
+  closure_status?: 'scheduled' | 'overdue_pending_quote' | 'closed' | 'closed_late' | 'legacy_unknown';
+  close_delay_seconds?: number | null;
 }
 
 export interface PaperLedgerSummary {
@@ -535,6 +585,9 @@ export interface PaperLedgerSummary {
   gross_pnl_usd: number;
   max_drawdown_usd: number;
   total_unrealized_pnl?: number | null;
+  overdue_positions?: number;
+  legacy_unknown_positions?: number;
+  late_closed_positions?: number;
 }
 
 export interface ProofLoopMetrics {
@@ -766,6 +819,8 @@ export interface LiveForwardAssetProgress {
   rejected: number;
   resolved: number;
   pending: number;
+  pending_due?: number;
+  pending_due_unknown?: number;
   resolved_late: number;
 }
 
@@ -775,11 +830,21 @@ export interface LiveForwardProgress {
   config_fingerprint?: string | null;
   strategy_version?: string | null;
   code_commit?: string | null;
+  saved_policy_id?: string | null;
+  saved_policy_version?: string | null;
+  saved_decision_fingerprint?: string | null;
+  saved_learned_artifacts_fingerprint?: string | null;
+  runtime_policy_id?: string | null;
+  runtime_policy_version?: string | null;
+  runtime_decision_fingerprint?: string | null;
+  identity_matches_saved_campaign?: boolean | null;
   selected_count: number;
   accepted_outside_top_n_count: number;
   rejected_count: number;
   resolved_count: number;
   pending_count: number;
+  pending_due_count?: number;
+  pending_due_unknown_count?: number;
   resolved_late_count: number;
   by_asset: LiveForwardAssetProgress[];
   last_scan_at?: string | null;
@@ -811,6 +876,8 @@ export interface PolicyPromotionReport {
   paired_returns_resolution_clusters: number;
   paired_returns_cluster_metadata_complete: boolean;
   paired_returns_superior: boolean;
+  calibration_eligible_pair_count?: number;
+  calibration_min_pairs?: number;
   pair_exclusion_counts: Record<string, number>;
   effective_champion_policy_id: string;
   requested_champion_policy_id: string;

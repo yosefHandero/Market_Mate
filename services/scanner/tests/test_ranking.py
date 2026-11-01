@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from app.config import Settings
 from app.brain.gates import buy_candidate_rank_score, is_buy_candidate, row_is_buy_candidate
+from app.core.freshness_policy import row_is_bar_stale, row_is_severely_stale
 from app.core.ranking import actionability_sort_tier, display_sort_key
 from app.schemas import ScanResult, WeeklyPatternPrediction
 
@@ -113,6 +114,40 @@ class RankingTests(unittest.TestCase):
                 resolve_signal=lambda row: row.decision_signal,
                 scan_result=critical,
             ),
+        )
+
+    def test_missing_news_does_not_count_as_stale_bars_and_stays_out_of_clean_tier(self) -> None:
+        clean = ScanResult(
+            ticker="LINK/USD",
+            asset_type="crypto",
+            score=80,
+            explanation="fresh bars, missing news",
+            price=14,
+            price_change_pct=1,
+            relative_volume=1.2,
+            sentiment_score=0.1,
+            filing_flag=False,
+            breakout_flag=True,
+            market_status="bullish",
+            sector_strength_score=0.2,
+            decision_signal="BUY",
+            gate_passed=True,
+            provider_status="ok",
+            execution_eligibility="eligible",
+            bar_age_minutes=6,
+            freshness_flags={"market_bars": "ok", "directional_news": "missing"},
+            created_at=datetime.now(timezone.utc),
+        )
+        self.assertFalse(row_is_bar_stale(clean, self.settings))
+        self.assertFalse(row_is_severely_stale(clean, self.settings))
+        self.assertEqual(
+            actionability_sort_tier(
+                clean,
+                settings=self.settings,
+                resolve_signal=lambda row: row.decision_signal,
+                scan_result=clean,
+            ),
+            2,
         )
 
     def test_higher_upside_ranks_higher(self) -> None:

@@ -95,6 +95,32 @@ describe('order proxy routes', () => {
     });
   });
 
+  it('forwards authoritative budget sizing and the agreed paper contract without dropping fields', async () => {
+    process.env.SCANNER_ADMIN_API_TOKEN = 'admin-token';
+    process.env.NEXT_PUBLIC_SCANNER_API_BASE = 'http://scanner.test';
+    const fetchMock = vi.fn().mockImplementation(async () => new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { POST: preview } = await import('@/app/api/orders/preview/route');
+    const previewResponse = await preview(createJsonRequest('http://localhost/api/orders/preview', { ticker: 'BTC/USD', side: 'buy', requested_notional_usd: 100 }));
+    expect(previewResponse.status).toBe(200);
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toEqual({ ticker: 'BTC/USD', side: 'buy', requested_notional_usd: 100, order_type: 'market' });
+    const contract = { source_run_id: 'run-1', policy_id: 'hybrid', policy_version: 'v4', decision_fingerprint: 'fingerprint', holding_horizon: '1h', holding_duration_seconds: 3600, exit_method: 'time_based' };
+    const { POST: place } = await import('@/app/api/orders/place/route');
+    const placeResponse = await place(createJsonRequest('http://localhost/api/orders/place', { ticker: 'BTC/USD', side: 'buy', qty: 0.00123, paper_contract: contract, preview_audit_id: 12 }));
+    expect(placeResponse.status).toBe(200);
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1].body))).toEqual(expect.objectContaining({ qty: 0.00123, paper_contract: contract, dry_run: true }));
+  });
+
+  it('rejects contradictory quantity and budget requests without adding an eligibility rule', async () => {
+    process.env.SCANNER_ADMIN_API_TOKEN = 'admin-token';
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const { POST } = await import('@/app/api/orders/preview/route');
+    const response = await POST(createJsonRequest('http://localhost/api/orders/preview', { ticker: 'AAPL', side: 'buy', qty: 1, requested_notional_usd: 100 }));
+    expect(response.status).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('forces dry-run order placement when the client omits mode and dry_run', async () => {
     process.env.SCANNER_ADMIN_API_TOKEN = 'admin-token';
     process.env.NEXT_PUBLIC_SCANNER_API_BASE = 'http://scanner.test';

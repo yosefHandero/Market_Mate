@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import json
+import math
 
 from sqlalchemy import and_, desc, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -16,6 +17,7 @@ from app.schemas import (
     AutomationIncidentClass,
     AutomationIntentSummary,
     AutomationStatusResponse,
+    PaperTradeContract,
 )
 
 
@@ -30,6 +32,39 @@ class AutomationRepository:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _position_contract(audit: ExecutionAuditORM | None, filled_at: datetime) -> dict:
+        """Copy saved agreement only; historical audits do not imply an exit contract."""
+        if audit is None:
+            return {}
+        try:
+            preview = json.loads(audit.preview_payload or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        contract = preview.get("paper_contract") if isinstance(preview, dict) else None
+        if not isinstance(contract, dict):
+            return {}
+        if contract.get("exit_method") != "time_based":
+            return {}
+        try:
+            agreed = PaperTradeContract.model_validate(contract, strict=True)
+        except (ValueError, TypeError):
+            return {}
+        return {
+            **agreed.model_dump(),
+            "exit_due_at": filled_at + timedelta(seconds=agreed.holding_duration_seconds),
+        }
+
+    @staticmethod
+    def _copy_position_contract(position: PaperPositionORM) -> dict:
+        return {
+            key: getattr(position, key)
+            for key in (
+                "source_run_id", "policy_id", "policy_version", "decision_fingerprint",
+                "holding_horizon", "holding_duration_seconds", "exit_method", "exit_due_at",
+            )
+        }
 
     def _ensure_breaker_row(self, session, *, now: datetime) -> PaperLoopBreakerORM:
         row = session.get(PaperLoopBreakerORM, _BREAKER_KEY)
@@ -215,6 +250,8 @@ class AutomationRepository:
         simulated_fill_price: float,
         filled_at: datetime | None = None,
     ) -> int | None:
+        if not math.isfinite(simulated_fill_price) or simulated_fill_price <= 0:
+            return None
         filled_time = filled_at or self._utc_now()
         with SessionLocal() as session:
             intent = session.get(AutomationIntentORM, intent_id)
@@ -227,6 +264,15 @@ class AutomationRepository:
             ).scalar_one_or_none()
             if existing is not None:
                 return existing.id
+
+            if intent.execution_audit_id is not None:
+                existing = session.execute(
+                    select(PaperPositionORM)
+                    .where(PaperPositionORM.execution_audit_id == intent.execution_audit_id)
+                    .limit(1)
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return existing.id
 
             if intent.side == "sell":
                 open_position = session.execute(
@@ -279,6 +325,11 @@ class AutomationRepository:
                 closed_at=None,
                 strategy_version=intent.strategy_version,
                 confidence=intent.confidence,
+                **self._position_contract(
+                    session.get(ExecutionAuditORM, intent.execution_audit_id)
+                    if intent.execution_audit_id is not None else None,
+                    filled_time,
+                ),
             )
             session.add(position)
             session.commit()
@@ -292,7 +343,7 @@ class AutomationRepository:
         simulated_fill_price: float,
         filled_at: datetime | None = None,
     ) -> int | None:
-        if simulated_fill_price <= 0:
+        if not math.isfinite(simulated_fill_price) or simulated_fill_price <= 0:
             return None
         filled_time = filled_at or self._utc_now()
         with SessionLocal() as session:
@@ -304,7 +355,11 @@ class AutomationRepository:
 
             existing = session.execute(
                 select(PaperPositionORM)
-                .where(PaperPositionORM.intent_key == intent_key)
+                .where(or_(
+                    PaperPositionORM.intent_key == intent_key,
+                    PaperPositionORM.execution_audit_id == audit.id,
+                    PaperPositionORM.intent_key == f"{intent_key}:partial:{audit.id}",
+                ))
                 .limit(1)
             ).scalar_one_or_none()
             if existing is not None:
@@ -361,6 +416,7 @@ class AutomationRepository:
                         closed_at=filled_time,
                         strategy_version=open_position.strategy_version,
                         confidence=open_position.confidence,
+                        **self._copy_position_contract(open_position),
                     )
                     session.add(closed_position)
                     open_position.quantity = remaining_quantity
@@ -378,7 +434,7 @@ class AutomationRepository:
                 session.commit()
                 return open_position.id
 
-            strategy_version = getattr(audit, "trade_gate_horizon", None)
+            strategy_version = None
             if audit.preview_payload:
                 try:
                     preview_payload = json.loads(audit.preview_payload)
@@ -407,6 +463,7 @@ class AutomationRepository:
                 closed_at=None,
                 strategy_version=strategy_version,
                 confidence=audit.confidence,
+                **self._position_contract(audit, filled_time),
             )
             session.add(position)
             session.commit()

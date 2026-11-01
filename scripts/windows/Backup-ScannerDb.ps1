@@ -92,7 +92,7 @@ print("ok")
     Write-Log -Message "Backup verified OK: $dest ($sizeKb KB)." -LogFile $logFile
 
     # Rotate: keep the most recent $KeepCount backups.
-    $backups = Get-ChildItem -Path $BackupDir -Filter 'market_mate-*.db' | Sort-Object LastWriteTime -Descending
+    $backups = @(Get-ChildItem -LiteralPath $BackupDir -Filter 'market_mate-*.db' | Sort-Object LastWriteTime -Descending)
     if ($backups.Count -gt $KeepCount) {
         foreach ($old in $backups | Select-Object -Skip $KeepCount) {
             Remove-Item -LiteralPath $old.FullName -ErrorAction SilentlyContinue

@@ -5,6 +5,8 @@ import { render, screen } from '@testing-library/react';
 import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import ProofPage from '@/app/proof/page';
+import { getLatestScan } from '@/lib/api';
+import { getDashboardFixture } from './fixtures/dashboard-fixture';
 
 vi.mock('@/lib/api', () => ({
   getReadyz: vi.fn(async () => ({ data: { ok: true, scan_fresh: true, scheduler_enabled: false }, error: null })),
@@ -13,7 +15,12 @@ vi.mock('@/lib/api', () => ({
     error: null,
   })),
   getSystemReadiness: vi.fn(async () => ({
-    data: { provider: { worst_status: 'ok', critical_count: 0 }, safety_blockers: [] },
+    data: {
+      status: 'PASS',
+      reasons: ['Core safety and data checks pass'],
+      provider: { worst_status: 'ok', critical_count: 0 },
+      safety_blockers: [],
+    },
     error: null,
   })),
   getLatestScan: vi.fn(async () => ({
@@ -114,12 +121,54 @@ vi.mock('@/components/proof-ledger-section', () => ({
 }));
 
 describe('ProofPage', () => {
+  it('explains every saved BUY evidence failure without treating detection as paper permission', async () => {
+    const scan = getDashboardFixture().latestScan;
+    const link = {
+      ...scan.results[0], ticker: 'LINK/USD', asset_type: 'crypto' as const,
+      decision_signal: 'BUY' as const, is_buy_candidate: true, is_top_pick: false,
+      recommended_action: 'blocked' as const, execution_eligibility: 'blocked',
+      gate_passed: false, readiness_score: 8, readiness_band: 'none' as const,
+      readiness_hard_stop: false, provider_status: 'degraded',
+      freshness_flags: { market_bars: 'ok', directional_news: 'missing' },
+      gate_checks: [
+        { name: 'sample_size', passed: false, detail: 'crypto BUY bucket has 0 1h outcomes; need 30' },
+        { name: 'win_rate', passed: false, detail: 'crypto win rate 0.00% vs min 55.00%' },
+        { name: 'avg_return', passed: false, detail: 'crypto avg return 0.0000% vs min 0.1500%' },
+      ],
+    };
+    vi.mocked(getLatestScan).mockResolvedValueOnce({
+      data: { ...scan, results: [link, { ...link, ticker: 'SHADOW/USD', decision_role: 'shadow' }] },
+      error: null,
+    });
+    render(await ProofPage());
+    const diagnostics = screen.getByLabelText('BUY gate diagnostics');
+    expect(diagnostics).toHaveTextContent('Detected BUY does not authorize a dry-run');
+    expect(diagnostics).toHaveTextContent('LINK/USD');
+    for (const check of link.gate_checks) expect(diagnostics).toHaveTextContent(check.detail);
+    expect(diagnostics).toHaveTextContent('Readiness 8/100; need 70');
+    expect(diagnostics).toHaveTextContent('Action blocked; need preview or dry_run');
+    expect(diagnostics).toHaveTextContent('directional news: missing');
+    expect(diagnostics).not.toHaveTextContent('SHADOW/USD');
+  });
+
   it('renders proof summary with loop metrics and unrealized P/L', async () => {
     render(await ProofPage());
     expect(screen.getByRole('heading', { name: 'Proof' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Scan diagnostics' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Dashboard status')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Paper loop proof' })).toBeInTheDocument();
     expect(screen.getByTestId('proof-unrealized-pnl')).toHaveTextContent('$12.50');
     expect(screen.getByTestId('prediction-in-range-rate')).toHaveTextContent('58.3%');
     expect(screen.queryByText('NaN')).not.toBeInTheDocument();
+  });
+
+  it('places the paper ledger directly after the loop summary so tracking is easy to find', async () => {
+    render(await ProofPage());
+    const summary = screen.getByLabelText('Paper loop proof summary');
+    const ledger = screen.getByTestId('proof-ledger');
+    const audits = screen.getByRole('heading', { name: /recent dry-run audits/i });
+    expect(summary.compareDocumentPosition(ledger) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(ledger.compareDocumentPosition(audits) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByTestId('operator-actions').compareDocumentPosition(ledger) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
   });
 });

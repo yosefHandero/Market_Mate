@@ -27,8 +27,8 @@ describe('DecisionGrid', () => {
       />,
     );
 
-    expect(screen.getByRole('heading', { name: 'Top Stock Buy Candidates' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Top Crypto Buy Candidates' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Stocks' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Crypto' })).toBeInTheDocument();
     expect(screen.getByTestId('card-NVDA')).toBeInTheDocument();
     expect(screen.getByTestId('card-BTC/USD')).toBeInTheDocument();
   });
@@ -61,17 +61,15 @@ describe('DecisionGrid', () => {
     expect(screen.queryByTestId('card-ADA/USD')).not.toBeInTheDocument();
   });
 
-  it('explains the exact reason when nothing was scanned', () => {
+  it('shows a short empty state with a Proof link when nothing was scanned', () => {
     render(<DecisionGrid results={[]} decisions={[]} automation={null} />);
-    expect(screen.getByTestId('stock-empty-state')).toHaveTextContent(
-      /no stock symbols were scanned/i,
-    );
-    expect(screen.getByTestId('crypto-empty-state')).toHaveTextContent(
-      /no crypto symbols were scanned/i,
-    );
+    expect(screen.getByTestId('decision-empty-state')).toHaveTextContent(/no scan results yet/i);
+    expect(screen.getByTestId('decision-proof-link')).toHaveAttribute('href', '/proof');
+    expect(screen.queryByTestId('stock-empty-state')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('crypto-empty-state')).not.toBeInTheDocument();
   });
 
-  it('shows held-back buy candidates as read-only reference during closed markets', () => {
+  it('keeps held-back buy candidates off the buy list during closed markets', () => {
     const heldBack = {
       ticker: 'AAPL',
       asset_type: 'stock',
@@ -84,13 +82,15 @@ describe('DecisionGrid', () => {
     } as unknown as import('@/lib/types').ScanResult;
 
     render(<DecisionGrid results={[heldBack]} decisions={[]} automation={null} />);
-    // No executable empty-state; instead a clearly-labeled read-only reference section.
-    expect(screen.queryByTestId('stock-empty-state')).not.toBeInTheDocument();
-    expect(screen.getByTestId('stock-reference-note')).toHaveTextContent(
-      /reference only - not executable right now\. 1 stock buy candidate held back: provider is critical and bars are stale/i,
+    expect(screen.queryByTestId('card-AAPL')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('stock-reference-grid')).not.toBeInTheDocument();
+    expect(screen.getByTestId('decision-empty-state')).toHaveTextContent(
+      /no qualifying buy candidates/i,
     );
-    expect(screen.getByTestId('stock-reference-grid')).toBeInTheDocument();
-    expect(screen.getByTestId('card-AAPL')).toBeInTheDocument();
+    expect(screen.getByTestId('decision-proof-link')).toHaveAttribute('href', '/proof');
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(
+      /stale or incomplete data is affecting these results/i,
+    );
   });
 
   it('splits blocked top BUY setups into a read-only section when valid candidates remain', () => {
@@ -132,13 +132,9 @@ describe('DecisionGrid', () => {
     expect(
       within(screen.getByTestId('stock-actionable-grid')).getByTestId('card-NVDA'),
     ).toBeInTheDocument();
-    expect(
-      within(screen.getByTestId('stock-actionable-grid')).queryByTestId('card-ROKU'),
-    ).not.toBeInTheDocument();
-    expect(screen.getByTestId('stock-readonly-note')).toHaveTextContent(/read-only setup details/i);
-    expect(
-      within(screen.getByTestId('stock-readonly-grid')).getByTestId('card-ROKU'),
-    ).toBeInTheDocument();
+    expect(screen.queryByTestId('card-ROKU')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('stock-readonly-grid')).not.toBeInTheDocument();
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/blocked setups stay off this list/i);
   });
 
   it('does not expose shadow rows on the Decision surface', () => {
@@ -192,9 +188,31 @@ describe('DecisionGrid', () => {
     );
 
     render(<DecisionGrid results={holds} decisions={[]} automation={null} />);
-    expect(screen.getByTestId('crypto-empty-state')).toHaveTextContent(
-      /No crypto buy candidates qualified from 3 crypto symbols\. Likely blockers: no qualifying BUY signal was present\./i,
+    expect(screen.getByTestId('decision-empty-state')).toHaveTextContent(
+      /no qualifying buy candidates in the latest scan/i,
     );
+    expect(screen.getByTestId('decision-proof-link')).toHaveAttribute('href', '/proof');
+    expect(screen.queryByTestId('card-A')).not.toBeInTheDocument();
+  });
+
+  it('does not render a BUY when is_buy_candidate is omitted', () => {
+    const omitted = {
+      ticker: 'OMIT',
+      asset_type: 'stock',
+      decision_signal: 'BUY',
+      is_top_pick: true,
+      selection_rank: 1,
+      provider_status: 'ok',
+      bar_age_minutes: 3,
+      freshness_flags: {},
+      readiness_hard_stop: false,
+      readiness_score: 90,
+      gate_passed: true,
+      recommended_action: 'dry_run',
+    } as unknown as ScanResult;
+
+    render(<DecisionGrid results={[omitted]} decisions={[]} automation={null} />);
+    expect(screen.queryByTestId('card-OMIT')).not.toBeInTheDocument();
   });
 
   it('explains sparse stock and crypto sections independently', () => {
@@ -242,11 +260,207 @@ describe('DecisionGrid', () => {
       />,
     );
 
-    expect(screen.getByTestId('stock-sparse-state')).toHaveTextContent(
-      /Only 1 stock buy candidate qualified from 2 stock symbols\. Likely blockers:/i,
+    expect(screen.getByTestId('card-MSFT')).toBeInTheDocument();
+    expect(screen.getByTestId('card-ETH/USD')).toBeInTheDocument();
+    expect(screen.queryByTestId('card-INTC')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('card-AVAX/USD')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('stock-sparse-state')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('crypto-sparse-state')).not.toBeInTheDocument();
+    // The displayed picks are fresh; a stale row that is not shown must not
+    // label the visible results as stale.
+    expect(screen.getByTestId('decision-data-warning')).not.toHaveTextContent(/stale/i);
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(
+      /blocked setups stay off this list/i,
     );
-    expect(screen.getByTestId('crypto-sparse-state')).toHaveTextContent(
-      /Only 1 crypto buy candidate qualified from 2 crypto symbols\. Likely blockers:/i,
+  });
+
+  it('explains why each BUY signal was held back when the list is empty', () => {
+    const base = {
+      asset_type: 'stock',
+      decision_signal: 'BUY',
+      is_buy_candidate: true,
+      is_top_pick: true,
+      bar_age_minutes: 3,
+      freshness_flags: {},
+      readiness_hard_stop: false,
+      readiness_score: 20,
+      recommended_action: 'blocked',
+      execution_eligibility: 'blocked',
+    };
+    const lowTrust = {
+      ...base,
+      ticker: 'LOW',
+      selection_rank: 1,
+      provider_status: 'ok',
+      gate_passed: false,
+      gate_reason: 'stock BUY bucket has 4 1h outcomes; need 20',
+      gate_checks: [
+        { name: 'sample_size', passed: false, detail: 'stock BUY bucket has 4 1h outcomes; need 20' },
+      ],
+      readiness_reason: 'Low trust: blocked only by sample size, not by a hard safety stop.',
+    } as unknown as ScanResult;
+    const providerDown = {
+      ...base,
+      ticker: 'PROV',
+      selection_rank: 2,
+      provider_status: 'critical',
+      gate_passed: true,
+      gate_reason: 'Stock signal passed signal-level and score-band evidence gates.',
+      readiness_reason: 'Blocked: provider critical.',
+    } as unknown as ScanResult;
+    const hold = {
+      ...base,
+      ticker: 'HOLDY',
+      decision_signal: 'HOLD',
+      is_buy_candidate: false,
+      is_top_pick: false,
+      provider_status: 'ok',
+    } as unknown as ScanResult;
+
+    render(
+      <DecisionGrid
+        results={[lowTrust, providerDown, hold]}
+        topStocks={[lowTrust, providerDown]}
+        decisions={[]}
+        automation={null}
+      />,
     );
+
+    const empty = screen.getByTestId('decision-empty-state');
+    expect(empty).toHaveTextContent(/no qualifying buy candidates/i);
+    expect(screen.getByTestId('decision-held-back')).toHaveTextContent(/2 BUY signals were held back/i);
+    expect(screen.getByTestId('held-back-LOW')).toHaveTextContent(/blocked only by sample size/i);
+    expect(screen.getByTestId('held-back-PROV')).toHaveTextContent(/provider critical/i);
+    // The passed-gate text must never be presented as a reason for holding back.
+    expect(screen.getByTestId('held-back-PROV')).not.toHaveTextContent(/passed/i);
+    expect(screen.queryByTestId('held-back-HOLDY')).not.toBeInTheDocument();
+    expect(screen.getByTestId('decision-proof-link')).toHaveAttribute('href', '/proof');
+  });
+
+  it('reports the signal mix when the scan produced no BUY signals at all', () => {
+    const rows = [
+      { ticker: 'H1', decision_signal: 'HOLD' },
+      { ticker: 'H2', decision_signal: 'HOLD' },
+      { ticker: 'S1', decision_signal: 'SELL' },
+    ].map(
+      (row) =>
+        ({
+          ...row,
+          asset_type: 'stock',
+          provider_status: 'ok',
+          bar_age_minutes: 3,
+          freshness_flags: {},
+          readiness_hard_stop: false,
+        }) as unknown as ScanResult,
+    );
+
+    render(<DecisionGrid results={rows} decisions={[]} automation={null} />);
+    expect(screen.getByTestId('decision-empty-state')).toHaveTextContent(
+      /no BUY signals \(2 HOLD, 1 SELL\)/i,
+    );
+    expect(screen.queryByTestId('decision-held-back')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('decision-data-warning')).not.toBeInTheDocument();
+  });
+
+  it('keeps a fresh blocked BUY off the list without calling the bars stale', () => {
+    const link = {
+      ticker: 'LINK/USD',
+      asset_type: 'crypto',
+      decision_signal: 'BUY',
+      is_buy_candidate: true,
+      is_top_pick: true,
+      provider_status: 'degraded',
+      bar_age_minutes: 6,
+      freshness_flags: { market_bars: 'ok', directional_news: 'missing' },
+      gate_passed: false,
+      gate_checks: [
+        { name: 'sample_size', passed: false, detail: 'crypto BUY bucket has 0 1h outcomes; need 30' },
+      ],
+      recommended_action: 'blocked',
+      execution_eligibility: 'blocked',
+      readiness_score: 8,
+    } as unknown as ScanResult;
+
+    render(
+      <DecisionGrid
+        results={[link]}
+        topCrypto={[link]}
+        decisions={[]}
+        automation={null}
+      />,
+    );
+
+    expect(screen.queryByTestId('card-LINK/USD')).not.toBeInTheDocument();
+    expect(screen.getByTestId('decision-empty-state')).toHaveTextContent(/no qualifying buy candidates/i);
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/degraded or incomplete data/i);
+    expect(screen.getByTestId('decision-data-warning')).not.toHaveTextContent(/stale/i);
+  });
+
+  it('shows at most three candidates per asset and keeps the supplied rank order', () => {
+    const stocks = [2, 1, 4, 3].map(
+      (rank) =>
+        ({
+          ticker: `S${rank}`,
+          asset_type: 'stock',
+          decision_signal: 'BUY',
+          is_buy_candidate: true,
+          provider_status: 'ok',
+          bar_age_minutes: 3,
+          freshness_flags: {},
+          readiness_hard_stop: false,
+          readiness_score: 85,
+          readiness_band: 'high',
+          readiness_reason: 'Actionable: gates passed and data is fresh.',
+          gate_passed: true,
+          recommended_action: 'preview',
+          selection_rank: rank,
+        }) as unknown as ScanResult,
+    );
+
+    render(
+      <DecisionGrid
+        results={stocks}
+        topStocks={stocks}
+        decisions={[]}
+        automation={null}
+      />,
+    );
+
+    const grid = screen.getByTestId('stock-actionable-grid');
+    const rendered = within(grid).getAllByTestId(/^card-S/);
+    expect(rendered.map((node) => node.textContent)).toEqual(['S2', 'S1', 'S4']);
+    expect(screen.queryByTestId('card-S3')).not.toBeInTheDocument();
+  });
+
+  it('states a kill switch without listing blocked candidates as buys', () => {
+    const blocked = {
+      ticker: 'NVDA',
+      asset_type: 'stock',
+      decision_signal: 'BUY',
+      is_buy_candidate: true,
+      provider_status: 'ok',
+      bar_age_minutes: 3,
+      freshness_flags: {},
+      readiness_hard_stop: false,
+      readiness_score: 85,
+      readiness_band: 'high',
+      readiness_reason: 'Actionable: gates passed and data is fresh.',
+      gate_passed: true,
+      recommended_action: 'preview',
+    } as unknown as ScanResult;
+
+    render(
+      <DecisionGrid
+        results={[blocked]}
+        topStocks={[blocked]}
+        decisions={[]}
+        automation={{ kill_switch_enabled: true, breaker: { state: 'closed' } } as never}
+      />,
+    );
+
+    expect(screen.queryByTestId('card-NVDA')).not.toBeInTheDocument();
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/kill switch is on/i);
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/paper actions are blocked/i);
+    expect(screen.getByTestId('decision-empty-state')).toBeInTheDocument();
   });
 });

@@ -1,5 +1,9 @@
 import { ConfidencePerformancePanel } from '@/components/confidence-performance-panel';
+import { BuyGateDiagnostics } from '@/components/buy-gate-diagnostics';
+import { ConfidenceProvenancePanel } from '@/components/confidence-provenance-panel';
+import { DashboardStatusBanner } from '@/components/dashboard-status-banner';
 import { EvidenceTracksPanel } from '@/components/evidence-tracks-panel';
+import { ForecastContextPanel } from '@/components/forecast-context-panel';
 import { ExecutionAuditList } from '@/components/execution-audit-list';
 import { ExitWindowAccuracyPanel } from '@/components/exit-window-accuracy-panel';
 import { LiveForwardProgressPanel } from '@/components/live-forward-progress-panel';
@@ -56,6 +60,7 @@ export default async function ProofPage() {
   const errors = [
     healthResult.error,
     automationResult.error,
+    latestScanResult.error,
     paperLedgerResult.error,
     paperLedgerSummaryResult.error,
     auditsResult.error,
@@ -88,7 +93,26 @@ export default async function ProofPage() {
         ) : null}
       </section>
 
+      <section className="card proof-diagnostics-card">
+        <h2 className="proof-section-title">Scan diagnostics</h2>
+        <DashboardStatusBanner
+          health={healthResult.data}
+          automation={automationResult.data}
+          latestScan={latestScanResult.data}
+          systemReadiness={systemReadinessResult.data}
+          compactDiagnostics
+        />
+        <BuyGateDiagnostics results={latestScanResult.data?.results ?? []} />
+      </section>
+
       <ProofSummaryPanel summary={proofSummaryResult.data} />
+
+      <ProofLedgerSection
+        initialPositions={paperLedgerResult.data ?? []}
+        initialSummary={paperLedgerSummaryResult.data}
+        initialError={paperLedgerError || null}
+        latestPrices={latestPrices}
+      />
 
       <LiveForwardProgressPanel progress={proofSummaryResult.data?.live_forward} />
 
@@ -114,16 +138,13 @@ export default async function ProofPage() {
         lastSchedulerError={healthResult.data?.last_scheduler_error}
       />
 
-      <ProofLedgerSection
-        initialPositions={paperLedgerResult.data ?? []}
-        initialSummary={paperLedgerSummaryResult.data}
-        initialError={paperLedgerError || null}
-        latestPrices={latestPrices}
-      />
-
       <PredictionAccuracyPanel metrics={proofSummaryResult.data?.prediction_accuracy} />
 
       <ConfidencePerformancePanel performance={proofSummaryResult.data?.confidence_performance} />
+
+      <ConfidenceProvenancePanel results={latestScanResult.data?.results ?? []} />
+
+      <ForecastContextPanel results={latestScanResult.data?.results ?? []} />
 
       <ExitWindowAccuracyPanel metrics={proofSummaryResult.data?.exit_window_accuracy} />
 

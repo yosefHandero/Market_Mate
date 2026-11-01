@@ -1,4 +1,6 @@
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 from app.core.strategy_contract import (
     build_strategy_evaluation_metadata,
@@ -9,11 +11,14 @@ from app.core.strategy_contract import (
 
 class StrategyContractTests(unittest.TestCase):
     def test_current_contract_exposes_explicit_signal_meaning(self) -> None:
-        contract = get_current_strategy_contract()
+        with patch("app.core.strategy_contract.get_settings", return_value=SimpleNamespace(trade_gate_horizon="1h")):
+            contract = get_current_strategy_contract()
 
         self.assertEqual(contract.strategy_id, "scanner-directional")
         self.assertEqual(contract.strategy_version, "v4.1-integrated")
-        self.assertEqual(contract.primary_holding_horizon, "1w")
+        self.assertEqual(contract.primary_holding_horizon, "1h")
+        self.assertIn("deadline is saved", contract.exit_assumption)
+        self.assertIn("advisory", contract.exit_assumption)
         self.assertIn("HOLD means abstain", contract.hold_definition.operational_meaning)
         self.assertIn("binance", contract.supportive_provider_inputs)
 

@@ -107,6 +107,17 @@ describe('PolicyPromotionPanel', () => {
     );
   });
 
+  it('uses calibration counts independently of return pairs and explanatory text', () => {
+    const data = report({ paired_returns_total: 60, paired_returns_informative: 60, calibration_eligible_pair_count: 0, calibration_min_pairs: 40 });
+    data.checks = [{ name: 'paired_calibration_not_worse', passed: true, detail: 'Existing gate result.' }];
+    render(<PolicyPromotionPanel report={data} />);
+    expect(screen.getByTestId('policy-promotion-pairs')).toHaveTextContent('60 informative pair(s)');
+    expect(screen.getByTestId('policy-promotion-check-paired_calibration_not_worse')).toHaveTextContent('insufficient evidence');
+    expect(screen.getByTestId('policy-promotion-calibration')).toHaveTextContent('0 eligible pair(s); 40 required');
+    expect(screen.getByTestId('policy-promotion-calibration')).toHaveTextContent('Existing not-worse gate: pass');
+    expect(data.checks[0].passed).toBe(true);
+  });
+
   it('flags a requested champion that is not in effect', () => {
     render(
       <PolicyPromotionPanel

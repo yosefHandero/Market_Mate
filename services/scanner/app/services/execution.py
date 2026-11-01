@@ -4,15 +4,17 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import math
 
 from sqlalchemy import desc, select
 
 from app.clients.alpaca import AlpacaClient
 from app.config import get_settings
+from app.core.paper_action import paper_action_checks
 from app.db import SessionLocal
 from app.errors import AppError
-from app.models.scan import ExecutionAuditORM
-from app.schemas import OrderPlaceRequest, OrderPlaceResponse, OrderPreviewRequest, OrderPreviewResponse
+from app.models.scan import ExecutionAuditORM, PaperPositionORM, PredictionSnapshotORM
+from app.schemas import GateCheck, OrderPlaceRequest, OrderPlaceResponse, OrderPreviewRequest, OrderPreviewResponse, PaperTradeContract
 from app.services.readiness import evaluate_operational_readiness
 from app.services.repository import ScanRepository
 from app.services.risk import RiskService
@@ -58,6 +60,42 @@ class ExecutionService:
 
     def _asset_type_for_symbol(self, symbol: str) -> str:
         return "crypto" if "/" in symbol else "stock"
+
+    def _paper_contract(self, *, ticker: str, trade_gate) -> PaperTradeContract:
+        # Read the saved production decision, never today's configured policy.
+        source_run_id = trade_gate.signal_run_id
+        policy_id = policy_version = decision_fingerprint = None
+        if source_run_id:
+            with SessionLocal() as session:
+                snapshot = session.execute(
+                    select(PredictionSnapshotORM).where(
+                        PredictionSnapshotORM.run_id == source_run_id,
+                        PredictionSnapshotORM.ticker == ticker,
+                        PredictionSnapshotORM.decision_role == "production",
+                    ).order_by(desc(PredictionSnapshotORM.id)).limit(1)
+                ).scalar_one_or_none()
+                if snapshot is not None:
+                    policy_id = snapshot.policy_id
+                    policy_version = snapshot.policy_version
+                    decision_fingerprint = snapshot.decision_fingerprint
+        horizon = trade_gate.horizon
+        return PaperTradeContract(
+            source_run_id=source_run_id, policy_id=policy_id, policy_version=policy_version,
+            decision_fingerprint=decision_fingerprint, holding_horizon=horizon,
+            holding_duration_seconds={"15m": 900, "1h": 3600, "1d": 86400, "1w": 604800}[horizon],
+        )
+
+    def _validate_preview_agreement(self, request: OrderPreviewRequest, contract: PaperTradeContract) -> None:
+        if request.paper_contract is None and request.preview_audit_id is None:
+            return
+        prior = self._get_audit(request.preview_audit_id)
+        saved = json.loads(prior.preview_payload or "{}").get("paper_contract") if prior else None
+        supplied = request.paper_contract.model_dump(mode="json") if request.paper_contract else saved
+        if supplied != saved or (saved is not None and saved != contract.model_dump(mode="json")):
+            raise AppError(
+                message="The scan or paper holding contract changed. Create a fresh preview before placing.",
+                status_code=409, code="paper_contract_changed",
+            )
 
     def _get_audit(self, audit_id: int | None) -> ExecutionAuditORM | None:
         if audit_id is None:
@@ -123,6 +161,12 @@ class ExecutionService:
                 )
                 session.add(row)
             else:
+                if row.lifecycle_status in {"submitted", "dry_run", "blocked"}:
+                    raise AppError(
+                        message="This preview already has a completed placement; reuse its original idempotency key.",
+                        status_code=409,
+                        code="preview_already_used",
+                    )
                 row.updated_at = now
                 row.asset_type = self._asset_type_for_symbol(preview.ticker)
                 row.side = preview.side
@@ -130,6 +174,9 @@ class ExecutionService:
                 row.qty = preview.qty
                 row.dry_run = True
                 row.idempotency_key = getattr(request, "idempotency_key", None)
+                row.idempotency_payload_hash = self._idempotency_payload_hash(
+                    request.model_dump(mode="json")
+                )
                 row.recommended_action_snapshot = request.recommended_action_snapshot
                 row.lifecycle_status = "previewed"
                 row.latest_price = preview.latest_price
@@ -178,6 +225,26 @@ class ExecutionService:
             row.error_message = error_message
             session.commit()
 
+    def _stamp_placement_identity(self, audit_id: int | None, request: OrderPlaceRequest) -> None:
+        """Persist the placement request, not the earlier preview body.
+
+        Preview and placement share an audit row. The idempotency hash has to
+        describe the operation that was actually completed, or an identical
+        placement retry is rejected as a different payload.
+        """
+        if audit_id is None:
+            return
+        payload = request.model_dump(mode="json")
+        with SessionLocal() as session:
+            row = session.get(ExecutionAuditORM, audit_id)
+            if row is None:
+                return
+            row.updated_at = datetime.now(timezone.utc)
+            row.idempotency_key = request.idempotency_key
+            row.request_payload = json.dumps(payload)
+            row.idempotency_payload_hash = self._idempotency_payload_hash(payload)
+            session.commit()
+
     def _enforce_execution_safeguards(self) -> None:
         if self.settings.execution_enabled or self.settings.allow_live_trading:
             raise AppError(
@@ -203,7 +270,7 @@ class ExecutionService:
                 code="dry_run_required",
             )
 
-    def _response_from_existing_audit(self, row: ExecutionAuditORM) -> OrderPlaceResponse:
+    def _response_from_existing_audit(self, row: ExecutionAuditORM, *, ledger_id: int | None = None) -> OrderPlaceResponse:
         raw_payload = {}
         if row.broker_payload:
             try:
@@ -216,6 +283,13 @@ class ExecutionService:
                 preview_payload = json.loads(row.preview_payload)
             except json.JSONDecodeError:
                 preview_payload = {}
+        with SessionLocal() as session:
+            saved_ledger_id = ledger_id or raw_payload.get("ledger_id")
+            position = session.get(PaperPositionORM, saved_ledger_id) if saved_ledger_id else session.execute(
+                select(PaperPositionORM)
+                .where(PaperPositionORM.execution_audit_id == row.id)
+                .limit(1)
+            ).scalar_one_or_none()
         return OrderPlaceResponse(
             ok=row.lifecycle_status in {"submitted", "dry_run"},
             submitted=row.submitted,
@@ -226,7 +300,15 @@ class ExecutionService:
             status=row.broker_status,
             raw=raw_payload or preview_payload,
             execution_audit_id=row.id,
+            trade_gate=preview_payload.get("trade_gate"),
+            ledger_id=position.id if position is not None else None,
+            fill_price=(raw_payload.get("fill_price") or row.latest_price) if row.side == "sell" and position else position.simulated_fill_price if position else None,
+            filled_qty=row.qty if row.side == "sell" and position else position.quantity if position else None,
+            slippage_assumption_bps=0.0 if position is not None else None,
             recommended_action_snapshot=row.recommended_action_snapshot,
+            paper_contract=preview_payload.get("paper_contract"),
+            filled_at=position.closed_at if row.side == "sell" and position else position.opened_at if position else None,
+            exit_due_at=position.exit_due_at if position is not None else None,
         )
 
     @staticmethod
@@ -252,15 +334,40 @@ class ExecutionService:
             latest_price = await self.alpaca.get_latest_crypto_price(ticker)
         else:
             latest_price = await self.alpaca.get_latest_price(ticker)
-        price_for_estimate = request.limit_price or latest_price
+        if not math.isfinite(latest_price) or latest_price <= 0:
+            raise AppError(message="No valid quote is available for a paper fill.", status_code=503, code="paper_quote_unavailable")
+        price_for_estimate = latest_price
+        if request.requested_notional_usd is not None:
+            qty = self.risk.suggest_paper_quantity(
+                requested_notional_usd=request.requested_notional_usd, latest_price=price_for_estimate,
+            )
+            if qty <= 0:
+                raise AppError(message="The requested budget cannot produce a positive quantity within paper limits.", status_code=400, code="unable_to_size")
+            request = request.model_copy(update={"qty": qty, "requested_notional_usd": None})
         warnings: list[str] = []
         warnings.append("Paper-only build: broker submission is permanently disabled.")
+        warnings.append("Time-based closure starts at the simulated fill; stop, target and forecast ranges are advisory only. No protective orders are active.")
         trade_gate = self.risk.evaluate_trade(
             ticker=ticker,
             side=request.side,
             qty=request.qty,
             latest_price=price_for_estimate,
         )
+        contract = self._paper_contract(ticker=ticker, trade_gate=trade_gate)
+        self._validate_preview_agreement(request, contract)
+        if request.side == "buy":
+            latest_run = self._scan_repository.get_latest_run()
+            result = next((row for row in latest_run.results if row.ticker == ticker), None) if latest_run else None
+            action_checks = paper_action_checks(result) if result is not None else [
+                GateCheck(name="paper_latest_result", passed=False, detail="No current scan row is available.")
+            ]
+            trade_gate.gate_checks.extend(action_checks)
+            failed_actions = [check for check in action_checks if not check.passed]
+            if failed_actions:
+                if trade_gate.allowed:
+                    trade_gate.reason = "Paper action blocked: " + "; ".join(check.detail for check in failed_actions) + "."
+                trade_gate.allowed = False
+                trade_gate.execution_eligibility = "blocked"
         if not trade_gate.allowed:
             warnings.append(trade_gate.reason)
         elif trade_gate.execution_eligibility == "review":
@@ -298,6 +405,7 @@ class ExecutionService:
             gate_result="allowed" if trade_gate.allowed else "blocked",
             freshness=freshness,
             reject_reasons=reject_reasons,
+            paper_contract=contract,
         )
         preview.execution_audit_id = self._write_audit(
             request=request,
@@ -327,8 +435,18 @@ class ExecutionService:
                 )
             self._enforce_operational_readiness()
             return self._response_from_existing_audit(existing)
+        if existing and existing.lifecycle_status == "previewed":
+            if request.preview_audit_id is not None and request.preview_audit_id != existing.id:
+                raise AppError(
+                    message="Idempotency key is already bound to a different preview.",
+                    status_code=409,
+                    code="idempotency_preview_mismatch",
+                )
+            if request.preview_audit_id is None:
+                request = request.model_copy(update={"preview_audit_id": existing.id})
 
         preview = await self.preview(request)
+        self._stamp_placement_identity(preview.execution_audit_id, request)
         if preview.trade_gate and not preview.trade_gate.allowed:
             self._update_audit(
                 audit_id=preview.execution_audit_id,
@@ -349,13 +467,7 @@ class ExecutionService:
                 execution_audit_id=preview.execution_audit_id,
                 recommended_action_snapshot=request.recommended_action_snapshot,
             )
-        self._update_audit(
-            audit_id=preview.execution_audit_id,
-            submitted=False,
-            lifecycle_status="dry_run",
-            broker_status="dry_run",
-            broker_payload=preview.model_dump(mode="json"),
-        )
+        filled_at = datetime.now(timezone.utc)
         if (
             preview.execution_audit_id is not None
             and preview.trade_gate is not None
@@ -366,27 +478,33 @@ class ExecutionService:
                 ledger_id = self._scan_repository.record_paper_position_from_audit(
                     audit_id=preview.execution_audit_id,
                     simulated_fill_price=float(preview.latest_price),
+                    filled_at=filled_at,
                 )
-            except Exception:
-                ledger_id = None
+            except Exception as exc:
                 logger.exception(
                     "Failed to persist manual dry-run paper position for audit %s.",
                     preview.execution_audit_id,
                 )
+                raise AppError(message="Paper fill could not be saved. No completed position is confirmed; retry this placement.", status_code=503, code="paper_position_persistence_failed") from exc
         else:
             ledger_id = None
-        return OrderPlaceResponse(
-            ok=True,
-            submitted=False,
-            dry_run=True,
-            message="Dry-run paper order recorded. No broker order request was made.",
-            idempotency_key=request.idempotency_key,
-            raw=preview.model_dump(),
-            trade_gate=preview.trade_gate,
-            execution_audit_id=preview.execution_audit_id,
-            ledger_id=ledger_id,
-            fill_price=preview.latest_price,
-            filled_qty=preview.qty,
-            slippage_assumption_bps=0.0,
-            recommended_action_snapshot=request.recommended_action_snapshot,
+        if ledger_id is None:
+            self._update_audit(
+                audit_id=preview.execution_audit_id, submitted=False, lifecycle_status="failed",
+                broker_status="failed", error_message="No paper position was recorded.",
+            )
+            raise AppError(message="No paper position was recorded.", status_code=503, code="paper_position_persistence_failed")
+        saved_audit = self._get_audit(preview.execution_audit_id)
+        response = self._response_from_existing_audit(saved_audit, ledger_id=ledger_id)
+        response = response.model_copy(update={
+            "ok": True, "message": "Dry-run paper order recorded. No broker order request was made.",
+            "raw": preview.model_dump(mode="json"), "trade_gate": preview.trade_gate,
+            "paper_contract": preview.paper_contract, "status": "dry_run",
+        })
+        # Retain the actual fill receipt for safe reconciliation; a later repair
+        # must not use its own wall clock as the original fill time.
+        self._update_audit(
+            audit_id=preview.execution_audit_id, submitted=False, lifecycle_status="dry_run",
+            broker_status="dry_run", broker_payload={**preview.model_dump(mode="json"), **response.model_dump(mode="json", exclude={"raw"})},
         )
+        return response

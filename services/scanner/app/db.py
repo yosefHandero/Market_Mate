@@ -111,6 +111,7 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "alerts_sent": "INTEGER DEFAULT 0",
         "fear_greed_value": "INTEGER",
         "fear_greed_label": "VARCHAR(32)",
+        "coverage_json": "TEXT",
     },
     "scan_results": {
         "asset_type": "VARCHAR(16) DEFAULT 'stock'",
@@ -332,6 +333,14 @@ REQUIRED_TABLE_COLUMNS: dict[str, dict[str, str]] = {
         "closed_at": "DATETIME",
         "strategy_version": "VARCHAR(32)",
         "confidence": "FLOAT",
+        "source_run_id": "VARCHAR(64)",
+        "policy_id": "VARCHAR(64)",
+        "policy_version": "VARCHAR(32)",
+        "decision_fingerprint": "VARCHAR(64)",
+        "holding_horizon": "VARCHAR(16)",
+        "holding_duration_seconds": "INTEGER",
+        "exit_method": "VARCHAR(32)",
+        "exit_due_at": "DATETIME",
     },
 }
 

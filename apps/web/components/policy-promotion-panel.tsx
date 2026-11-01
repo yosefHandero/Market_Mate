@@ -29,6 +29,8 @@ export function PolicyPromotionPanel({ report }: { report: PolicyPromotionReport
   const flipInEffect = report.effective_champion_policy_id !== report.champion_policy_id;
   const rulerFingerprint = shortFingerprint(report.ruler_fingerprint);
   const exclusions = exclusionSummary(report.pair_exclusion_counts);
+  const calibrationKnown = report.calibration_eligible_pair_count != null && report.calibration_min_pairs != null;
+  const calibrationInsufficient = calibrationKnown && report.calibration_eligible_pair_count! < report.calibration_min_pairs!;
 
   return (
     <section className="card policy-promotion-panel" aria-label="Champion and challenger promotion">
@@ -53,10 +55,20 @@ export function PolicyPromotionPanel({ report }: { report: PolicyPromotionReport
             data-testid={`policy-promotion-check-${check.name}`}
           >
             <span className="muted small">{check.name.replaceAll('_', ' ')}</span>
-            <strong className={check.passed ? 'positive' : 'negative'}>
-              {check.passed ? 'pass' : 'not yet'}
+            <strong className={check.name === 'paired_calibration_not_worse' && calibrationInsufficient ? 'muted' : check.passed ? 'positive' : 'negative'}>
+              {check.name === 'paired_calibration_not_worse' && calibrationInsufficient
+                ? 'insufficient evidence'
+                : check.passed ? 'pass' : 'not yet'}
             </strong>
             <span className="muted small">{check.detail}</span>
+            {check.name === 'paired_calibration_not_worse' ? (
+              <span className="muted small" data-testid="policy-promotion-calibration">
+                {calibrationKnown
+                  ? `Calibration: ${report.calibration_eligible_pair_count} eligible pair(s); ${report.calibration_min_pairs} required for the comparison.`
+                  : 'Calibration sample counts unavailable.'}
+                {calibrationInsufficient ? ` Existing not-worse gate: ${check.passed ? 'pass' : 'not yet'}; insufficient evidence does not establish calibration quality.` : ''}
+              </span>
+            ) : null}
           </div>
         ))}
       </div>

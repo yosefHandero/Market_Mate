@@ -16,7 +16,6 @@ from app.dependencies import (
     get_walk_forward_repository,
 )
 from app.core.freshness_policy import (
-    row_has_bad_freshness_flags,
     row_is_bar_stale,
     row_is_severely_stale,
     row_is_unusable_or_stale,
@@ -172,10 +171,6 @@ def _row_provider_critical(row: ScanResult) -> bool:
     return (row.provider_status or "").strip().lower() in {"critical", "error"}
 
 
-def _row_has_bad_freshness_flags(row: ScanResult) -> bool:
-    return row_has_bad_freshness_flags(row)
-
-
 def _row_severely_stale(row: ScanResult, settings) -> bool:
     return row_is_severely_stale(row, settings)
 
@@ -213,11 +208,7 @@ def _freshness_summary(
         max_stale_minutes=max_stale_minutes,
         scan_fresh=scan_fresh,
         total_count=len(rows),
-        stale_count=sum(
-            1
-            for row in rows
-            if row_is_bar_stale(row, settings) or _row_has_bad_freshness_flags(row)
-        ),
+        stale_count=sum(1 for row in rows if row_is_bar_stale(row, settings)),
         severe_stale_count=sum(
             1 for row in rows if _row_severely_stale(row, settings)
         ),
@@ -490,6 +481,7 @@ async def get_latest_decisions(
     limit: int = Query(default=20, ge=1, le=100),
     scan_repository: ScanRepository = Depends(get_scan_repository),
 ) -> list[DecisionRow]:
+    """Latest scan rows, selected symbols first, never more than ``limit``."""
     return scan_repository.get_latest_decisions(limit=limit)
 
 
@@ -581,11 +573,23 @@ async def get_proof_summary(
         last_scan_at=last_scan_at,
         health_max_stale_minutes=settings.health_max_stale_minutes,
     )
-    policy_promotion = BrainRuntime(
+    brain_runtime = BrainRuntime(
         settings=settings,
         repository=scan_repository,
         walk_forward_repository=walk_forward_repository,
-    ).promotion_report_response()
+    )
+    policy_promotion = brain_runtime.promotion_report_response()
+    live_forward = scan_repository.get_live_forward_progress()
+    runtime_policy = brain_runtime.registry.get(policy_promotion.effective_champion_policy_id)
+    live_forward.runtime_policy_id = runtime_policy.policy_id
+    live_forward.runtime_policy_version = runtime_policy.policy_version
+    live_forward.runtime_decision_fingerprint = runtime_policy.fingerprint()
+    if all((live_forward.saved_policy_id, live_forward.saved_policy_version, live_forward.saved_decision_fingerprint)):
+        live_forward.identity_matches_saved_campaign = (
+            live_forward.saved_policy_id == live_forward.runtime_policy_id
+            and live_forward.saved_policy_version == live_forward.runtime_policy_version
+            and live_forward.saved_decision_fingerprint == live_forward.runtime_decision_fingerprint
+        )
     return ProofSummaryResponse(
         generated_at=datetime.now(timezone.utc),
         ledger=ledger,
@@ -600,7 +604,7 @@ async def get_proof_summary(
         exit_window_accuracy=scan_repository.get_exit_window_accuracy_summary(),
         weekly_evidence=scan_repository.get_weekly_evidence_progress(),
         walk_forward=walk_forward_repository.get_latest_run_summary(),
-        live_forward=scan_repository.get_live_forward_progress(),
+        live_forward=live_forward,
         evidence_contract=[
             EvidenceTrackDescriptor(**track) for track in evidence_track_manifest()
         ],

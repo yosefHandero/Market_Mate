@@ -1,13 +1,24 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
 from app.clients.alpaca import AlpacaClient
 from app.config import Settings
 from app.http_client import ProviderRequestError
-from app.schemas import ScanResult
+from app.db import Base
+from app.models.scan import ScanRunORM
+from app.schemas import ScanResult, ScanRun
+from app.services.repository import ScanRepository
+import app.services.repository as repository_module
 from app.services.scanner import ScannerService
 
 
@@ -80,7 +91,30 @@ class PartialScanProviderTests(unittest.TestCase):
                 self.assertEqual(run.watchlist_size, 2)
                 self.assertEqual(run.scan_count, 1)
                 self.assertNotEqual(run.results[0].asset_type, failed_asset)
+                coverage = next(row for row in run.coverage if row.asset_type == failed_asset)
+                self.assertEqual(coverage.status, "unavailable")
+                self.assertEqual(coverage.missing_symbols[0].reason, "provider_unavailable")
+                self.assertIn("503", coverage.missing_symbols[0].detail)
                 service.repo.save_run.assert_called_once()
+
+    def test_missing_symbol_and_benchmark_reasons_do_not_change_returned_decisions(self):
+        service = self._service()
+        service.settings.watchlist = "AAPL,MSFT,SPY"
+        service._get_stock_bars_with_fallback.return_value = ({"AAPL": {}, "SPY": {"bars": [1]}}, "alpaca")
+        analyze = service._analyze_ticker
+
+        async def analyze_with_benchmark(**kwargs):
+            return None if kwargs["ticker"] == "SPY" else await analyze(**kwargs)
+
+        service._analyze_ticker = analyze_with_benchmark
+        run = asyncio.run(service.run_scan())
+        stock = next(row for row in run.coverage if row.asset_type == "stock")
+        self.assertEqual(stock.expected_symbols, ["AAPL", "MSFT", "SPY"])
+        self.assertEqual(stock.returned_symbols, ["AAPL"])
+        self.assertEqual(stock.status, "partial")
+        self.assertEqual({row.ticker: row.reason for row in stock.missing_symbols},
+                         {"MSFT": "market_data_missing", "SPY": "benchmark_only"})
+        self.assertEqual([row.ticker for row in run.results], ["AAPL", "BTC/USD"])
 
     def test_all_market_providers_failed_does_not_persist_empty_success(self):
         service = self._service()
@@ -90,3 +124,61 @@ class PartialScanProviderTests(unittest.TestCase):
         with self.assertRaises(ProviderRequestError):
             asyncio.run(service.run_scan())
         service.repo.save_run.assert_not_called()
+
+
+class ScanCoveragePersistenceTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.engine = create_engine(f"sqlite:///{(Path(directory.name) / 'coverage.db').as_posix()}")
+        self.addCleanup(self.engine.dispose)
+        Base.metadata.create_all(self.engine)
+        self.sessions = sessionmaker(bind=self.engine, expire_on_commit=False)
+        self.repo = ScanRepository()
+        self.repo.settings = Settings(_env_file=None)
+        for name, value in (("SessionLocal", self.sessions), ("engine", self.engine)):
+            patched = patch.object(repository_module, name, value)
+            patched.start()
+            self.addCleanup(patched.stop)
+
+    def _api_payload(self):
+        from app.api.public import protected_router, require_schema_ready
+        from app.auth import require_read_access
+        from app.dependencies import get_scanner_service
+
+        service = ScannerService.__new__(ScannerService)
+        service.repo = self.repo
+        app = FastAPI()
+        app.include_router(protected_router)
+        app.dependency_overrides[require_read_access] = lambda: None
+        app.dependency_overrides[require_schema_ready] = lambda: None
+        app.dependency_overrides[get_scanner_service] = lambda: service
+        with TestClient(app) as client:
+            response = client.get("/scan/latest")
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def test_saved_scan_coverage_survives_database_and_api_round_trip(self):
+        service = PartialScanProviderTests()._service()
+        service._get_stock_bars_with_fallback.side_effect = ProviderRequestError(
+            "temporary failure", provider="alpaca", url="test", retryable=True, status_code=503,
+        )
+        run = asyncio.run(service.run_scan())
+        self.repo.save_run(run)
+        expected = [row.model_dump(mode="json") for row in run.coverage]
+        self.assertEqual(self._api_payload()["coverage"], expected)
+        self.assertEqual(self.repo.get_run_history()[0].coverage, run.coverage)
+        with self.sessions() as session:
+            self.assertIsNotNone(session.execute(select(ScanRunORM)).scalar_one().coverage_json)
+
+    def test_legacy_scan_coverage_remains_unknown_in_database_and_api(self):
+        # A count shortfall alone cannot establish which symbols or why.
+        run = ScanRun(
+            run_id="legacy-coverage", created_at=datetime(2026, 9, 20, tzinfo=timezone.utc),
+            market_status="neutral", scan_count=0, watchlist_size=69, results=[],
+        )
+        self.repo.save_run(run)
+        self.assertIsNone(self._api_payload()["coverage"])
+        self.assertIsNone(self.repo.get_run_history()[0].coverage)
+        with self.sessions() as session:
+            self.assertIsNone(session.execute(select(ScanRunORM)).scalar_one().coverage_json)

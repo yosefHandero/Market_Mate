@@ -106,6 +106,7 @@ function automation(overrides: Partial<AutomationStatusResponse> = {}): Automati
 function result(overrides: Partial<ScanResult> = {}): ScanResult {
   return {
     ticker: 'AAPL',
+    asset_type: 'stock',
     provider_status: 'ok',
     bar_age_minutes: 5,
     freshness_flags: {},
@@ -173,6 +174,81 @@ describe('DashboardStatusBanner system readiness', () => {
 
   afterEach(() => vi.useRealTimers());
 
+  it('keeps six-minute bars fresh while reporting missing auxiliary inputs separately', () => {
+    const stock = result({
+      bar_as_of: '2026-05-22T11:59:00Z',
+      bar_age_minutes: 6,
+      freshness_flags: { market_bars: 'ok', options_flow: 'missing' },
+    });
+    const crypto = result({
+      ticker: 'LINK/USD', asset_type: 'crypto',
+      bar_as_of: '2026-05-22T11:59:00',
+      bar_age_minutes: 6,
+      freshness_flags: { market_bars: 'ok', directional_news: 'missing' },
+    });
+    render(<DashboardStatusBanner health={health()} automation={automation()} latestScan={scan([stock, crypto])} systemReadiness={serverReadiness()} />);
+    expect(screen.getByText('Stock bars').parentElement).toHaveTextContent('fresh');
+    expect(screen.getByText('Crypto bars').parentElement).toHaveTextContent('fresh');
+    expect(screen.getByTestId('bar-freshness-stock')).toHaveTextContent('oldest age 6m');
+    expect(screen.getByTestId('bar-freshness-crypto')).toHaveTextContent('oldest age 6m');
+    expect(screen.getByTestId('data-quality-banner')).toHaveTextContent('options_flow: missing');
+    expect(screen.getByTestId('data-quality-banner')).toHaveTextContent('directional_news: missing');
+    expect(screen.getByTestId('data-quality-banner')).not.toHaveTextContent('bars are stale');
+    expect(screen.getByText('System').parentElement).toHaveTextContent('WARN');
+    expect(stock.freshness_flags).toEqual({ market_bars: 'ok', options_flow: 'missing' });
+    expect(crypto.freshness_flags).toEqual({ market_bars: 'ok', directional_news: 'missing' });
+  });
+
+  it('does not call fresh bars stale when the provider is critical', () => {
+    const stock = result({
+      bar_as_of: '2026-05-22T11:59:00Z',
+      bar_age_minutes: 6,
+      provider_status: 'critical',
+      freshness_flags: { market_bars: 'ok' },
+    });
+    const crypto = result({
+      ticker: 'LINK/USD',
+      asset_type: 'crypto',
+      bar_as_of: '2026-05-22T11:59:00Z',
+      bar_age_minutes: 6,
+      provider_status: 'critical',
+      freshness_flags: { market_bars: 'ok', directional_news: 'missing' },
+    });
+    render(
+      <DashboardStatusBanner
+        health={health()}
+        automation={automation()}
+        latestScan={scan([stock, crypto])}
+      />,
+    );
+    expect(screen.getByText('Stock bars').parentElement).toHaveTextContent('fresh');
+    expect(screen.getByText('Crypto bars').parentElement).toHaveTextContent('fresh');
+    expect(screen.getByTestId('data-quality-banner')).toHaveTextContent(/critical provider status/i);
+    expect(screen.getByTestId('data-quality-banner')).toHaveTextContent('directional_news: missing');
+    expect(screen.getByTestId('data-quality-banner')).not.toHaveTextContent('bars are stale');
+    const summary = computeSystemReadiness({
+      health: health(),
+      automation: automation(),
+      latestScan: scan([stock, crypto]),
+    });
+    expect(summary.reasons).not.toContain('Severe global freshness failure');
+    expect(summary.reasons).not.toContain('Provider critical with unusable/stale data');
+  });
+
+  it('separates scan execution and stock/crypto bar timestamps without changing stored flags', () => {
+    const stock = result({ bar_as_of: '2026-05-20T12:00:00Z', freshness_flags: { market_bars: 'stale' } });
+    const crypto = result({ ticker: 'BTC/USD', asset_type: 'crypto', bar_as_of: '2026-05-22T12:03:00Z', freshness_flags: { market_bars: 'ok' } });
+    render(<DashboardStatusBanner health={health()} automation={automation()} latestScan={scan([stock, crypto])} />);
+    expect(screen.getByText('Stock bars').parentElement).toHaveTextContent('>24h stale');
+    expect(screen.getByText('Crypto bars').parentElement).toHaveTextContent('fresh');
+    expect(screen.getByTestId('scan-execution-time')).toHaveTextContent('2026-05-22T12:00:00.000Z');
+    expect(screen.getByTestId('bar-freshness-stock')).toHaveTextContent('2026-05-20T12:00:00Z');
+    expect(screen.getByTestId('bar-freshness-crypto')).toHaveTextContent('oldest age 2m');
+    expect(screen.getByTestId('data-quality-banner')).not.toHaveTextContent('Crypto bars are stale');
+    expect(crypto.freshness_flags).toEqual({ market_bars: 'ok' });
+    expect(stock.freshness_flags).toEqual({ market_bars: 'stale' });
+  });
+
   it('ages stored bars and identifies stale provider observations without changing the row', () => {
     vi.setSystemTime(new Date('2026-09-19T12:00:00Z'));
     const row = result({
@@ -185,7 +261,7 @@ describe('DashboardStatusBanner system readiness', () => {
     expect(screen.getByText('>24h stale')).toBeInTheDocument();
     expect(screen.getByText('ok (last scan)')).toBeInTheDocument();
     expect(screen.getByTestId('stale-scan-banner')).toHaveTextContent('historical snapshots');
-    expect(screen.getByTestId('scan-coverage')).toHaveTextContent('1 candidate results (0 stock, 1 crypto) from 69 configured symbols, including benchmarks');
+    expect(screen.getByTestId('scan-coverage')).toHaveTextContent('1 analyzed results (0 stock, 1 crypto) from 69 configured symbols, including benchmarks');
     expect(row.bar_age_minutes).toBe(5);
     expect(row.provider_status).toBe('ok');
   });
@@ -225,7 +301,8 @@ describe('DashboardStatusBanner system readiness', () => {
     expect(within(primary).getByText('System')).toBeInTheDocument();
     expect(within(primary).getByText('PASS')).toBeInTheDocument();
     expect(within(primary).getByText('Provider')).toBeInTheDocument();
-    expect(within(primary).getByText('Bars')).toBeInTheDocument();
+    expect(within(primary).getByText('Stock bars')).toBeInTheDocument();
+    expect(within(primary).getByText('Crypto bars')).toBeInTheDocument();
     // Worker / Scheduler detail moved into the health-details disclosure.
     expect(within(primary).queryByText('Scheduler')).not.toBeInTheDocument();
     expect(within(primary).queryByText('Worker')).not.toBeInTheDocument();
@@ -351,7 +428,7 @@ describe('DashboardStatusBanner system readiness', () => {
     expect(within(primary).getByText('WARN')).toBeInTheDocument();
     expect(within(primary).queryByText('PASS')).not.toBeInTheDocument();
     expect(screen.getByTestId('data-quality-banner')).toHaveTextContent(
-      /market data is stale or provider is critical/i,
+      /Stock bars are stale/i,
     );
   });
 

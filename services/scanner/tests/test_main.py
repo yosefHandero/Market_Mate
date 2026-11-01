@@ -907,6 +907,40 @@ class MainRouteTests(unittest.TestCase):
         self.assertTrue(body["automation"]["kill_switch_enabled"])
         self.assertEqual(body["automation"]["breaker_state"], "open")
 
+    def test_system_readiness_keeps_fresh_bars_separate_from_missing_news(self) -> None:
+        missing_news = self._sample_scan_result(ticker="LINK/USD")
+        missing_news.asset_type = "crypto"
+        missing_news.bar_age_minutes = 6
+        missing_news.provider_status = "degraded"
+        missing_news.freshness_flags = {"market_bars": "ok", "directional_news": "missing"}
+        critical_fresh = self._sample_scan_result(ticker="AAPL")
+        critical_fresh.bar_age_minutes = 6
+        critical_fresh.provider_status = "critical"
+        critical_fresh.freshness_flags = {"market_bars": "ok"}
+
+        with patch.object(
+            public_module,
+            "check_database_connection",
+            Mock(return_value=True),
+        ), patch.object(
+            main_module.scan_repository,
+            "get_latest_run",
+            Mock(return_value=self._sample_scan_run([missing_news, critical_fresh])),
+        ), patch.object(
+            main_module.automation_service,
+            "status",
+            Mock(return_value=self._sample_automation_status()),
+        ):
+            response = self.client.get("/system/readiness")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertNotIn("Severe global freshness failure", body["reasons"])
+        self.assertNotIn("Provider critical with unusable/stale data", body["reasons"])
+        self.assertEqual(body["freshness"]["stale_count"], 0)
+        self.assertEqual(body["freshness"]["severe_stale_count"], 0)
+        self.assertEqual(body["provider"]["worst_status"], "critical")
+
     def test_paper_ledger_summary_route_returns_backend_summary(self) -> None:
         with patch.object(
             main_module.scan_repository,

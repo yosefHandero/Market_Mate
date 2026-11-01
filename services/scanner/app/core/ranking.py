@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from app.config import Settings
-from app.core.freshness_policy import row_is_unusable_or_stale
+from app.core.freshness_policy import row_has_bad_freshness_flags, row_is_bar_stale
 from app.schemas import DecisionSignal, ScanResult
 
 
@@ -52,21 +52,30 @@ def actionability_sort_tier(
     eligibility = (getattr(row, "execution_eligibility", None) or "not_applicable").strip().lower()
     gate_passed = bool(getattr(row, "gate_passed", False))
 
-    stale = False
+    bar_stale = False
+    # Context flags still keep a row out of the clean tiers. They are not bar staleness.
+    data_quality_blocked = False
     if scan_result is not None:
-        stale = row_is_unusable_or_stale(scan_result, settings)
+        bar_stale = row_is_bar_stale(scan_result, settings)
+        data_quality_blocked = row_has_bad_freshness_flags(scan_result)
     elif getattr(row, "bar_age_minutes", None) is not None:
         age = float(row.bar_age_minutes)  # type: ignore[arg-type]
-        stale = age > settings.health_max_stale_minutes
+        bar_stale = age > settings.health_max_stale_minutes
+    operationally_blocked = bar_stale or data_quality_blocked
 
     if (
         gate_passed
         and provider in {"ok", "healthy"}
         and eligibility == "eligible"
-        and not stale
+        and not operationally_blocked
     ):
         return 0
-    if gate_passed and provider != "critical" and eligibility in {"eligible", "review"} and not stale:
+    if (
+        gate_passed
+        and provider != "critical"
+        and eligibility in {"eligible", "review"}
+        and not operationally_blocked
+    ):
         return 1
     return 2
 

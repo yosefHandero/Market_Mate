@@ -65,6 +65,22 @@ class PromotionReport:
         }
 
 
+def _calibration_detail(
+    paired_brier: PairedComparisonResult | None,
+    *,
+    min_pairs: int,
+) -> str:
+    if paired_brier is None:
+        return "No paired Brier sample; calibration gate deferred."
+    if paired_brier.n_pairs_informative < min_pairs:
+        return (
+            f"{paired_brier.summary} Missing probabilities are excluded from calibration "
+            "and are not replaced with confidence, zero, or another forecast. "
+            "Calibration evidence is insufficient."
+        )
+    return paired_brier.summary
+
+
 def build_promotion_report(
     *,
     champion_policy_id: str,
@@ -107,11 +123,7 @@ def build_promotion_report(
         PromotionCheck(
             name="paired_calibration_not_worse",
             passed=calibration_ok,
-            detail=(
-                paired_brier.summary
-                if paired_brier is not None
-                else "No paired Brier sample; calibration gate deferred."
-            ),
+            detail=_calibration_detail(paired_brier, min_pairs=min_pairs),
         ),
     )
     gates_cleared = all(check.passed for check in checks)

@@ -8,7 +8,7 @@ import type {
 } from '@/lib/types';
 import {
   FRESH_BAR_MAX_MINUTES,
-  hasBadFreshnessFlags as hasBadRowFreshnessFlags,
+  isHealthyFreshnessFlag,
   SCAN_FRESH_MAX_MINUTES,
 } from '@/lib/freshness';
 
@@ -62,16 +62,8 @@ function rowProviderCritical(row: Pick<ScanResult, 'provider_status'>): boolean 
   return normalized === 'critical' || normalized === 'error';
 }
 
-function rowHasBadFreshnessFlags(row: Pick<ScanResult, 'freshness_flags'>): boolean {
-  return hasBadRowFreshnessFlags(row.freshness_flags);
-}
-
 function rowBarAge(row: Pick<ScanResult, 'bar_age_minutes'>): number | null {
   return finiteNumber(row.bar_age_minutes);
-}
-
-function hasBadFreshnessFlags(latestScan: ScanRun | null): boolean {
-  return (latestScan?.results ?? []).some((row) => rowHasBadFreshnessFlags(row));
 }
 
 function displayedBarAge(row: ScanResult, latestScan: ScanRun): number | null {
@@ -83,34 +75,41 @@ function displayedBarAge(row: ScanResult, latestScan: ScanRun): number | null {
   return storedAge + (ageFromTimestamp(row.created_at ?? latestScan.created_at) ?? 0);
 }
 
-function barsState(latestScan: ScanRun | null): { label: string; tone: StatusTone } {
-  const ages = (latestScan?.results ?? [])
+function barsState(latestScan: ScanRun | null, assetType?: 'stock' | 'crypto'): { label: string; tone: StatusTone } {
+  const rows = (latestScan?.results ?? []).filter((row) => !assetType || row.asset_type === assetType);
+  const ages = rows
     .map((row) => displayedBarAge(row, latestScan!))
     .filter((age): age is number => age != null);
-  const badFlags = hasBadFreshnessFlags(latestScan);
-
-  if (!ages.length) {
-    return badFlags
-      ? { label: 'flags stale', tone: 'warning' }
-      : { label: 'unknown', tone: 'muted' };
-  }
+  if (!ages.length) return { label: 'unknown', tone: 'muted' };
 
   const maxAge = Math.max(...ages);
   if (maxAge > 1440) return { label: '>24h stale', tone: 'bad' };
   if (maxAge > 360) return { label: '>6h stale', tone: 'bad' };
   if (maxAge > 120) return { label: '>120m stale', tone: 'warning' };
-  if (maxAge > FRESH_BAR_MAX_MINUTES || badFlags) return { label: 'stale', tone: 'warning' };
+  if (maxAge > FRESH_BAR_MAX_MINUTES) return { label: 'stale', tone: 'warning' };
   return { label: 'fresh', tone: 'ok' };
+}
+
+function qualityFlagSummary(latestScan: ScanRun | null): string[] {
+  const counts = new Map<string, number>();
+  for (const row of latestScan?.results ?? []) {
+    for (const [source, flag] of Object.entries(row.freshness_flags ?? {})) {
+      if (isHealthyFreshnessFlag(flag)) continue;
+      const label = `${source}: ${flag}`;
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+  }
+  return [...counts].map(([label, count]) => `${label} (${count} ${count === 1 ? 'row' : 'rows'})`);
 }
 
 function rowSeverelyStale(row: ScanResult): boolean {
   const age = rowBarAge(row);
-  return (age != null && age > SEVERE_STALE_MINUTES) || rowHasBadFreshnessFlags(row);
+  return age != null && age > SEVERE_STALE_MINUTES;
 }
 
 function rowUnusableOrStale(row: ScanResult): boolean {
   const age = rowBarAge(row);
-  return age == null || age > FRESH_BAR_MAX_MINUTES || rowHasBadFreshnessFlags(row);
+  return age == null || age > FRESH_BAR_MAX_MINUTES;
 }
 
 function hasSevereGlobalFreshnessFailure({
@@ -179,12 +178,13 @@ function summarizeServerReadiness(
   };
 }
 
-/** Provider critical or bars not fresh (stale/warning) means signals may be unreliable. */
+/** Keep input-quality warnings independent of the age-based bar labels. */
 function isDataQualityDegraded(
   provider: { tone: StatusTone },
   bars: { tone: StatusTone },
+  hasQualityFlags: boolean,
 ): boolean {
-  return provider.tone === 'bad' || bars.tone === 'bad' || bars.tone === 'warning';
+  return provider.tone === 'bad' || bars.tone === 'bad' || bars.tone === 'warning' || hasQualityFlags;
 }
 
 /**
@@ -195,9 +195,10 @@ function applyDataQualityWarning(
   summary: SystemReadinessSummary,
   provider: { tone: StatusTone },
   bars: { tone: StatusTone },
+  hasQualityFlags: boolean,
 ): SystemReadinessSummary {
   if (summary.status !== 'PASS') return summary;
-  if (!isDataQualityDegraded(provider, bars)) return summary;
+  if (!isDataQualityDegraded(provider, bars, hasQualityFlags)) return summary;
   return {
     status: 'WARN',
     tone: 'warning',
@@ -245,11 +246,14 @@ export function DashboardStatusBanner({
   automation,
   latestScan,
   systemReadiness: serverReadiness,
+  compactDiagnostics = false,
 }: {
   health: HealthResponse | null;
   automation: AutomationStatusResponse | null;
   latestScan: ScanRun | null;
   systemReadiness?: SystemReadinessResponse | null;
+  /** Hide pills already shown by Proof risk controls. */
+  compactDiagnostics?: boolean;
 }) {
   const backendOk = health?.ok === true;
   const scanAge =
@@ -258,6 +262,9 @@ export function DashboardStatusBanner({
     (scanAge != null && scanAge > (health?.max_stale_minutes ?? SCAN_FRESH_MAX_MINUTES));
   const provider = providerState(latestScan);
   const bars = barsState(latestScan);
+  const stockBars = barsState(latestScan, 'stock');
+  const cryptoBars = barsState(latestScan, 'crypto');
+  const qualityFlags = qualityFlagSummary(latestScan);
   const schedulerEnabled = health?.scheduler_enabled === true;
   const workerRunning = health?.worker_alive ?? (health?.scheduler_running === true);
   const killSwitchOn = automation?.kill_switch_enabled === true;
@@ -266,32 +273,37 @@ export function DashboardStatusBanner({
   const baseReadiness =
     summarizeServerReadiness(serverReadiness) ??
     computeSystemReadiness({ health, automation, latestScan });
-  const systemReadiness = applyDataQualityWarning(baseReadiness, provider, bars);
+  const systemReadiness = applyDataQualityWarning(baseReadiness, provider, bars, qualityFlags.length > 0);
   const safetyActive = killSwitchOn || breakerOpen;
-  const dataQualityDegraded = isDataQualityDegraded(provider, bars);
+  const dataQualityDegraded = isDataQualityDegraded(provider, bars, qualityFlags.length > 0);
 
   return (
     <section className="system-health-banner" aria-label="Dashboard status">
       <div className="system-health-primary" data-testid="system-health-primary">
-        <StatusPill
-          label="Paper"
-          value={automation?.dry_run_only === false ? 'check' : 'dry-run only'}
-          tone={automation?.dry_run_only === false ? 'bad' : 'ok'}
-          title="Paper mode and dry-run only; no live trading"
-        />
+        {compactDiagnostics ? null : (
+          <StatusPill
+            label="Paper"
+            value={automation?.dry_run_only === false ? 'check' : 'dry-run only'}
+            tone={automation?.dry_run_only === false ? 'bad' : 'ok'}
+            title="Paper mode and dry-run only; no live trading"
+          />
+        )}
         <StatusPill
           label="System"
           value={systemReadiness.status}
           tone={systemReadiness.tone}
           title={systemReadiness.reasons.join('; ')}
         />
-        <StatusPill
-          label="Provider"
-          value={staleScan ? `${provider.label} (last scan)` : provider.label}
-          tone={staleScan && provider.tone === 'ok' ? 'muted' : provider.tone}
-          title="Provider status observed during the last scan; this is not a current connectivity check."
-        />
-        <StatusPill label="Bars" value={bars.label} tone={bars.tone} />
+        {compactDiagnostics ? null : (
+          <StatusPill
+            label="Provider"
+            value={staleScan ? `${provider.label} (last scan)` : provider.label}
+            tone={staleScan && provider.tone === 'ok' ? 'muted' : provider.tone}
+            title="Provider status observed during the last scan; this is not a current connectivity check."
+          />
+        )}
+        <StatusPill label="Stock bars" value={stockBars.label} tone={stockBars.tone} />
+        <StatusPill label="Crypto bars" value={cryptoBars.label} tone={cryptoBars.tone} />
         <StatusPill
           label="Real-money trust"
           value={health?.trust_evidence_ready === true ? 'evidence ready' : 'blocked'}
@@ -303,12 +315,68 @@ export function DashboardStatusBanner({
       </div>
 
       {latestScan ? (
+        <p className="muted small" data-testid="scan-execution-time">
+          Scan execution recorded: {latestScan.created_at} ({formatMinutes(scanAge)} ago).
+        </p>
+      ) : null}
+      {(['stock', 'crypto'] as const).map((assetType) => {
+        const rows = (latestScan?.results ?? []).filter((row) => row.asset_type === assetType);
+        if (!latestScan || !rows.length) return null;
+        const datedRows = rows.filter((row) => ageFromTimestamp(row.bar_as_of) != null);
+        const oldest = datedRows.reduce<ScanResult | null>((current, row) =>
+          !current || ageFromTimestamp(row.bar_as_of)! > ageFromTimestamp(current.bar_as_of)! ? row : current, null);
+        const ages = rows.map((row) => displayedBarAge(row, latestScan)).filter((age): age is number => age != null);
+        return (
+          <p className="muted small" key={assetType} data-testid={`bar-freshness-${assetType}`}>
+            {assetType === 'stock' ? 'Stock' : 'Crypto'} bars: oldest recorded timestamp {oldest?.bar_as_of ?? 'unavailable'};
+            {' '}oldest age {formatMinutes(ages.length ? Math.max(...ages) : null)}.
+            {' '}Bars become stale above {FRESH_BAR_MAX_MINUTES}m.
+          </p>
+        );
+      })}
+
+      {latestScan ? (
         <p className="muted small" data-testid="scan-coverage">
-          Last scan: {latestScan.results.length} candidate results ({latestScan.results.filter((row) => row.asset_type === 'stock').length} stock,{' '}
+          Last scan: {latestScan.results.length} analyzed results ({latestScan.results.filter((row) => row.asset_type === 'stock').length} stock,{' '}
           {latestScan.results.filter((row) => row.asset_type === 'crypto').length} crypto) from{' '}
           {latestScan.watchlist_size} configured symbols, including benchmarks.
         </p>
       ) : null}
+
+      {latestScan?.coverage?.length ? (
+        <div aria-label="Scan coverage details">
+          {latestScan.coverage.map((coverage) => (
+            <div key={coverage.asset_type}>
+              <p className={`small ${coverage.status === 'complete' ? 'muted' : 'warning'}`}>
+                {coverage.asset_type === 'stock' ? 'Stock' : 'Crypto'} coverage: {coverage.returned_symbols.length}/{coverage.expected_symbols.length}{' '}
+                symbols analyzed — {coverage.status.replaceAll('_', ' ')}.
+                {coverage.status === 'partial' || coverage.status === 'unavailable'
+                  ? ' Missing symbols were not evaluated; this is not a full scan.' : ''}
+              </p>
+              {coverage.missing_symbols.length ? (
+                <details className="ui-disclosure">
+                  <summary className="ui-disclosure-summary small">
+                    Missing {coverage.asset_type} symbols ({coverage.missing_symbols.length})
+                  </summary>
+                  <ul className="small">
+                    {coverage.missing_symbols.map((missing) => (
+                      <li key={missing.ticker}>
+                        <strong>{missing.ticker}</strong>: {missing.detail || missing.reason.replaceAll('_', ' ')}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : latestScan ? (
+        <p className="muted small">
+          Coverage details were not recorded for this scan. Full coverage and missing-symbol reasons cannot be verified.
+        </p>
+      ) : (
+        <p className="muted small">No scan has been saved yet. Run a scan to check coverage and candidates.</p>
+      )}
 
       {staleScan ? (
         <p className="small warning" role="status" data-testid="stale-scan-banner">
@@ -317,7 +385,7 @@ export function DashboardStatusBanner({
         </p>
       ) : null}
 
-      {safetyActive ? (
+      {!compactDiagnostics && safetyActive ? (
         <p className="system-health-safety-alert small negative" role="status">
           {killSwitchOn ? 'Kill switch is on. ' : ''}
           {breakerOpen ? 'Circuit breaker is open. ' : ''}
@@ -331,8 +399,11 @@ export function DashboardStatusBanner({
           role="status"
           data-testid="data-quality-banner"
         >
-          Market data is stale or provider is critical. Signals may be unreliable until fresh
-          data is available.
+          {stockBars.tone === 'bad' || stockBars.tone === 'warning' ? 'Stock bars are stale. ' : ''}
+          {cryptoBars.tone === 'bad' || cryptoBars.tone === 'warning' ? 'Crypto bars are stale. ' : ''}
+          {qualityFlags.length ? `Recorded data-quality flags: ${qualityFlags.join('; ')}. ` : ''}
+          {provider.tone === 'bad' ? 'The last scan recorded a critical provider status. ' : ''}
+          Affected signals may be unreliable.
         </p>
       ) : null}
 

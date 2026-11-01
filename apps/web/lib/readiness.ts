@@ -8,6 +8,8 @@ import type {
 } from '@/lib/types';
 import { FRESH_BAR_MAX_MINUTES } from '@/lib/freshness';
 
+export const PAPER_READY_MIN_SCORE = 70;
+
 export type ReadinessTone = 'high' | 'watch' | 'low' | 'none';
 export type ReadinessBand = ReadinessTone;
 
@@ -80,7 +82,7 @@ function cleanGateMessage(value: string | null | undefined): string | null {
 }
 
 function failedGateChecks(result: ScanResult) {
-  return result.gate_checks.filter((check) => !check.passed);
+  return (result.gate_checks ?? []).filter((check) => !check.passed);
 }
 
 function isSampleSizeOnlyBlocked(result: ScanResult): boolean {
@@ -271,7 +273,7 @@ export function classifyReadinessState(
   if (gateFailed && !isSampleSizeOnlyBlocked(result)) return 'blocked';
   if (action === 'review') return 'review';
 
-  if (readiness.score >= 70 && (action === 'preview' || action === 'dry_run')) return 'ready';
+  if (readiness.score >= PAPER_READY_MIN_SCORE && (action === 'preview' || action === 'dry_run')) return 'ready';
   if (readiness.score >= 50 && !readiness.hardStop) return 'watch';
   if (action === 'blocked') return 'blocked';
 

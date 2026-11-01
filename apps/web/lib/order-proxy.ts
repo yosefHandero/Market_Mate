@@ -1,10 +1,12 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { parseOrderPayload } from '@/lib/paper-trading';
+import type { PaperTradeContract } from '@/lib/types';
 
 export type NormalizedOrderPayload = {
   ticker: string;
   side: 'buy' | 'sell';
-  qty: number;
+  qty?: number | null;
+  requested_notional_usd?: number | null;
   order_type: 'market' | 'limit';
   limit_price?: number | null;
   preview_audit_id?: number | null;
@@ -14,6 +16,7 @@ export type NormalizedOrderPayload = {
   stop_price?: number | null;
   target_price?: number | null;
   recommended_action_snapshot?: string | null;
+  paper_contract?: PaperTradeContract | null;
   dry_run?: boolean;
 };
 

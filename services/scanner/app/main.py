@@ -26,6 +26,7 @@ from app.errors import AppError
 from app.logging_utils import configure_logging
 from app.middleware import RequestContextMiddleware
 from app.services.startup_maintenance import StartupMaintenanceService
+from app.services.runtime_identity import log_runtime_identity
 
 settings = get_settings()
 configure_logging()
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.cache_dir_path.mkdir(parents=True, exist_ok=True)
+    log_runtime_identity("api")
     # Paper-only enforcement now lives in Settings.forbid_live_execution, so any
     # process that reaches this point has already validated that live-execution
     # flags are false. ExecutionService keeps a per-request safeguard as well.
@@ -65,14 +67,15 @@ async def lifespan(_: FastAPI):
         )
     startup_maintenance_result = None
     try:
-        startup_maintenance_result = await asyncio.wait_for(
-            StartupMaintenanceService(
-                sync_signal_outcome_returns=scan_repository.sync_signal_outcome_returns,
-                backfill_execution_audit_signal_links=scan_repository.backfill_execution_audit_signal_links,
-                recover_due_intents=automation_service.recover_due_intents,
-            ).run_if_due(),
-            timeout=settings.startup_check_timeout_seconds,
-        )
+        if not settings.runtime_verification_mode:
+            startup_maintenance_result = await asyncio.wait_for(
+                StartupMaintenanceService(
+                    sync_signal_outcome_returns=scan_repository.sync_signal_outcome_returns,
+                    backfill_execution_audit_signal_links=scan_repository.backfill_execution_audit_signal_links,
+                    recover_due_intents=automation_service.recover_due_intents,
+                ).run_if_due(),
+                timeout=settings.startup_check_timeout_seconds,
+            )
     except TimeoutError:
         logger.warning(
             "startup maintenance exceeded timeout",

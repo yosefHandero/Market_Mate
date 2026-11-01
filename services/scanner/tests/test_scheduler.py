@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, call, patch
 
+from app.config import get_settings
 from app.services.scheduler import SchedulerService
 
 
@@ -14,6 +15,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
         scanner_service.run_scan = AsyncMock(return_value=None)
 
         repository = Mock()
+        repository.settings = get_settings()
         repository.acquire_lease.return_value = True
         repository.due_for_run.return_value = True
 
@@ -26,9 +28,9 @@ class SchedulerServiceLoopTests(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 asyncio.run(service.run_forever())
 
-        instance_id = service.settings.app_instance_id
+        instance_id = repository.acquire_lease.call_args.args[0]
+        self.assertTrue(instance_id.startswith("scheduled-"))
         repository.acquire_lease.assert_called_once_with(instance_id, for_maintenance=True)
-        repository.heartbeat.assert_called_once_with(instance_id)
         scanner_service.refresh_due_signal_outcomes.assert_awaited_once()
         scanner_service.close_open_positions_past_horizon.assert_awaited_once()
         repository.mark_run_started.assert_called_once_with(instance_id)
@@ -44,6 +46,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
         scanner_service.run_scan = AsyncMock(side_effect=RuntimeError("scan failed"))
 
         repository = Mock()
+        repository.settings = get_settings()
         repository.acquire_lease.return_value = True
         repository.due_for_run.return_value = True
 
@@ -56,7 +59,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 asyncio.run(service.run_forever())
 
-        instance_id = service.settings.app_instance_id
+        instance_id = repository.acquire_lease.call_args.args[0]
         repository.mark_run_started.assert_called_once_with(instance_id)
         repository.mark_run_finished.assert_called_once_with(instance_id, error="scan failed")
         repository.release_lease.assert_called_once_with(instance_id)
@@ -69,6 +72,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
         scanner_service.run_scan = AsyncMock(return_value=None)
 
         repository = Mock()
+        repository.settings = get_settings()
         repository.reset_missed_run_on_startup.return_value = False
         repository.acquire_lease.return_value = True
         repository.due_for_run.return_value = False
@@ -82,7 +86,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 asyncio.run(service.run_forever())
 
-        instance_id = service.settings.app_instance_id
+        instance_id = repository.acquire_lease.call_args.args[0]
         repository.reset_missed_run_on_startup.assert_called_once_with(
             interval_seconds=service.settings.scan_interval_seconds
         )
@@ -100,6 +104,7 @@ class SchedulerServiceLoopTests(unittest.TestCase):
         scanner_service.run_scan = AsyncMock(return_value=None)
 
         repository = Mock()
+        repository.settings = get_settings()
         repository.reset_missed_run_on_startup.return_value = True
         repository.acquire_lease.return_value = True
         repository.due_for_run.return_value = True
@@ -113,21 +118,15 @@ class SchedulerServiceLoopTests(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 asyncio.run(service.run_forever())
 
-        instance_id = service.settings.app_instance_id
-        repository.assert_has_calls(
-            [
-                call.reset_missed_run_on_startup(
-                    interval_seconds=service.settings.scan_interval_seconds
-                ),
-                call.recover_stale_run(),
-                call.acquire_lease(instance_id, for_maintenance=True),
-                call.heartbeat(instance_id),
-                call.due_for_run(),
-                call.mark_run_started(instance_id),
-                call.mark_run_finished(instance_id),
-                call.release_lease(instance_id),
-            ]
+        instance_id = repository.acquire_lease.call_args.args[0]
+        repository.reset_missed_run_on_startup.assert_called_once_with(
+            interval_seconds=service.settings.scan_interval_seconds
         )
+        repository.recover_stale_run.assert_called_once_with()
+        repository.acquire_lease.assert_called_once_with(instance_id, for_maintenance=True)
+        repository.mark_run_started.assert_called_once_with(instance_id)
+        repository.mark_run_finished.assert_called_once_with(instance_id)
+        repository.release_lease.assert_called_once_with(instance_id)
         scanner_service.run_scan.assert_awaited_once()
 
 

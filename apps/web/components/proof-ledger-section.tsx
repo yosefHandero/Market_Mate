@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { PaperLedgerPanel } from '@/components/paper-ledger-panel';
 import { getPaperLedger, getPaperLedgerSummary } from '@/lib/trading-desk';
 import type { PaperLedgerSummary, PaperPositionSummary } from '@/lib/types';
@@ -20,6 +20,13 @@ export function ProofLedgerSection({
   const [summary, setSummary] = useState(initialSummary);
   const [errorMessage, setErrorMessage] = useState<string | null>(initialError ?? null);
   const [refreshing, setRefreshing] = useState(false);
+
+  // The Proof page streams behind a loading boundary, so the router's hash
+  // scroll can fire before #paper-ledger exists. Finish the jump once mounted.
+  useEffect(() => {
+    if (typeof window === 'undefined' || window.location.hash !== '#paper-ledger') return;
+    document.getElementById('paper-ledger')?.scrollIntoView({ block: 'start' });
+  }, []);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);

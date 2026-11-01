@@ -27,7 +27,10 @@ export function PredictionAccuracyPanel({
     <section className="card" aria-label="Prediction accuracy">
       <h2 className="proof-section-title">Prediction accuracy</h2>
       <p className="muted small" style={{ marginTop: 0 }}>
-        Tracks whether price at the structural horizon landed inside the predicted stop/target range.
+        Tracks whether price at each saved forecast horizon landed inside its advisory range
+        (weekly when present, otherwise structural). In-range accuracy is separate from direction,
+        signal confidence and paper-trade profit. Stop and target levels are not active orders.
+        {' '}{metrics.scope === 'campaign' ? `Current campaign: ${metrics.campaign_id}.` : 'Historical totals across all campaigns.'}
       </p>
       {metrics.note ? (
         <p className="muted small" data-testid="prediction-accuracy-note">

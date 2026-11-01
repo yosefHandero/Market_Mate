@@ -28,6 +28,9 @@ class JsonLogFormatter(logging.Formatter):
 
 def configure_logging() -> None:
     settings = get_settings()
+    # httpx INFO request lines contain full query strings, including provider
+    # API tokens. Provider diagnostics already use credential-free messages.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     root = logging.getLogger()
     if getattr(root, "_market_mate_configured", False):
         return

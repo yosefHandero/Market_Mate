@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -16,8 +17,49 @@ import app.services.repository as repository_module
 from app.db import Base
 from app.errors import AppError
 from app.models.scan import ExecutionAuditORM, PaperPositionORM
-from app.schemas import OrderPlaceRequest, OrderPreviewRequest, TradeEligibility
+from app.core.paper_action import paper_action_checks
+from app.schemas import GateCheck, OrderPlaceRequest, OrderPreviewRequest, ScanResult, TradeEligibility
 from app.services.execution import ExecutionService
+
+
+def _paper_buy_row(ticker: str = "AAPL", **overrides) -> ScanResult:
+    payload = {
+        "ticker": ticker,
+        "asset_type": "crypto" if "/" in ticker else "stock",
+        "score": 88.0,
+        "raw_score": 88.0,
+        "calibrated_confidence": 88.0,
+        "decision_signal": "BUY",
+        "explanation": "Eligible paper fixture.",
+        "price": 100.0,
+        "price_change_pct": 1.2,
+        "relative_volume": 1.4,
+        "sentiment_score": 0.2,
+        "filing_flag": False,
+        "breakout_flag": True,
+        "market_status": "bullish",
+        "sector_strength_score": 0.4,
+        "gate_passed": True,
+        "gate_reason": "Passed.",
+        "gate_checks": [GateCheck(name="sample_size", passed=True, detail="30 vs 30")],
+        "evidence_quality": "high",
+        "execution_eligibility": "eligible",
+        "recommended_action": "dry_run",
+        "provider_status": "ok",
+        "bar_age_minutes": 5.0,
+        "freshness_flags": {"market_bars": "ok", "directional_news": "ok"},
+        "readiness_score": 88.0,
+        "readiness_hard_stop": False,
+        "created_at": datetime(2026, 9, 28, 14, 22, tzinfo=timezone.utc),
+    }
+    payload.update(overrides)
+    return ScanResult(**payload)
+
+
+def _allow_current_buy(service: ExecutionService, ticker: str = "AAPL") -> ScanResult:
+    row = _paper_buy_row(ticker)
+    service._scan_repository.get_latest_run = lambda: SimpleNamespace(results=[row])
+    return row
 
 
 class ExecutionServiceTests(unittest.TestCase):
@@ -392,6 +434,7 @@ class ExecutionServiceTests(unittest.TestCase):
                 service.settings.paper_loop_kill_switch = False
                 service.settings.require_readyz_for_execution = False
                 service.alpaca.get_latest_price = AsyncMock(return_value=100.0)
+                _allow_current_buy(service, "AAPL")
                 service.risk.evaluate_trade = lambda **_: TradeEligibility(
                     ticker="AAPL",
                     asset_type="stock",
@@ -452,6 +495,7 @@ class ExecutionServiceTests(unittest.TestCase):
                 service.settings.paper_loop_kill_switch = False
                 service.settings.require_readyz_for_execution = False
                 service.alpaca.get_latest_price = AsyncMock(return_value=100.0)
+                _allow_current_buy(service, "AAPL")
                 service.risk.evaluate_trade = lambda **_: TradeEligibility(
                     ticker="AAPL",
                     asset_type="stock",
@@ -710,6 +754,7 @@ class ExecutionServiceTests(unittest.TestCase):
                 service.settings.require_readyz_for_execution = False
                 service.alpaca.get_latest_price = AsyncMock(return_value=190.0)
                 service.alpaca._request_json = AsyncMock()
+                _allow_current_buy(service, "AAPL")
                 service.risk.evaluate_trade = lambda **_: TradeEligibility(
                     ticker="AAPL",
                     asset_type="stock",
@@ -956,6 +1001,7 @@ class ExecutionServiceTests(unittest.TestCase):
                 service = ExecutionService()
                 service.settings.require_readyz_for_execution = False
                 service.alpaca.get_latest_price = AsyncMock(return_value=100.0)
+                _allow_current_buy(service, "AAPL")
                 service.risk.evaluate_trade = lambda **_: TradeEligibility(
                     ticker="AAPL",
                     asset_type="stock",
@@ -1051,6 +1097,196 @@ class ExecutionServiceTests(unittest.TestCase):
                 self.assertFalse(response.ok)
                 self.assertTrue(response.dry_run)
                 self.assertEqual(positions, [])
+            finally:
+                engine.dispose()
+
+    def _eligible_trade(self, *, ticker: str, price: float) -> TradeEligibility:
+        asset_type = "crypto" if "/" in ticker else "stock"
+        return TradeEligibility(
+            ticker=ticker,
+            asset_type=asset_type,
+            requested_side="buy",
+            required_signal="BUY",
+            horizon="1h",
+            execution_eligibility="eligible",
+            latest_scan_fresh=True,
+            allowed=True,
+            reason="Eligible.",
+            notional_estimate=price,
+            qty=1.0,
+            strategy_version="v4.0-layered",
+        )
+
+    def test_preview_to_placement_retries_the_placement_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                service = ExecutionService()
+                service.settings.require_readyz_for_execution = False
+                service.alpaca.get_latest_price = AsyncMock(return_value=190.0)
+                service.alpaca._request_json = AsyncMock()
+                row = _allow_current_buy(service, "AAPL")
+                self.assertTrue(all(check.passed for check in paper_action_checks(row)))
+                service.risk.evaluate_trade = lambda **_: self._eligible_trade(ticker="AAPL", price=190.0)
+
+                preview_request = OrderPreviewRequest(ticker="AAPL", side="buy", qty=1, mode="dry_run")
+                place_request = OrderPlaceRequest(
+                    ticker="AAPL",
+                    side="buy",
+                    qty=1,
+                    dry_run=True,
+                    mode="dry_run",
+                    idempotency_key="placement-identity-1",
+                )
+                with patch.object(execution_module, "SessionLocal", SessionLocal), patch.object(
+                    automation_repository_module,
+                    "SessionLocal",
+                    SessionLocal,
+                ):
+                    preview = asyncio.run(service.preview(preview_request))
+                    place_request = place_request.model_copy(
+                        update={"preview_audit_id": preview.execution_audit_id}
+                    )
+                    with SessionLocal() as session:
+                        stored_preview = session.get(ExecutionAuditORM, preview.execution_audit_id)
+                        preview_hash = stored_preview.idempotency_payload_hash
+                    placed = asyncio.run(service.place(place_request))
+                    place_hash = ExecutionService._idempotency_payload_hash(
+                        place_request.model_dump(mode="json")
+                    )
+                    with SessionLocal() as session:
+                        audit = session.get(ExecutionAuditORM, placed.execution_audit_id)
+                        self.assertEqual(session.query(ExecutionAuditORM).count(), 1)
+                        self.assertEqual(session.query(PaperPositionORM).count(), 1)
+                    retried = asyncio.run(service.place(place_request))
+                    with SessionLocal() as session:
+                        self.assertEqual(session.query(ExecutionAuditORM).count(), 1)
+                        self.assertEqual(session.query(PaperPositionORM).count(), 1)
+                    with self.assertRaises(AppError) as ctx:
+                        asyncio.run(service.place(place_request.model_copy(update={"qty": 2})))
+
+                self.assertEqual(preview.gate_result, "allowed")
+                self.assertEqual(
+                    preview_hash,
+                    ExecutionService._idempotency_payload_hash(preview_request.model_dump(mode="json")),
+                )
+                self.assertNotEqual(preview_hash, place_hash)
+                self.assertEqual(audit.idempotency_payload_hash, place_hash)
+                self.assertEqual(audit.lifecycle_status, "dry_run")
+                self.assertEqual(audit.idempotency_key, "placement-identity-1")
+                self.assertTrue(placed.ok)
+                self.assertEqual(placed.ledger_id, retried.ledger_id)
+                self.assertEqual(placed.execution_audit_id, retried.execution_audit_id)
+                self.assertIn("Reused prior", retried.message)
+                self.assertEqual(ctx.exception.code, "idempotency_payload_mismatch")
+                service.alpaca._request_json.assert_not_awaited()
+            finally:
+                engine.dispose()
+
+    def test_blocked_link_preview_cannot_open_a_paper_position(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "scanner.db"
+            engine = create_engine(
+                f"sqlite:///{database_path.as_posix()}",
+                future=True,
+                connect_args={"check_same_thread": False},
+            )
+            SessionLocal = sessionmaker(
+                bind=engine,
+                autoflush=False,
+                autocommit=False,
+                expire_on_commit=False,
+                future=True,
+            )
+            Base.metadata.create_all(engine)
+            try:
+                service = ExecutionService()
+                service.settings.require_readyz_for_execution = False
+                service.alpaca.get_latest_crypto_price = AsyncMock(return_value=14.25)
+                service.alpaca._request_json = AsyncMock()
+                eligible = _paper_buy_row("LINK/USD")
+                blocked = _paper_buy_row(
+                    "LINK/USD",
+                    gate_passed=False,
+                    gate_reason="crypto BUY bucket has 0 1h outcomes; need 30",
+                    gate_checks=[
+                        GateCheck(name="sample_size", passed=False, detail="crypto BUY bucket has 0 1h outcomes; need 30"),
+                        GateCheck(name="win_rate", passed=False, detail="crypto win rate 0.00% vs min 55.00%"),
+                        GateCheck(name="avg_return", passed=False, detail="crypto avg return 0.0000% vs min 0.1500%"),
+                    ],
+                    evidence_quality="low",
+                    execution_eligibility="review",
+                    recommended_action="review",
+                    provider_status="degraded",
+                    freshness_flags={"market_bars": "ok", "directional_news": "missing"},
+                    bar_age_minutes=6.0,
+                    readiness_score=8.0,
+                )
+                self.assertFalse(all(check.passed for check in paper_action_checks(blocked)))
+                current = {"row": eligible}
+                service._scan_repository.get_latest_run = lambda: SimpleNamespace(results=[current["row"]])
+                service.risk.evaluate_trade = lambda **_: self._eligible_trade(ticker="LINK/USD", price=14.25)
+
+                with patch.object(execution_module, "SessionLocal", SessionLocal), patch.object(
+                    automation_repository_module,
+                    "SessionLocal",
+                    SessionLocal,
+                ):
+                    preview = asyncio.run(
+                        service.preview(OrderPreviewRequest(ticker="LINK/USD", side="buy", qty=1, mode="dry_run"))
+                    )
+                    self.assertEqual(preview.gate_result, "allowed")
+                    current["row"] = blocked
+                    place_request = OrderPlaceRequest(
+                        ticker="LINK/USD",
+                        side="buy",
+                        qty=1,
+                        dry_run=True,
+                        mode="dry_run",
+                        preview_audit_id=preview.execution_audit_id,
+                        idempotency_key="link-blocked-place-1",
+                    )
+                    placed = asyncio.run(service.place(place_request))
+                    retried = asyncio.run(service.place(place_request))
+                    with SessionLocal() as session:
+                        audits = session.query(ExecutionAuditORM).all()
+                        positions = session.query(PaperPositionORM).all()
+                        audit = audits[0]
+
+                self.assertFalse(placed.ok)
+                self.assertFalse(placed.trade_gate.allowed)
+                self.assertIn("evidence gate=False", placed.message)
+                self.assertIn("directional_news=missing", placed.message)
+                self.assertEqual(retried.execution_audit_id, placed.execution_audit_id)
+                self.assertFalse(retried.ok)
+                self.assertIn("Order blocked by trade gate", retried.message)
+                self.assertEqual(len(audits), 1)
+                self.assertEqual(positions, [])
+                self.assertEqual(audit.lifecycle_status, "blocked")
+                self.assertEqual(
+                    audit.idempotency_payload_hash,
+                    ExecutionService._idempotency_payload_hash(place_request.model_dump(mode="json")),
+                )
+                self.assertNotEqual(
+                    audit.idempotency_payload_hash,
+                    ExecutionService._idempotency_payload_hash(
+                        OrderPreviewRequest(ticker="LINK/USD", side="buy", qty=1, mode="dry_run").model_dump(mode="json")
+                    ),
+                )
+                service.alpaca._request_json.assert_not_awaited()
             finally:
                 engine.dispose()
 

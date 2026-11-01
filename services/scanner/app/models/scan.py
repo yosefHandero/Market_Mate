@@ -18,6 +18,7 @@ class ScanRunORM(Base):
     alerts_sent: Mapped[int] = mapped_column(Integer, default=0)
     fear_greed_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
     fear_greed_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    coverage_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ScanResultORM(Base):
@@ -231,6 +232,15 @@ class PaperPositionORM(Base):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     strategy_version: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Nullable by design: pre-contract positions retain unknown historical terms.
+    source_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    policy_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    policy_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    holding_horizon: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    holding_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    exit_method: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    exit_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class PredictionSnapshotORM(Base):
