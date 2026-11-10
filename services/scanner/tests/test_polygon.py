@@ -43,8 +43,11 @@ class PolygonClientTests(unittest.TestCase):
                         }
                     ]
                 ),
-            ):
-                return await client.get_latest_bars(["AAPL"], bar_builder=bar_builder)
+            ) as fetch:
+                result = await client.get_latest_bars(["AAPL"], bar_builder=bar_builder)
+                call = fetch.await_args.kwargs
+                self.assertGreater(call["limit"], (call["end"] - call["start"]).total_seconds() / 60)
+                return result
 
         bars = asyncio.run(run())
         self.assertEqual(bars["AAPL"]["latest_price"], 100.5)

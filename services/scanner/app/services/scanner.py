@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from collections.abc import Awaitable
+from datetime import datetime, time as wall_time, timedelta, timezone
 import logging
+import math
 import time
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
-from app.clients.alpaca import AlpacaClient
+from app.clients.alpaca import AlpacaClient, stock_iex_session_is_open
 from app.clients.polygon import PolygonClient
 from app.clients.binance import BinanceClient
 from app.clients.coingecko import CoinGeckoClient
@@ -18,6 +21,7 @@ from app.clients.fred import FREDClient
 from app.clients.options_flow import OptionsFlowClient
 from app.clients.sec import SECClient
 from app.clients.marketaux import MarketauxClient
+from app.clients.news_result import news_request_failure
 from app.config import get_settings
 from app.errors import AppError
 from app.core.confidence import compute_confidence_overlay
@@ -63,6 +67,7 @@ from app.services.scheduler_repository import SchedulerRepository
 from app.brain.policies import WEEKLY_POLICY_ID
 
 logger = logging.getLogger(__name__)
+EASTERN = ZoneInfo("America/New_York")
 
 
 class ScannerService:
@@ -128,9 +133,14 @@ class ScannerService:
             return "calm"
         return "normal"
 
+    @staticmethod
+    def _has_volume_reference(item: dict) -> bool:
+        volume = item.get("average_volume")
+        return isinstance(volume, (int, float)) and math.isfinite(volume) and volume > 0
+
     def _data_quality(self, item: dict, relative_volume: float) -> str:
         bars = item.get("bars") or []
-        if len(bars) < 6 or float(item.get("average_volume") or 0) <= 0:
+        if len(bars) < 6 or not self._has_volume_reference(item):
             return "low"
         if relative_volume > 12 or relative_volume <= 0:
             return "degraded"
@@ -229,17 +239,6 @@ class ScannerService:
     def _freshness_max_age_minutes(self) -> int:
         return unified_bar_freshness_max_age_minutes(self.settings)
 
-    def _effective_bar_age_minutes(self, *, asset_type: str, item: dict, observed_at: datetime) -> float | None:
-        alpaca_bar_age = self._latest_bar_age_minutes(item, observed_at)
-        if asset_type != "crypto":
-            return alpaca_bar_age
-        ws_age = self._coinbase_ws_age_minutes(item, observed_at)
-        if ws_age is None:
-            return alpaca_bar_age
-        if alpaca_bar_age is None:
-            return ws_age
-        return min(alpaca_bar_age, ws_age)
-
     def _derive_price_provenance(
         self,
         *,
@@ -250,8 +249,8 @@ class ScannerService:
     ) -> tuple[str, bool]:
         if alpaca_served_stale_cache:
             return "stale_cache", True
-        if asset_type == "stock" and market_bars_source == "polygon":
-            return "polygon", True
+        if asset_type == "stock" and market_bars_source in {"alpaca_sip", "polygon"}:
+            return market_bars_source, True
         market_flag = freshness_flags.get("market_bars", "ok")
         if asset_type == "crypto" and market_flag == "ws_override":
             return "coinbase_ws", True
@@ -262,63 +261,132 @@ class ScannerService:
         symbols: list[str],
         *,
         timeframe: str = "5Min",
+        observed_at: datetime | None = None,
+        attempts_by_symbol: dict[str, dict] | None = None,
     ) -> tuple[dict[str, dict], str]:
         if not symbols:
             return {}, "alpaca"
 
-        alpaca_error: Exception | None = None
+        observed_at = observed_at or datetime.now(timezone.utc)
+        primary: dict[str, dict] = {}
+        primary_error: Exception | None = None
         try:
-            bars = await self.alpaca.get_latest_bars(symbols, timeframe=timeframe)
-            if self.alpaca.consume_last_stale_flag():
-                return bars, "stale_cache"
-            return bars, "alpaca"
+            primary = await self.alpaca.get_latest_bars(symbols, timeframe=timeframe)
         except Exception as exc:
-            alpaca_error = exc
+            primary_error = exc
 
-        if not self.settings.polygon_api_key:
-            if alpaca_error is not None:
-                raise alpaca_error
-            return {}, "alpaca"
+        from_cache = bool(primary) and self.alpaca.latest_bars_served_stale("stocks", symbols, timeframe)
+        primary_source = "stale_cache" if from_cache else "alpaca_iex"
+        primary_failure = news_request_failure(primary_error) if primary_error else None
+        polygon_enabled = self.settings.polygon_intraday_fallback_enabled and bool(self.settings.polygon_api_key)
+        attempts: dict[str, dict] = {}
+        selected = dict(primary)
+        sources = dict.fromkeys(primary, primary_source)
+        pending = []
 
-        try:
-            bars = await self.polygon.get_latest_bars(
-                symbols,
-                timeframe=timeframe,
-                bar_builder=self.alpaca._build_bars_by_symbol,
+        def bar_status(item: dict | None) -> str:
+            if not item:
+                return "empty"
+            freshness = self._market_bars_freshness_flag(asset_type="stock", item=item, observed_at=observed_at)
+            if freshness == "stale":
+                return "stale"
+            if freshness == "missing" or self._data_quality(item, 1.0) == "low":
+                return "unusable"
+            return "available"
+
+        for symbol in symbols:
+            item = primary.get(symbol)
+            status = bar_status(item)
+            attempts[symbol] = {
+                "primary_status": primary_failure.status if primary_failure else "stale_cache" if from_cache and item else status,
+                "primary_http_status": primary_failure.http_status if primary_failure else None,
+                "fallback_provider": "alpaca_sip",
+                "fallback_status": "not_requested",
+                "polygon_status": "not_requested" if polygon_enabled else "disabled",
+            }
+            if status != "available":
+                pending.append(symbol)
+
+        async def try_fallback(provider: str, request: Awaitable[dict[str, dict]]) -> None:
+            try:
+                rows = await request
+                error = None
+            except Exception as exc:
+                rows = {}
+                error = news_request_failure(exc)
+            key = "polygon" if provider == "polygon" else "fallback"
+            fallback_from_cache = (
+                provider == "alpaca_sip" and bool(rows)
+                and self.alpaca.latest_bars_served_stale("stocks_sip", pending, timeframe)
             )
-            logger.warning(
-                "stock bars served from polygon fallback",
-                extra={
-                    "event": "provider_fallback_polygon_stock_bars",
-                    "symbol_count": len(symbols),
-                },
-            )
-            return bars, "polygon"
-        except Exception as polygon_error:
-            if alpaca_error is not None:
-                raise RuntimeError(
-                    f"Alpaca stock bars failed ({alpaca_error}); "
-                    f"Polygon fallback also failed ({polygon_error})"
-                ) from polygon_error
-            raise
+            for symbol in pending.copy():
+                item = rows.get(symbol)
+                status = error.status if error else bar_status(item)
+                attempts[symbol][f"{key}_status"] = "stale_cache" if fallback_from_cache and item else status
+                attempts[symbol][f"{key}_http_status"] = error.http_status if error else None
+                if status == "available":
+                    selected[symbol] = item
+                    sources[symbol] = provider
+                    pending.remove(symbol)
+
+        in_session = stock_iex_session_is_open(observed_at)
+        # A primary request failure or stale-cache serve already consumed the
+        # shared Alpaca retry budget. Do not send another call to the same API.
+        if pending and in_session and not primary_error and not from_cache:
+            await try_fallback("alpaca_sip", self.alpaca.get_latest_stock_sip_bars(pending.copy(), timeframe=timeframe))
+        if pending and polygon_enabled and (in_session or primary_error):
+            await try_fallback("polygon", self.polygon.get_latest_bars(
+                pending.copy(), timeframe=timeframe, bar_builder=self.alpaca._build_bars_by_symbol,
+            ))
+
+        if attempts_by_symbol is not None:
+            attempts_by_symbol.update(attempts)
+        if not selected and primary_error:
+            raise primary_error
+        bars = {
+            symbol: {**item, "_market_bars_source": sources[symbol], "_market_bars_attempts": attempts[symbol]}
+            for symbol, item in selected.items()
+            if symbol in attempts
+        }
+        distinct_sources = set(sources.values())
+        uniform_source = next(iter(distinct_sources)) if len(distinct_sources) == 1 else primary_source
+        return bars, "alpaca" if uniform_source == "alpaca_iex" else uniform_source
 
     def _market_bars_freshness_flag(self, *, asset_type: str, item: dict, observed_at: datetime) -> str:
         alpaca_bar_age = self._latest_bar_age_minutes(item, observed_at)
         ws_age = self._coinbase_ws_age_minutes(item, observed_at) if asset_type == "crypto" else None
-        effective_age = self._effective_bar_age_minutes(asset_type=asset_type, item=item, observed_at=observed_at)
         max_age = self._freshness_max_age_minutes()
-        if effective_age is None:
+        if alpaca_bar_age is None:
             return "missing"
-        if effective_age > max_age:
+        if alpaca_bar_age > max_age:
             return "stale"
         if (
             asset_type == "crypto"
             and ws_age is not None
             and ws_age <= max_age
-            and (alpaca_bar_age is None or ws_age <= alpaca_bar_age)
+            and ws_age <= alpaca_bar_age
         ):
             return "ws_override"
         return "ok"
+
+    def _stock_bars_from_expected_closed_session(self, item: dict, observed_at: datetime, source: str | None) -> bool:
+        latest = self._latest_bar_as_of(item)
+        if latest is None or source not in {"alpaca", "alpaca_iex", "alpaca_sip", "polygon"}:
+            return False
+        # IEX has shorter extended hours than consolidated SIP or Polygon.
+        open_time, close_time = (wall_time(8), wall_time(17)) if source in {"alpaca", "alpaca_iex"} else (wall_time(4), wall_time(20))
+        observed = self._as_utc_datetime(observed_at).astimezone(EASTERN)
+        if observed.weekday() < 5 and open_time <= observed.time() < close_time:
+            return False
+        previous_session = observed.date()
+        if observed.time() < close_time:
+            previous_session -= timedelta(days=1)
+        if previous_session.weekday() >= 5:
+            previous_session -= timedelta(days=previous_session.weekday() - 4)
+        # Require an actual late-session bar. An empty response, older session,
+        # holiday or shorter trading day is not enough to assert closure here.
+        latest = latest.astimezone(EASTERN)
+        return latest.date() == previous_session and latest.time() >= wall_time(15)
 
     def _gate_signal(
         self,
@@ -488,11 +556,6 @@ class ScannerService:
             sell_balance=round((sell_balance / total) * 100, 2),
             participation_score=round(participation_score, 2),
         )
-
-    def _symbol_for_directional_news(self, symbol: str, asset_type: str) -> str:
-        if asset_type == "crypto" and "/" in symbol:
-            return symbol.split("/", 1)[0]
-        return symbol
 
     def _deferred_outcome_ids(self, kind: str) -> set[int]:
         retries = getattr(self, "_outcome_retries", {})
@@ -794,12 +857,11 @@ class ScannerService:
                 continue
             try:
                 if (item.asset_type or "stock") == "crypto":
-                    market_prices[item.ticker] = float(
-                        await self.alpaca.get_latest_crypto_price(item.ticker)
-                    )
+                    price, bar_time = await self.alpaca.get_latest_crypto_quote(item.ticker)
                 else:
-                    market_prices[item.ticker] = float(await self.alpaca.get_latest_price(item.ticker))
-                market_observed_at[item.ticker] = datetime.now(timezone.utc)
+                    price, bar_time = await self.alpaca.get_latest_stock_quote(item.ticker)
+                market_prices[item.ticker] = price
+                market_observed_at[item.ticker] = bar_time
             except Exception:
                 logger.warning(
                     "paper_horizon_close_price_unavailable",
@@ -827,39 +889,109 @@ class ScannerService:
         market_status = market_status_from_change(spy_change, qqq_change)
         return market_status, spy_change, qqq_change
 
-    async def _get_directional_sentiment(self, ticker: str) -> tuple[float, bool, str, str, list[str]]:
-        cached_score, cached_label = self.news_cache.get(ticker)
-        if cached_score is not None:
-            return cached_score, True, "cache", cached_label, []
+    def _benchmark_health(
+        self, *, asset_type: str, symbols: tuple[str, ...], bars: dict[str, dict],
+        observed_at: datetime, attempts_by_symbol: dict[str, dict] | None = None,
+        provider_error: Exception | None = None,
+    ) -> dict:
+        checks = []
+        for symbol in symbols:
+            item = bars.get(symbol) or {}
+            attempts = (attempts_by_symbol or {}).get(symbol, {})
+            if not attempts and provider_error:
+                failure = news_request_failure(provider_error)
+                attempts = {"primary_status": failure.status, "primary_http_status": failure.http_status}
+            source = item.get("_market_bars_source", "alpaca_iex" if asset_type == "stock" else "alpaca")
+            age = self._latest_bar_age_minutes(item, observed_at)
+            as_of = self._latest_bar_as_of(item)
+            open_key = "day_open" if asset_type == "stock" else "session_open"
+            status = "missing"
+            if item:
+                values = (item.get("latest_price"), item.get(open_key))
+                if age is None or not all(isinstance(value, (int, float)) and math.isfinite(value) and value > 0 for value in values):
+                    status = "unusable"
+                elif age > self._freshness_max_age_minutes():
+                    status = "stale"
+                else:
+                    status = "fallback" if source in {"alpaca_sip", "polygon"} else "ok"
+            checks.append({"symbol": symbol, "status": status, "provider": source, "age_minutes": age,
+                           "as_of": as_of.isoformat() if as_of else None, **attempts})
+        statuses = {check["status"] for check in checks}
+        status = next((state for state in ("missing", "unusable", "stale", "fallback") if state in statuses), "ok")
+        return {"status": status, "symbols": checks}
 
-        marketaux_score, finnhub_score = await asyncio.gather(
-            self.marketaux.get_news_sentiment_score(ticker),
-            self.finnhub.get_news_sentiment_score(ticker),
-            return_exceptions=True,
-        )
+    @staticmethod
+    def _missing_benchmark_detail(benchmark: dict) -> str | None:
+        unusable = [check for check in benchmark["symbols"] if check["status"] in {"missing", "unusable"}]
+        if not unusable:
+            return None
+        reasons = []
+        for check in unusable:
+            status = check["status"]
+            attempts = []
+            for label, key in (("primary", "primary"), ("SIP", "fallback"), ("Polygon", "polygon")):
+                if state := check.get(f"{key}_status"):
+                    http_status = check.get(f"{key}_http_status")
+                    attempts.append(f"{label} {state.replace('_', ' ')}" + (f" HTTP {http_status}" if http_status else ""))
+            detail = f"{check['symbol']} {status}"
+            if attempts:
+                detail += f" ({', '.join(attempts)})"
+            reasons.append(detail)
+        return f"Required intraday benchmark data unavailable ({', '.join(reasons)}). Check the listed feeds for usable bars."
+
+    async def _get_directional_sentiment(self, ticker: str, asset_type: str = "stock") -> tuple[float | None, bool, str, str, list[str], dict]:
+        if asset_type == "stock":
+            cached_score, cached_label = self.news_cache.get(ticker)
+            if cached_score is not None:
+                return cached_score, True, "cache", cached_label, [], {
+                    "status": "available", "source": "cache", "providers": [],
+                }
+
+        providers = {"marketaux": self.marketaux.check_news(ticker.replace("/", ""))}
+        # Finnhub's company news and company sentiment endpoints do not cover crypto pairs.
+        if asset_type == "stock":
+            providers["finnhub"] = self.finnhub.check_news(ticker)
+        results = await asyncio.gather(*providers.values(), return_exceptions=True)
+        available: dict[str, float] = {}
         warnings: list[str] = []
-        if not self.settings.marketaux_api_token:
-            warnings.append("marketaux_api_token_missing")
-        if not self.settings.finnhub_api_key:
-            warnings.append("finnhub_api_key_missing")
-        available = {
-            provider: float(score)
-            for provider, score in (("marketaux", marketaux_score), ("finnhub", finnhub_score))
-            if isinstance(score, (int, float))
-        }
-        for provider in ("marketaux", "finnhub"):
-            if provider not in available:
-                warnings.append(f"{provider}_unavailable")
+        details: list[str] = []
+        provider_checks = []
+        only_empty = True
+        for provider, result in zip(providers, results, strict=True):
+            if isinstance(result, Exception):
+                result = news_request_failure(result)
+            if result.score is None:
+                warnings.append(f"{provider}_{result.status}")
+            else:
+                available[provider] = result.score
+                only_empty &= result.status == "no_relevant_articles"
+            if result.status != "ok":
+                details.append(f"{provider}: {result.status.replace('_', ' ')}")
+            provider_checks.append({
+                "provider": provider,
+                "endpoint": getattr(result, "endpoint", None),
+                "status": result.status,
+                "http_status": getattr(result, "http_status", None),
+                "lookback_start": getattr(result, "lookback_start", None),
+                "latest_article_at": getattr(result, "latest_article_at", None),
+            })
+        suffix = f" ({', '.join(details)})" if details else ""
         if not available:
             warnings.append("directional_news_unavailable")
-            return 0.0, False, "unavailable", "Directional news unavailable", warnings
+            return None, False, "unavailable", f"Directional news unavailable{suffix}", warnings, {
+                "status": "unavailable", "source": "unavailable", "providers": provider_checks,
+            }
         # Preserve the existing successful-input blend; genuine zero is valid
         # availability, while failed requests never become cached neutral data.
         scores = [score for score in available.values() if abs(score) > 0]
         sentiment = round(sum(scores) / len(scores), 4) if scores else 0.0
-        if len(available) == 2:
+        if len(available) == 2 and not only_empty:
             self.news_cache.set(ticker, sentiment)
-        return sentiment, True, "+".join(available), "Fresh directional news check", warnings
+        source = "+".join(available)
+        label = "No relevant articles" if only_empty else "Directional news fallback" if warnings else "Fresh directional news check"
+        return sentiment, True, source, f"{label}{suffix}", [], {
+            "status": "successful_empty" if only_empty else "available", "source": source, "providers": provider_checks,
+        }
 
     def _provider_health(
         self,
@@ -873,6 +1005,7 @@ class ScannerService:
         options_snapshot: OptionsFlowSnapshot,
         news_warnings: list[str],
         alpaca_served_stale_cache: bool | None = None,
+        market_bars_source: str | None = None,
         sec_snapshot: SECCatalystSnapshot | None = None,
         binance_snapshot: BinanceMicrostructureSnapshot | None = None,
         deribit_snapshot: DeribitPositioningSnapshot | None = None,
@@ -882,26 +1015,18 @@ class ScannerService:
     ) -> tuple[str, list[str]]:
         warnings = list(news_warnings)
         critical_warnings: list[str] = []
-        if alpaca_served_stale_cache is None:
-            alpaca_served_stale_cache = self.alpaca.consume_last_stale_flag()
         max_age = self._freshness_max_age_minutes()
-        if alpaca_served_stale_cache:
-            latest_for_stale = self._effective_bar_age_minutes(
-                asset_type=asset_type,
-                item=item,
-                observed_at=observed_at,
-            )
-            if latest_for_stale is None or latest_for_stale > max_age:
-                warnings.append("alpaca_served_stale_cache")
-        latest_bar_age_minutes = self._effective_bar_age_minutes(
-            asset_type=asset_type,
-            item=item,
-            observed_at=observed_at,
-        )
+        latest_bar_age_minutes = self._latest_bar_age_minutes(item, observed_at)
+        if alpaca_served_stale_cache and (latest_bar_age_minutes is None or latest_bar_age_minutes > max_age):
+            warnings.append("alpaca_served_stale_cache")
         if latest_bar_age_minutes is None:
             critical_warnings.append("market_bars_missing")
         elif latest_bar_age_minutes > max_age:
-            critical_warnings.append("market_bars_stale")
+            expected_closure = (
+                asset_type == "stock" and not alpaca_served_stale_cache
+                and self._stock_bars_from_expected_closed_session(item, observed_at, market_bars_source)
+            )
+            critical_warnings.append("market_bars_market_closed" if expected_closure else "market_bars_stale")
         if data_quality == "low":
             critical_warnings.append("market_data_quality_low")
         if asset_type == "stock" and self.settings.sec_user_agent.endswith("your-email@example.com"):
@@ -955,6 +1080,7 @@ class ScannerService:
         options_snapshot: OptionsFlowSnapshot,
         fear_greed_value: int | None,
         coingecko_context: dict | None,
+        news_status: str = "available",
         sec_snapshot: SECCatalystSnapshot | None = None,
         binance_snapshot: BinanceMicrostructureSnapshot | None = None,
         deribit_snapshot: DeribitPositioningSnapshot | None = None,
@@ -969,47 +1095,55 @@ class ScannerService:
                 observed_at=observed_at,
             ),
             "directional_news": (
-                "missing" if news_source == "unavailable"
-                else "fallback" if news_source in {"cache", "insufficient", "finnhub", "marketaux"}
+                "missing" if news_source in {"unavailable", "insufficient"}
+                else "not_requested" if news_source == "skipped"
+                else "successful_empty" if news_status == "successful_empty"
+                else "fallback" if news_source in {"cache", "finnhub"}
+                or (asset_type == "stock" and news_source == "marketaux")
                 else "ok"
             ),
             "options_flow": (
-                "missing"
-                if asset_type == "stock" and options_snapshot.summary.startswith("Options flow unavailable")
+                "not_requested" if asset_type != "stock"
+                else "missing" if options_snapshot.summary.startswith("Options flow unavailable")
                 else "ok"
             ),
             "sec": (
-                "missing"
-                if asset_type == "stock" and self.settings.sec_enhanced_enabled and (sec_snapshot is None or not sec_snapshot.available)
+                "not_requested" if asset_type != "stock"
+                else "disabled" if not self.settings.sec_enhanced_enabled
+                else "missing" if sec_snapshot is None or not sec_snapshot.available
                 else "ok"
             ),
             "fear_greed": (
-                "missing" if asset_type == "crypto" and fear_greed_value is None else "ok"
+                "not_requested" if asset_type != "crypto" else "missing" if fear_greed_value is None else "ok"
             ),
             "coingecko_context": (
-                "missing" if asset_type == "crypto" and coingecko_context is None else "ok"
+                "not_requested" if asset_type != "crypto" else "missing" if coingecko_context is None else "ok"
             ),
             "binance": (
-                "missing"
-                if asset_type == "crypto" and self.settings.binance_enabled and (binance_snapshot is None or not binance_snapshot.available)
+                "not_requested" if asset_type != "crypto"
+                else "disabled" if not self.settings.binance_enabled
+                else "missing" if binance_snapshot is None or not binance_snapshot.available
                 else "ok"
             ),
             "deribit": (
-                "missing"
-                if asset_type == "crypto" and self.settings.deribit_enabled and (deribit_snapshot is None or not deribit_snapshot.available)
+                "not_requested" if asset_type != "crypto"
+                else "disabled" if not self.settings.deribit_enabled
+                else "missing" if deribit_snapshot is None or not deribit_snapshot.available
                 else "ok"
             ),
             "fred": (
-                "missing" if self.settings.fred_enabled and fred_snapshot is not None and not fred_snapshot.available else "ok"
+                "disabled" if not self.settings.fred_enabled
+                else "missing" if fred_snapshot is not None and not fred_snapshot.available else "ok"
             ),
             "breadth": (
-                "missing"
-                if self.settings.internal_breadth_enabled and (breadth_snapshot is None or not breadth_snapshot.available)
+                "disabled" if not self.settings.internal_breadth_enabled
+                else "missing" if breadth_snapshot is None or not breadth_snapshot.available
                 else "ok"
             ),
             "defillama": (
-                "missing"
-                if asset_type == "crypto" and self.settings.defillama_enabled and (defillama_snapshot is None or not defillama_snapshot.available)
+                "not_requested" if asset_type != "crypto"
+                else "disabled" if not self.settings.defillama_enabled
+                else "missing" if defillama_snapshot is None or not defillama_snapshot.available
                 else "ok"
             ),
         }
@@ -1037,6 +1171,8 @@ class ScannerService:
         market_bars_source: str | None = None,
         daily_bars: list[dict] | None = None,
         market_daily_bars: list[dict] | None = None,
+        benchmark_health: dict | None = None,
+        blocked_inputs: dict[str, dict] | None = None,
     ) -> ScanResult | None:
         async with self._analyze_semaphore:
             return await self._analyze_ticker_impl(
@@ -1059,6 +1195,8 @@ class ScannerService:
                 market_bars_source=market_bars_source,
                 daily_bars=daily_bars,
                 market_daily_bars=market_daily_bars,
+                benchmark_health=benchmark_health,
+                blocked_inputs=blocked_inputs,
             )
 
     async def _analyze_ticker_impl(
@@ -1083,9 +1221,18 @@ class ScannerService:
         market_bars_source: str | None = None,
         daily_bars: list[dict] | None = None,
         market_daily_bars: list[dict] | None = None,
+        benchmark_health: dict | None = None,
+        blocked_inputs: dict[str, dict] | None = None,
     ) -> ScanResult | None:
         if not item or (asset_type == "stock" and ticker in {"SPY", "QQQ"}):
             return None
+        if not self._has_volume_reference(item):
+            if blocked_inputs is not None:
+                blocked_inputs[ticker] = {"volume_reference": True}
+            return None
+        market_bars_source = item.get("_market_bars_source", market_bars_source)
+        if "_market_bars_source" in item:
+            alpaca_served_stale_cache = market_bars_source == "stale_cache"
 
         price = item["latest_price"]
         day_open = item["session_open"] or price or 1
@@ -1149,6 +1296,7 @@ class ScannerService:
         news_source = "skipped"
         news_cache_label = "Skipped below news threshold"
         news_warnings: list[str] = []
+        news_details = {"status": "not_requested", "source": news_source, "providers": []}
 
         if (
             abs(price_change_pct) >= self.settings.news_trigger_abs_move_pct
@@ -1156,9 +1304,13 @@ class ScannerService:
             or breakout_flag
             or breakdown_flag
         ):
-            sentiment_score, news_checked, news_source, news_cache_label, news_warnings = await self._get_directional_sentiment(
-                self._symbol_for_directional_news(ticker, asset_type)
+            sentiment_score, news_checked, news_source, news_cache_label, news_warnings, news_details = await self._get_directional_sentiment(
+                ticker, asset_type,
             )
+            if sentiment_score is None:
+                if blocked_inputs is not None:
+                    blocked_inputs[ticker] = {"directional_news": news_details}
+                return None
         provider_status, provider_warnings = self._provider_health(
             asset_type=asset_type,
             item=item,
@@ -1170,23 +1322,21 @@ class ScannerService:
             options_snapshot=options_flow_snapshot,
             news_warnings=news_warnings,
             alpaca_served_stale_cache=alpaca_served_stale_cache,
+            market_bars_source=market_bars_source,
             binance_snapshot=binance_snapshot,
             deribit_snapshot=deribit_snapshot,
             fred_snapshot=fred_snapshot,
             breadth_snapshot=breadth_snapshot,
             defillama_snapshot=defillama_snapshot,
         )
-        bar_age_minutes = self._effective_bar_age_minutes(
-            asset_type=asset_type,
-            item=item,
-            observed_at=created_at,
-        )
+        bar_age_minutes = self._latest_bar_age_minutes(item, created_at)
         bar_as_of = self._latest_bar_as_of(item) if item else None
         freshness_flags = self._freshness_flags(
             asset_type=asset_type,
             item=item,
             observed_at=created_at,
             news_source=news_source,
+            news_status=news_details["status"],
             options_snapshot=options_flow_snapshot,
             fear_greed_value=fear_greed_value,
             coingecko_context=coingecko_context,
@@ -1197,6 +1347,14 @@ class ScannerService:
             breadth_snapshot=breadth_snapshot,
             defillama_snapshot=defillama_snapshot,
         )
+        if benchmark_health is not None:
+            freshness_flags["benchmark"] = benchmark_health["status"]
+            if benchmark_health["status"] == "stale":
+                provider_status = "critical"
+                provider_warnings.extend(
+                    f"benchmark_bars_stale:{check['symbol']}"
+                    for check in benchmark_health["symbols"] if check["status"] == "stale"
+                )
         price_source, fallback_used = self._derive_price_provenance(
             asset_type=asset_type,
             freshness_flags=freshness_flags,
@@ -1205,6 +1363,26 @@ class ScannerService:
         )
         if market_bars_source == "polygon" and "polygon_stock_bars_fallback" not in provider_warnings:
             provider_warnings.append("polygon_stock_bars_fallback")
+        bar_status = freshness_flags["market_bars"]
+        if "market_bars_market_closed" in provider_warnings:
+            bar_status = "market_closed"
+        elif bar_status == "stale" and alpaca_served_stale_cache:
+            bar_status = "stale_cache"
+        elif bar_status in {"ok", "ws_override"}:
+            bar_status = "unusable" if data_quality == "low" else "fresh"
+        market_bars_details = {
+            "provider": market_bars_source if market_bars_source in {"alpaca_sip", "polygon"} else "alpaca",
+            "endpoint": (
+                "/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{from}/{to}" if market_bars_source == "polygon"
+                else "/v1beta3/crypto/us/bars" if asset_type == "crypto" else "/v2/stocks/bars"
+            ),
+            "status": bar_status,
+            "as_of": bar_as_of.isoformat() if bar_as_of else None,
+            "max_age_minutes": self._freshness_max_age_minutes(),
+            "coinbase_price_as_of": item.get("coinbase_price_received_at"),
+            **({"primary_status": "stale_cache"} if alpaca_served_stale_cache else {}),
+            **item.get("_market_bars_attempts", {}),
+        }
 
         signal = compute_signal_and_explanation(
             buy_threshold=(
@@ -1406,7 +1584,7 @@ class ScannerService:
             decision_signal=signal.decision_signal,
             scoring_version=signal.scoring_version,
             explanation=gated_explanation.explanation,
-            price=round(price, 2),
+            price=price,
             price_change_pct=round(price_change_pct, 2),
             relative_volume=round(relative_volume, 2),
             sentiment_score=round(sentiment_score, 2),
@@ -1488,7 +1666,11 @@ class ScannerService:
                     "fallback_used": fallback_used,
                     "options_flow_source": options_flow_snapshot.source,
                     "bar_age_minutes": bar_age_minutes,
+                    "bar_as_of": bar_as_of.isoformat() if bar_as_of else None,
                     "freshness_flags": freshness_flags,
+                    "directional_news": news_details,
+                    "market_bars": market_bars_details,
+                    "benchmark": benchmark_health,
                     "binance": (
                         {
                             "available": binance_snapshot.available,
@@ -1581,6 +1763,10 @@ class ScannerService:
         stock_watchlist = self.settings.watchlist_items
         crypto_watchlist = self.settings.crypto_watchlist_items
         watchlist = stock_watchlist + crypto_watchlist
+        stock_benchmarks = ("SPY", "QQQ") if stock_watchlist else ()
+        crypto_benchmarks = ("BTC/USD",) if crypto_watchlist else ()
+        stock_bar_symbols = list(dict.fromkeys([*stock_watchlist, *stock_benchmarks]))
+        crypto_bar_symbols = list(dict.fromkeys([*crypto_watchlist, *crypto_benchmarks]))
         observed_at = datetime.now(timezone.utc)
         await self.refresh_due_signal_outcomes(
             observed_at=observed_at,
@@ -1590,13 +1776,16 @@ class ScannerService:
             observed_at=observed_at,
             limit=self._SCAN_INLINE_REFRESH_LIMIT,
         )
+        stock_bar_attempts: dict[str, dict] = {}
         stock_bars_task = (
-            self._get_stock_bars_with_fallback(stock_watchlist)
+            self._get_stock_bars_with_fallback(
+                stock_bar_symbols, attempts_by_symbol=stock_bar_attempts,
+            )
             if stock_watchlist
             else None
         )
-        crypto_bars_task = self.alpaca.get_latest_crypto_bars(crypto_watchlist) if crypto_watchlist else None
-        fear_greed_task = self.fear_greed.get_index()
+        crypto_bars_task = self.alpaca.get_latest_crypto_bars(crypto_bar_symbols) if crypto_watchlist else None
+        fear_greed_task = self.fear_greed.get_index() if crypto_watchlist else None
         coingecko_task = self.coingecko.get_market_context(crypto_watchlist) if crypto_watchlist else None
         binance_task = (
             self.binance.get_microstructure_batch(crypto_watchlist)
@@ -1617,7 +1806,7 @@ class ScannerService:
         provider_results = await asyncio.gather(
             stock_bars_task if stock_bars_task is not None else asyncio.sleep(0, result=({}, "alpaca")),
             crypto_bars_task if crypto_bars_task is not None else asyncio.sleep(0, result={}),
-            fear_greed_task,
+            fear_greed_task if fear_greed_task is not None else asyncio.sleep(0, result=(None, None)),
             coingecko_task if coingecko_task is not None else asyncio.sleep(0, result={}),
             binance_task if binance_task is not None else asyncio.sleep(0, result={}),
             deribit_task if deribit_task is not None else asyncio.sleep(0, result={}),
@@ -1642,24 +1831,33 @@ class ScannerService:
         if not stock_bars_result[0] and not crypto_bars and (stock_error or crypto_error):
             raise stock_error or crypto_error
         stock_bars, stock_bars_source = stock_bars_result
-        crypto_alpaca_served_stale_cache = self.alpaca.consume_last_stale_flag()
+        crypto_alpaca_served_stale_cache = bool(crypto_bars) and self.alpaca.latest_bars_served_stale("crypto", crypto_bar_symbols)
         crypto_bars = self.market_data_service.apply_crypto_price_overrides(crypto_bars)
-        market_status, spy_change_pct, qqq_change_pct = self._compute_market_status(stock_bars)
+        created_at = datetime.now(timezone.utc)
+        stock_benchmark = self._benchmark_health(
+            asset_type="stock", symbols=stock_benchmarks, bars=stock_bars, observed_at=created_at,
+            attempts_by_symbol=stock_bar_attempts, provider_error=stock_error,
+        )
+        crypto_benchmark = self._benchmark_health(
+            asset_type="crypto", symbols=crypto_benchmarks, bars=crypto_bars, observed_at=created_at,
+            provider_error=crypto_error,
+        )
+        stock_benchmark_blocker = self._missing_benchmark_detail(stock_benchmark)
+        crypto_benchmark_blocker = self._missing_benchmark_detail(crypto_benchmark)
+        market_status = "unavailable"
+        stock_benchmark_change_pct = None
+        if stock_benchmarks and not stock_benchmark_blocker:
+            market_status, spy_change_pct, qqq_change_pct = self._compute_market_status(stock_bars)
+            stock_benchmark_change_pct = (spy_change_pct + qqq_change_pct) / 2
         fear_greed_value, fear_greed_label = fear_greed
         stock_breadth = self._build_breadth_snapshot(asset_type="stock", bars=stock_bars) if self.settings.internal_breadth_enabled else None
         crypto_breadth = self._build_breadth_snapshot(asset_type="crypto", bars=crypto_bars) if self.settings.internal_breadth_enabled else None
-        crypto_benchmark_ticker = "BTC/USD" if "BTC/USD" in crypto_bars else (crypto_watchlist[0] if crypto_watchlist else None)
-        crypto_benchmark_row = crypto_bars.get(crypto_benchmark_ticker or "", {})
-        crypto_benchmark_change_pct = (
-            (
-                (float(crypto_benchmark_row.get("latest_price", 0) or 0) - float(crypto_benchmark_row.get("session_open", 0) or 0))
-                / max(float(crypto_benchmark_row.get("session_open", 0) or 1), 1)
-            ) * 100
-            if crypto_benchmark_row
-            else 0.0
-        )
-        crypto_market_status = self._crypto_market_status(crypto_benchmark_change_pct, fear_greed_value)
-        created_at = observed_at
+        crypto_benchmark_change_pct = None
+        crypto_market_status = "unavailable"
+        if crypto_benchmarks and not crypto_benchmark_blocker:
+            btc = crypto_bars["BTC/USD"]
+            crypto_benchmark_change_pct = (btc["latest_price"] - btc["session_open"]) / max(btc["session_open"], 1) * 100
+            crypto_market_status = self._crypto_market_status(crypto_benchmark_change_pct, fear_greed_value)
         daily_bars_by_symbol: dict[str, list[dict]] = {}
         stock_market_daily_bars: list[dict] | None = None
         crypto_market_daily_bars: list[dict] | None = None
@@ -1680,22 +1878,22 @@ class ScannerService:
             # walk-forward proof (SPY for stock, BTC/USD for crypto). Fetched once
             # and cached; reused from the per-symbol map when already present.
             stock_market_daily_bars = daily_bars_by_symbol.get("SPY")
-            if stock_market_daily_bars is None:
+            if stock_watchlist and stock_market_daily_bars is None:
                 stock_market_daily_bars = (
                     await self.daily_bar_service.get_daily_bars("SPY", asset_type="stock")
                 )[0]
-            crypto_benchmark_symbol = crypto_benchmark_ticker or "BTC/USD"
-            crypto_market_daily_bars = daily_bars_by_symbol.get(crypto_benchmark_symbol)
-            if crypto_market_daily_bars is None:
+            crypto_market_daily_bars = daily_bars_by_symbol.get("BTC/USD")
+            if crypto_watchlist and crypto_market_daily_bars is None:
                 crypto_market_daily_bars = (
                     await self.daily_bar_service.get_daily_bars(
-                        crypto_benchmark_symbol, asset_type="crypto"
+                        "BTC/USD", asset_type="crypto"
                     )
                 )[0]
 
         learned_inputs = self.brain.refresh_weekly_inputs()
         self.weekly_prediction_service.learned_inputs = learned_inputs
 
+        blocked_inputs: dict[str, dict] = {}
         analyzed = await asyncio.gather(
             *[
                 self._analyze_ticker(
@@ -1704,7 +1902,9 @@ class ScannerService:
                     item=stock_bars.get(ticker),
                     market_status=market_status,
                     benchmark_ticker="SPY/QQQ",
-                    benchmark_change_pct=(spy_change_pct + qqq_change_pct) / 2,
+                    benchmark_change_pct=stock_benchmark_change_pct,
+                    benchmark_health=stock_benchmark,
+                    blocked_inputs=blocked_inputs,
                     created_at=created_at,
                     fred_snapshot=fred_snapshot,
                     breadth_snapshot=stock_breadth,
@@ -1715,7 +1915,7 @@ class ScannerService:
                     daily_bars=daily_bars_by_symbol.get(ticker),
                     market_daily_bars=stock_market_daily_bars,
                 )
-                for ticker in stock_watchlist
+                for ticker in stock_watchlist if stock_benchmark_change_pct is not None
             ],
             *[
                 self._analyze_ticker(
@@ -1723,8 +1923,10 @@ class ScannerService:
                     asset_type="crypto",
                     item=crypto_bars.get(ticker),
                     market_status=crypto_market_status,
-                    benchmark_ticker=crypto_benchmark_ticker or "BTC/USD",
+                    benchmark_ticker="BTC/USD",
                     benchmark_change_pct=crypto_benchmark_change_pct,
+                    benchmark_health=crypto_benchmark,
+                    blocked_inputs=blocked_inputs,
                     created_at=created_at,
                     fear_greed_value=fear_greed_value,
                     fear_greed_label=fear_greed_label,
@@ -1738,7 +1940,7 @@ class ScannerService:
                     daily_bars=daily_bars_by_symbol.get(ticker),
                     market_daily_bars=crypto_market_daily_bars,
                 )
-                for ticker in crypto_watchlist
+                for ticker in crypto_watchlist if crypto_benchmark_change_pct is not None
             ],
         )
         ranked = sorted(
@@ -1796,6 +1998,9 @@ class ScannerService:
                     market_data=market_data,
                     provider_error=provider_error,
                     results=results,
+                    attempts_by_symbol=stock_bar_attempts if asset_type == "stock" else None,
+                    benchmark_blocker=stock_benchmark_blocker if asset_type == "stock" else crypto_benchmark_blocker,
+                    blocked_inputs=blocked_inputs,
                 )
                 for asset_type, expected_symbols, market_data, provider_error in (
                     ("stock", stock_watchlist, stock_bars, stock_error),

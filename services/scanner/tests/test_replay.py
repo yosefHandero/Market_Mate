@@ -20,6 +20,29 @@ def _bar(ts: datetime, price: float, volume: int = 1000) -> dict:
 
 
 class ReplayServiceTests(unittest.TestCase):
+    def test_persisted_hourly_replay_uses_completed_bars_and_a_versioned_recipe(self) -> None:
+        service = ReplayService()
+        start = datetime(2026, 11, 4, 14, 0, tzinfo=timezone.utc)
+        bars = [_bar(start + timedelta(minutes=5 * index), 100 + index * 0.5) for index in range(48)]
+        benchmark = [_bar(start + timedelta(minutes=5 * index), 500) for index in range(48)]
+        service.alpaca.get_historical_stock_bars = AsyncMock(
+            side_effect=lambda symbol, **_: bars if symbol == "AAPL" else benchmark,
+        )
+        from unittest.mock import Mock
+        service.repo.persist_strategy_replay_run = Mock()
+        response = asyncio.run(service.replay_and_persist(ReplayRequest(
+            symbols=["AAPL"], start=start, end=start + timedelta(hours=4),
+            interval_minutes=60, warmup_bars=20, horizon="1h", persist_outcomes=True,
+        )))
+
+        request_payload = service.repo.persist_strategy_replay_run.call_args.kwargs["request_payload"]
+        self.assertIn("hourly_buy_evidence", request_payload)
+        self.assertEqual(response.rows[0].observed_at, start + timedelta(minutes=105))
+        self.assertEqual(response.rows[0].horizon, "1h")
+        self.assertEqual(response.rows[0].future_price_at, start + timedelta(minutes=170))
+        self.assertEqual(response.rows[0].future_price, 116.5)
+        self.assertIsNone(response.rows[-1].future_price)
+
     def test_replay_uses_historical_bars_without_lookahead(self) -> None:
         service = ReplayService()
         start = datetime(2026, 3, 1, 14, 0, tzinfo=timezone.utc)

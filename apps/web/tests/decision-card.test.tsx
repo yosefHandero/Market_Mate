@@ -326,6 +326,14 @@ describe('DecisionCard', () => {
     expect(metrics).not.toHaveTextContent(/Confidence40/i);
   });
 
+  it('shows sub-cent prices and explains a missing saved price', () => {
+    const { rerender } = render(<DecisionCard result={sampleResult({ price: 0.00000974 })} />);
+    expect(screen.getByTestId('current-price')).toHaveTextContent('$0.00000974');
+    rerender(<DecisionCard result={sampleResult({ price: 0 })} />);
+    expect(screen.getByTestId('current-price')).toHaveTextContent('--');
+    expect(screen.getByTestId('decision-card-AAPL')).toHaveTextContent(/saved scan price is unavailable/i);
+  });
+
   it('renders hard-blocked stale candidates as blocked, with setup details behind Details', async () => {
     const user = userEvent.setup();
     render(

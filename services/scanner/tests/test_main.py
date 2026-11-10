@@ -987,7 +987,17 @@ class MainRouteTests(unittest.TestCase):
             Mock(lifecycle_status="previewed", trade_gate_allowed=True),
             Mock(lifecycle_status="blocked", trade_gate_allowed=False),
         ]
+        quota = {
+            "configured_daily_attempt_budget": 12,
+            "utc_day_attempts": 4,
+            "operational_attempts_remaining": 8,
+            "block_state": "reset_known",
+            "verified_reset_at": "2026-05-19T00:00:00Z",
+            "rate_retry_at": None,
+        }
         with patch.object(
+            public_module, "marketaux_quota_status", return_value={**quota, "audit": ["internal"]},
+        ), patch.object(
             main_module.scan_repository,
             "get_latest_run",
             Mock(return_value=None),
@@ -1035,6 +1045,7 @@ class MainRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
+        self.assertEqual(body["marketaux_quota"], quota)
         self.assertEqual(body["ledger"]["total_unrealized_pnl"], 8.25)
         self.assertEqual(body["loop_metrics"]["recent_dry_runs"], 1)
         self.assertEqual(body["loop_metrics"]["recent_previewed"], 1)

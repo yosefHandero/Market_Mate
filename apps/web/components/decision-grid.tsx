@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useMemo } from 'react';
 import { DecisionCard } from '@/components/decision-card';
 import { buildDecisionWarning, VISIBLE_CANDIDATE_LIMIT } from '@/lib/decision-surface';
-import { FRESH_BAR_MAX_MINUTES, hasBadFreshnessFlags } from '@/lib/freshness';
+import { FRESH_BAR_MAX_MINUTES, hasBadFreshnessFlags, isHealthyFreshnessFlag } from '@/lib/freshness';
 import { evaluatePaperActionGate } from '@/lib/paper-order';
 import type { AutomationStatusResponse, DecisionRow, ScanResult } from '@/lib/types';
 
@@ -29,6 +29,28 @@ function rowBarsAreStale(row: ScanResult): boolean {
 
 function rowHasContextQualityWarning(row: ScanResult): boolean {
   return rowProviderCritical(row) || hasBadFreshnessFlags(row.freshness_flags);
+}
+
+function candidateDataReason(row: ScanResult): string | null {
+  const benchmark = row.freshness_flags?.benchmark;
+  const marketBars = row.freshness_flags?.market_bars;
+  if (benchmark === 'stale') return 'The relative-strength benchmark was stale.';
+  if (benchmark === 'missing' || benchmark === 'unusable') return 'The relative-strength benchmark was unavailable.';
+  if (row.freshness_flags?.directional_news === 'missing') return 'Directional news was unavailable.';
+  if (marketBars === 'missing' || !Number.isFinite(row.bar_age_minutes)) {
+    return 'Required price data was unavailable.';
+  }
+  if (marketBars === 'market_closed') return 'Required price data was stale after market close.';
+  if (rowBarsAreStale(row)) return 'Required price data was stale.';
+  if (marketBars && !isHealthyFreshnessFlag(marketBars)) return 'Required price data was unusable.';
+  return null;
+}
+
+function usesCompatibleFallback(row: ScanResult): boolean {
+  return !rowHasContextQualityWarning(row) && !rowBarsAreStale(row) && (
+    row.freshness_flags?.directional_news === 'fallback' ||
+    row.price_source === 'polygon' || row.price_source === 'alpaca_sip'
+  );
 }
 
 function officialTopPicks(
@@ -64,7 +86,9 @@ function heldBackReason(
   decision: DecisionRow | null | undefined,
   automation: AutomationStatusResponse | null | undefined,
 ): string {
-  // Prefer the scanner's own verdict so the Decision page and Proof agree.
+  const dataReason = candidateDataReason(result);
+  if (dataReason) return dataReason;
+  // Prefer the scanner's verdict for the other checks.
   const readiness = String(result.readiness_reason ?? '').trim();
   if (readiness && !/^actionable/i.test(readiness)) return readiness;
   const gate = String(result.gate_reason ?? '').trim();
@@ -138,6 +162,8 @@ export function DecisionGrid({
   decisionsError,
   scanStale = false,
   coverageIncomplete = false,
+  unscoredRequiredInputs,
+  hasSavedScan = false,
 }: {
   results: ScanResult[];
   topStocks?: ScanResult[];
@@ -147,6 +173,8 @@ export function DecisionGrid({
   decisionsError?: string | null;
   scanStale?: boolean;
   coverageIncomplete?: boolean;
+  unscoredRequiredInputs?: string;
+  hasSavedScan?: boolean;
 }) {
   const productionResults = useMemo(
     () => results.filter(isProductionSurfaceRow),
@@ -191,15 +219,15 @@ export function DecisionGrid({
   // gate. These explain an empty list and are the only non-displayed rows whose
   // data quality is worth flagging here.
   const heldBack = useMemo(() => {
-    const shown = new Set(displayedPicks.map(candidateKey));
+    const qualified = new Set([...stockQualified, ...cryptoQualified].map(candidateKey));
     const seen = new Set<string>();
     return [...officialStockPicks, ...officialCryptoPicks, ...productionResults].filter((row) => {
       const key = candidateKey(row);
-      if (row.decision_signal !== 'BUY' || shown.has(key) || seen.has(key)) return false;
+      if (row.decision_signal !== 'BUY' || qualified.has(key) || seen.has(key)) return false;
       seen.add(key);
       return true;
     });
-  }, [displayedPicks, officialCryptoPicks, officialStockPicks, productionResults]);
+  }, [cryptoQualified, officialCryptoPicks, officialStockPicks, productionResults, stockQualified]);
   const heldBackCount = heldBack.length;
   const bothEmpty = displayedPicks.length === 0;
   // Data-quality warnings describe what the reader is looking at: the displayed
@@ -212,6 +240,7 @@ export function DecisionGrid({
       : productionResults;
   const barsStale = warningScope.some((row) => rowBarsAreStale(row));
   const marketDataDegraded = warningScope.some((row) => rowHasContextQualityWarning(row));
+  const affected = bothEmpty ? heldBack : heldBack.filter((row) => row.is_buy_candidate && candidateDataReason(row));
   const warning = buildDecisionWarning({
     killSwitchOn: automation?.kill_switch_enabled === true,
     breakerOpen: automation?.breaker?.state === 'open',
@@ -219,13 +248,38 @@ export function DecisionGrid({
     barsStale,
     coverageIncomplete,
     marketDataDegraded,
+    requiredDataUnavailable: affected.some((row) => candidateDataReason(row) != null),
+    unscoredRequiredInputs,
+    compatibleFallback: displayedPicks.some(usesCompatibleFallback),
     heldBackCount,
   });
-  const emptyMessage = productionResults.length
+  const emptyMessage = productionResults.length || hasSavedScan
     ? 'No qualifying buy candidates in the latest scan.'
     : 'No scan results yet.';
-  const heldBackPreview = heldBack.slice(0, HELD_BACK_PREVIEW_LIMIT);
-  const heldBackOverflow = heldBack.length - heldBackPreview.length;
+  const heldBackPreview = affected.slice(0, HELD_BACK_PREVIEW_LIMIT);
+  const heldBackOverflow = affected.length - heldBackPreview.length;
+  const heldBackDetails = heldBackPreview.length ? (
+    <div className="decision-held-back" data-testid="decision-held-back">
+      <p className="muted small" style={{ margin: '8px 0 4px' }}>
+        {affected.length === 1 ? '1 BUY signal was held back:' : `${affected.length} BUY signals were held back:`}
+      </p>
+      <ul className="decision-reason-list small">
+        {heldBackPreview.map((row) => (
+          <li key={candidateKey(row)} data-testid={`held-back-${row.ticker}`}>
+            <strong>{row.ticker}</strong>{' '}
+            <span className="muted">
+              {heldBackReason(row, decisionsBySymbol.get(row.ticker), automation)}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {heldBackOverflow > 0 ? (
+        <p className="muted small" style={{ margin: '4px 0 0' }}>
+          +{heldBackOverflow} more on Proof.
+        </p>
+      ) : null}
+    </div>
+  ) : null;
 
   return (
     <div className="decision-grid" data-testid="decision-grid">
@@ -258,54 +312,34 @@ export function DecisionGrid({
             </Link>{' '}
             for coverage and evidence.
           </p>
-          {heldBackPreview.length ? (
-            <div className="decision-held-back" data-testid="decision-held-back">
-              <p className="muted small" style={{ margin: '8px 0 4px' }}>
-                {heldBack.length === 1
-                  ? '1 BUY signal was held back:'
-                  : `${heldBack.length} BUY signals were held back:`}
-              </p>
-              <ul className="decision-reason-list small">
-                {heldBackPreview.map((row) => (
-                  <li key={candidateKey(row)} data-testid={`held-back-${row.ticker}`}>
-                    <strong>{row.ticker}</strong>{' '}
-                    <span className="muted">
-                      {heldBackReason(row, decisionsBySymbol.get(row.ticker), automation)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-              {heldBackOverflow > 0 ? (
-                <p className="muted small" style={{ margin: '4px 0 0' }}>
-                  +{heldBackOverflow} more on Proof.
-                </p>
-              ) : null}
-            </div>
-          ) : null}
+          {heldBackDetails}
         </div>
       ) : (
-        <div className="decision-columns">
-          <CandidateColumn
-            label="Stocks"
-            ariaLabel="Stock buy candidates"
-            emptyTestId="stock-empty-state"
-            emptyText="No qualifying stocks."
-            gridTestId="stock-actionable-grid"
-            picks={stockPicks}
-            decisionsBySymbol={decisionsBySymbol}
-            automation={automation}
-          />
-          <CandidateColumn
-            label="Crypto"
-            ariaLabel="Crypto buy candidates"
-            emptyTestId="crypto-empty-state"
-            emptyText="No qualifying crypto."
-            gridTestId="crypto-actionable-grid"
-            picks={cryptoPicks}
-            decisionsBySymbol={decisionsBySymbol}
-            automation={automation}
-          />
-        </div>
+        <>
+          {heldBackDetails}
+          <div className="decision-columns">
+            <CandidateColumn
+              label="Stocks"
+              ariaLabel="Stock buy candidates"
+              emptyTestId="stock-empty-state"
+              emptyText="No qualifying stocks."
+              gridTestId="stock-actionable-grid"
+              picks={stockPicks}
+              decisionsBySymbol={decisionsBySymbol}
+              automation={automation}
+            />
+            <CandidateColumn
+              label="Crypto"
+              ariaLabel="Crypto buy candidates"
+              emptyTestId="crypto-empty-state"
+              emptyText="No qualifying crypto."
+              gridTestId="crypto-actionable-grid"
+              picks={cryptoPicks}
+              decisionsBySymbol={decisionsBySymbol}
+              automation={automation}
+            />
+          </div>
+        </>
       )}
     </div>
   );

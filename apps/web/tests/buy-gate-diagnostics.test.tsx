@@ -99,9 +99,11 @@ describe('BuyGateDiagnostics', () => {
           execution_eligibility: 'eligible',
           readiness_score: 82,
           is_top_pick: true,
+          bar_age_minutes: 32.5,
           gate_checks: [
             { name: 'sample_size', passed: true, detail: '30 vs 30' },
             { name: 'win_rate', passed: true, detail: 'win rate passed' },
+            { name: 'evidence_sources', passed: true, detail: 'Recent outcomes 14. Historical outcomes 16.' },
           ],
         })]}
       />,
@@ -110,6 +112,10 @@ describe('BuyGateDiagnostics', () => {
     expect(diagnostics).toHaveTextContent('Stored checks allow preview or dry-run');
     expect(diagnostics).toHaveTextContent('Saved evidence gate passed');
     expect(diagnostics).toHaveTextContent('2 of 2 saved evidence checks passed');
+    expect(diagnostics).toHaveTextContent('Recent outcomes 14. Historical outcomes 16.');
+    expect(diagnostics).toHaveTextContent('Passed evidence checks');
+    expect(diagnostics).toHaveTextContent('30 vs 30');
+    expect(diagnostics).toHaveTextContent('Bar age at scan 32.5 minutes. Paper limit 45 minutes.');
     expect(diagnostics).toHaveTextContent('Readiness 82/100; need 70');
     expect(diagnostics).toHaveTextContent('Action dry_run');
     expect(diagnostics).toHaveTextContent('Selected for Decision.');
@@ -163,5 +169,20 @@ describe('BuyGateDiagnostics', () => {
     expect(diagnostics).toHaveTextContent('Action review; need preview or dry_run');
     expect(diagnostics).toHaveTextContent('Eligibility review');
     expect(diagnostics).toHaveTextContent('directional news: missing');
+  });
+
+  it('separates expected stock closure from news failure without reopening paper action', () => {
+    render(<BuyGateDiagnostics results={[buy({
+      ticker: 'JNJ', asset_type: 'stock', provider_status: 'critical',
+      provider_warnings: ['market_bars_market_closed'],
+      bar_age_minutes: 62,
+      freshness_flags: { market_bars: 'stale', directional_news: 'missing' },
+      news_cache_label: 'Marketaux fetching disabled. Finnhub access denied.',
+    })]} />);
+    const diagnostics = screen.getByLabelText('BUY gate diagnostics');
+    expect(diagnostics).toHaveTextContent('JNJ — Paper action blocked');
+    expect(diagnostics).toHaveTextContent('Bar age at scan 62 minutes. Paper limit 45 minutes.');
+    expect(diagnostics).toHaveTextContent('Stock bars were retrieved outside scheduled trading hours for that feed');
+    expect(diagnostics).toHaveTextContent('Marketaux fetching disabled. Finnhub access denied.');
   });
 });

@@ -15,7 +15,6 @@ from sqlalchemy.orm import sessionmaker
 
 import app.services.automation_repository as automation_repository_module
 import app.services.repository as repository_module
-import app.services.scanner as scanner_module
 from app.db import Base
 from app.models.scan import AutomationIntentORM, ExecutionAuditORM
 from app.services.automation_repository import AutomationRepository
@@ -223,12 +222,12 @@ class PaperHorizonCloseTests(unittest.TestCase):
         self._position()
         service = ScannerService()
         service.repo = self.repo
-        service.alpaca.get_latest_price = AsyncMock(side_effect=RuntimeError("no usable quote"))
+        service.alpaca.get_latest_stock_quote = AsyncMock(side_effect=RuntimeError("no usable quote"))
         closed = asyncio.run(service.close_open_positions_past_horizon(
             observed_at=self.fill_time + timedelta(hours=2),
         ))
         self.assertEqual(closed, 0)
-        service.alpaca.get_latest_price.assert_awaited_once_with("AAPL")
+        service.alpaca.get_latest_stock_quote.assert_awaited_once_with("AAPL")
         self.assertEqual(self.repo.list_paper_positions()[0].status, "open")
 
     def test_actual_scanner_close_path_records_quote_observation_time(self) -> None:
@@ -237,15 +236,25 @@ class PaperHorizonCloseTests(unittest.TestCase):
         quote_observed_at = due_at + timedelta(seconds=17)
         service = ScannerService()
         service.repo = self.repo
-        service.alpaca.get_latest_price = AsyncMock(return_value=110.0)
-        with patch.object(scanner_module, "datetime", wraps=datetime) as clock:
-            clock.now.return_value = quote_observed_at
-            closed = asyncio.run(service.close_open_positions_past_horizon(observed_at=due_at))
+        service.alpaca.get_latest_stock_quote = AsyncMock(return_value=(110.0, quote_observed_at))
+        closed = asyncio.run(service.close_open_positions_past_horizon(observed_at=due_at))
         self.assertEqual(closed, 1)
         row = self.repo.list_paper_positions()[0]
         self.assertEqual(row.closed_at.replace(tzinfo=timezone.utc), quote_observed_at)
         self.assertEqual(row.close_delay_seconds, 17.0)
         self.assertEqual(row.realized_pnl, 20.0)
+
+    def test_delayed_quote_before_deadline_cannot_close_due_position(self) -> None:
+        self._position()
+        due_at = self.fill_time + timedelta(hours=1)
+        service = ScannerService()
+        service.repo = self.repo
+        service.alpaca.get_latest_stock_quote = AsyncMock(return_value=(110.0, due_at - timedelta(minutes=5)))
+
+        closed = asyncio.run(service.close_open_positions_past_horizon(observed_at=due_at + timedelta(minutes=10)))
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(self.repo.list_paper_positions()[0].status, "open")
 
     def test_safe_repair_requires_actual_fill_receipt_and_never_invents_legacy_fill(self) -> None:
         self._audit(contract=False)

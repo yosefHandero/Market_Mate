@@ -6,9 +6,11 @@ import json
 import logging
 import math
 
+import httpx
 from sqlalchemy import desc, select
 
-from app.clients.alpaca import AlpacaClient
+from app.clients.alpaca import AlpacaClient, MarketQuoteUnavailable, stock_iex_session_is_open
+from app.clients.polygon import PolygonClient
 from app.config import get_settings
 from app.core.paper_action import paper_action_checks
 from app.db import SessionLocal
@@ -27,6 +29,7 @@ class ExecutionService:
     def __init__(self, scan_repository: ScanRepository | None = None) -> None:
         self.settings = get_settings()
         self.alpaca = AlpacaClient()
+        self.polygon = PolygonClient()
         self._scan_repository = scan_repository or ScanRepository()
         self.risk = RiskService(scan_repository=self._scan_repository)
 
@@ -324,18 +327,45 @@ class ExecutionService:
         direction = -1 if side == "sell" else 1
         return round((target_price - entry_price) * qty * direction, 2)
 
+    async def get_paper_quote(self, ticker: str) -> float:
+        is_crypto = self._asset_type_for_symbol(ticker) == "crypto"
+        fetch_price = self.alpaca.get_latest_crypto_price if is_crypto else self.alpaca.get_latest_price
+        try:
+            latest_price = await fetch_price(ticker)
+        except (RuntimeError, httpx.HTTPError, TimeoutError) as exc:
+            if (
+                not is_crypto and self.settings.polygon_intraday_fallback_enabled and self.settings.polygon_api_key
+                and (not isinstance(exc, MarketQuoteUnavailable) or stock_iex_session_is_open(datetime.now(timezone.utc)))
+            ):
+                try:
+                    bars = await self.polygon.get_latest_bars(
+                        [ticker], timeframe="1Min", bar_builder=self.alpaca._build_bars_by_symbol,
+                    )
+                    quote = self.alpaca.fresh_bar_quote(bars.get(ticker), datetime.now(timezone.utc))
+                    if quote is not None:
+                        return quote[0]
+                except (RuntimeError, httpx.HTTPError, TimeoutError):
+                    pass
+            if isinstance(exc, MarketQuoteUnavailable):
+                message = str(exc)
+            elif isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+                message = "The market data request for a paper quote timed out."
+            elif status := getattr(exc, "status_code", None):
+                message = f"The market data provider returned HTTP {status} for the paper quote."
+            else:
+                message = "The market data provider could not retrieve a paper quote."
+            raise AppError(message=message, status_code=503, code="paper_quote_unavailable") from exc
+        if not math.isfinite(latest_price) or latest_price <= 0:
+            raise AppError(message="No valid quote is available for a paper fill.", status_code=503, code="paper_quote_unavailable")
+        return latest_price
+
     async def preview(self, request: OrderPreviewRequest) -> OrderPreviewResponse:
         self._enforce_paper_only_request(request, placement=False)
         self._enforce_execution_safeguards()
         self._enforce_operational_readiness()
         self._enforce_kill_switch()
         ticker = request.ticker.upper()
-        if self._asset_type_for_symbol(ticker) == "crypto":
-            latest_price = await self.alpaca.get_latest_crypto_price(ticker)
-        else:
-            latest_price = await self.alpaca.get_latest_price(ticker)
-        if not math.isfinite(latest_price) or latest_price <= 0:
-            raise AppError(message="No valid quote is available for a paper fill.", status_code=503, code="paper_quote_unavailable")
+        latest_price = await self.get_paper_quote(ticker)
         price_for_estimate = latest_price
         if request.requested_notional_usd is not None:
             qty = self.risk.suggest_paper_quantity(
@@ -355,17 +385,28 @@ class ExecutionService:
         )
         contract = self._paper_contract(ticker=ticker, trade_gate=trade_gate)
         self._validate_preview_agreement(request, contract)
+        additional_reject_reason = None
         if request.side == "buy":
             latest_run = self._scan_repository.get_latest_run()
             result = next((row for row in latest_run.results if row.ticker == ticker), None) if latest_run else None
-            action_checks = paper_action_checks(result) if result is not None else [
-                GateCheck(name="paper_latest_result", passed=False, detail="No current scan row is available.")
-            ]
+            if result is not None:
+                action_checks = paper_action_checks(result)
+            else:
+                missing_detail = next((
+                    missing.detail
+                    for asset_coverage in (getattr(latest_run, "coverage", None) or [])
+                    for missing in asset_coverage.missing_symbols
+                    if missing.ticker == ticker and missing.reason != "benchmark_only"
+                ), "No current scan row is available.")
+                action_checks = [GateCheck(name="paper_latest_result", passed=False, detail=missing_detail)]
             trade_gate.gate_checks.extend(action_checks)
             failed_actions = [check for check in action_checks if not check.passed]
             if failed_actions:
+                action_reason = "Paper action blocked: " + "; ".join(check.detail for check in failed_actions) + "."
                 if trade_gate.allowed:
-                    trade_gate.reason = "Paper action blocked: " + "; ".join(check.detail for check in failed_actions) + "."
+                    trade_gate.reason = action_reason
+                else:
+                    additional_reject_reason = action_reason
                 trade_gate.allowed = False
                 trade_gate.execution_eligibility = "blocked"
         if not trade_gate.allowed:
@@ -380,6 +421,8 @@ class ExecutionService:
             target_price=request.target_price,
         )
         reject_reasons = [trade_gate.reason] if not trade_gate.allowed else []
+        if additional_reject_reason:
+            reject_reasons.append(additional_reject_reason)
         freshness = (
             "fresh"
             if getattr(trade_gate, "latest_scan_fresh", None) is True
@@ -393,11 +436,11 @@ class ExecutionService:
             qty=request.qty,
             order_type=request.order_type,
             notional_estimate=round(price_for_estimate * request.qty, 2),
-            latest_price=round(latest_price, 4),
+            latest_price=latest_price,
             time_in_force=self.settings.execution_default_time_in_force,
             warnings=warnings,
             trade_gate=trade_gate,
-            entry_price=round(entry_price, 4),
+            entry_price=entry_price,
             stop_price=request.stop_price,
             target_price=request.target_price,
             position_size=request.qty,

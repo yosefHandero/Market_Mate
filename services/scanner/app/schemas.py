@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MarketStatus = Literal["bullish", "neutral", "bearish"]
+ScanMarketStatus = MarketStatus | Literal["unavailable"]
 BrokerName = Literal["alpaca"]
 OrderSide = Literal["buy", "sell"]
 OrderType = Literal["market", "limit"]
@@ -226,7 +227,7 @@ class ScanResult(BaseModel):
     fear_greed_label: str | None = None
     provider_status: ProviderStatus = "ok"
     provider_warnings: list[str] = []
-    price_source: Literal["alpaca", "coinbase_ws", "polygon", "stale_cache"] = "alpaca"
+    price_source: Literal["alpaca", "alpaca_sip", "coinbase_ws", "polygon", "stale_cache"] = "alpaca"
     fallback_used: bool = False
     bar_age_minutes: float | None = None
     bar_as_of: datetime | None = None
@@ -247,6 +248,8 @@ class ScanMissingSymbol(BaseModel):
     ticker: str
     reason: Literal["provider_unavailable", "market_data_missing", "benchmark_only", "analysis_skipped"]
     detail: str
+    required_input: Literal["benchmark", "directional_news", "volume_reference"] | None = None
+    directional_news: dict | None = None
 
 
 class ScanAssetCoverage(BaseModel):
@@ -260,7 +263,7 @@ class ScanAssetCoverage(BaseModel):
 class ScanRun(BaseModel):
     run_id: str
     created_at: datetime
-    market_status: MarketStatus
+    market_status: ScanMarketStatus
     strategy_variant: str = "layered-v4"
     scan_count: int
     watchlist_size: int
@@ -755,7 +758,7 @@ class SignalOutcomeSummary(BaseModel):
 class TickerScanHistoryRow(BaseModel):
     run_id: str
     run_created_at: datetime
-    market_status: MarketStatus
+    market_status: ScanMarketStatus
     result: ScanResult
 
 
@@ -1466,6 +1469,15 @@ class PolicyPromotionReport(BaseModel):
     requested_champion_policy_id: str
 
 
+class MarketauxQuotaSummary(BaseModel):
+    configured_daily_attempt_budget: int | None
+    utc_day_attempts: int
+    operational_attempts_remaining: int | None
+    block_state: Literal["reset_known", "reset_unknown"] | None
+    verified_reset_at: datetime | None
+    rate_retry_at: datetime | None
+
+
 class ProofSummaryResponse(BaseModel):
     generated_at: datetime
     ledger: PaperLedgerSummaryResponse
@@ -1478,6 +1490,7 @@ class ProofSummaryResponse(BaseModel):
     live_forward: LiveForwardProgress | None = None
     evidence_contract: list[EvidenceTrackDescriptor] = []
     last_scan_at: datetime | None = None
+    marketaux_quota: MarketauxQuotaSummary | None = None
     scan_fresh: bool | None = None
     mark_prices_source: str = "latest_scan"
     note: str | None = None
@@ -1560,6 +1573,7 @@ class ReplayRequest(BaseModel):
     include_secondary_providers: bool = False
     apply_friction: bool = True
     replay_mode: Literal["intraday", "weekly"] = "intraday"
+    horizon: Literal["1h", "1w"] = "1w"
     sample_source: SampleSource = "backfilled_replay"
     persist_outcomes: bool = False
 
@@ -1573,6 +1587,14 @@ class ReplayRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_window(self) -> "ReplayRequest":
+        if self.horizon == "1h" and (
+            self.replay_mode != "intraday" or self.include_secondary_providers
+            or self.start.tzinfo is None or self.end.tzinfo is None
+            or self.end - self.start > timedelta(days=14)
+        ):
+            raise ValueError("1h replay requires intraday core data and a timezone-aware window of at most 14 days")
+        if self.horizon == "1h" and self.persist_outcomes and self.interval_minutes < 60:
+            raise ValueError("1h evidence replay requires at least 60 minutes between samples")
         if self.end <= self.start:
             raise ValueError("end must be greater than start")
         return self
@@ -1593,6 +1615,7 @@ class ReplaySignalRow(BaseModel):
     provider_status: ProviderStatus
     entry_price: float
     future_price: float | None = None
+    future_price_at: datetime | None = None
     raw_return_pct: float | None = None
     friction_adjusted_return_pct: float | None = None
     horizon: OutcomeHorizon = "1w"

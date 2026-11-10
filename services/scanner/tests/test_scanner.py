@@ -12,12 +12,33 @@ if "yahooquery" not in sys.modules:
     sys.modules["yahooquery"] = yahooquery_stub
 
 from app.http_client import ProviderRequestError
-from app.config import get_settings
-from app.schemas import GateCheck, ScanResult
+from app.clients.news_result import NewsResult
+from app.config import Settings, get_settings
+from app.core.paper_action import paper_action_checks
+from app.schemas import GateCheck, OptionsFlowSnapshot, ScanResult
+from app.services.scan_coverage import build_scan_coverage
 from app.services.scanner import ScannerService
 
 
 class ScannerServiceHardeningTests(unittest.TestCase):
+    def test_successful_off_session_stock_bars_remain_blocked_without_calling_it_an_outage(self):
+        service = ScannerService()
+        observed = datetime(2026, 11, 6, 23, 2, tzinfo=timezone.utc)
+        item = {"bars": [{"t": "2026-11-06T20:55:00Z"}]}
+        kwargs = dict(asset_type="stock", item=item, observed_at=observed, data_quality="ok",
+                      fear_greed_value=None, coingecko_context=None, options_snapshot=OptionsFlowSnapshot(),
+                      news_warnings=[])
+        status, warnings = service._provider_health(**kwargs, market_bars_source="alpaca",
+                                                    alpaca_served_stale_cache=False)
+        self.assertEqual(status, "critical")
+        self.assertIn("market_bars_market_closed", warnings)
+        self.assertEqual(service._market_bars_freshness_flag(asset_type="stock", item=item, observed_at=observed), "stale")
+        status, warnings = service._provider_health(**kwargs, market_bars_source="alpaca",
+                                                    alpaca_served_stale_cache=True)
+        self.assertEqual(status, "critical")
+        self.assertIn("alpaca_served_stale_cache", warnings)
+        self.assertNotIn("market_bars_market_closed", warnings)
+
     def setUp(self) -> None:
         settings = get_settings()
         for name in ("watchlist", "crypto_watchlist", "alpaca_api_key", "alpaca_api_secret", "polygon_api_key"):
@@ -25,6 +46,7 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         # Scanner orchestration always gathers these providers, including on an
         # Alpaca failure. Keep that failure test entirely local and deterministic.
         for target, result in (
+            ("AlpacaClient.get_latest_stock_sip_bars", {}),
             ("FearGreedClient.get_index", (50, "neutral")),
             ("CoinGeckoClient.get_market_context", {}),
             ("BinanceClient.get_microstructure_batch", {}),
@@ -66,6 +88,53 @@ class ScannerServiceHardeningTests(unittest.TestCase):
                 flags = service._freshness_flags(item={"bars": [{"t": now.isoformat()}]},
                                                  observed_at=now, **kwargs)
                 self.assertEqual(flags["directional_news"], expected)
+
+    def test_news_failure_affects_only_candidates_that_trigger_the_check(self):
+        service = ScannerService()
+        service.settings = service.settings.model_copy(update={
+            "sec_user_agent": "MarketMateScanner trader@example.com",
+            "news_trigger_abs_move_pct": 1.25,
+        })
+        service.sec.get_recent_catalyst_score = AsyncMock(return_value=0.0)
+        service.options_flow.get_flow_snapshot = AsyncMock(return_value=OptionsFlowSnapshot())
+        service.marketaux.check_news = AsyncMock(return_value=NewsResult(None, "operational_attempt_ceiling_reached"))
+        service.finnhub.check_news = AsyncMock(return_value=NewsResult(None, "access_denied"))
+        service.news_cache.get = MagicMock(return_value=(None, None))
+        service.weekly_prediction_service.build_weekly_prediction = AsyncMock(return_value=None)
+        service._gate_signal = MagicMock(return_value=(80.0, "raw", True, "Fixture evidence passes", [], {}))
+        now = datetime(2026, 11, 6, 18, tzinfo=timezone.utc)
+        item = dict(latest_price=100, session_open=100, latest_volume=1000, average_volume=1000,
+                    rolling_high=105, rolling_low=95, bars=[{"t": now.isoformat(), "c": 100}] * 6)
+        common = dict(asset_type="stock", market_status="neutral", benchmark_ticker="SPY",
+                      benchmark_change_pct=0.0, created_at=now)
+        blocked_inputs = {}
+        skipped = asyncio.run(service._analyze_ticker(ticker="MSFT", item=item, **common))
+        checked = asyncio.run(service._analyze_ticker(ticker="AAPL", item={**item, "latest_price": 102},
+                                                      blocked_inputs=blocked_inputs, **common))
+        self.assertEqual((skipped.provider_status, skipped.freshness_flags["directional_news"]), ("ok", "not_requested"))
+        self.assertIsNone(checked)
+        self.assertEqual(blocked_inputs["AAPL"]["directional_news"]["providers"][1]["status"], "access_denied")
+        missing = build_scan_coverage(asset_type="stock", expected_symbols=["AAPL"], market_data={"AAPL": item},
+                                      provider_error=None, results=[], blocked_inputs=blocked_inputs).missing_symbols[0]
+        self.assertEqual(missing.required_input, "directional_news")
+        self.assertIn("finnhub access denied", missing.detail)
+        self.assertEqual(missing.directional_news, blocked_inputs["AAPL"]["directional_news"])
+        service.finnhub.check_news.assert_awaited_once_with("AAPL")
+        service.marketaux.check_news.assert_awaited_once_with("AAPL")
+
+        service.marketaux.check_news.return_value = NewsResult(0.25)
+        fallback = asyncio.run(service._analyze_ticker(ticker="AAPL", item={**item, "latest_price": 102}, **common))
+        self.assertEqual(fallback.provider_status, "ok")
+        self.assertEqual(fallback.freshness_flags["directional_news"], "fallback")
+        self.assertTrue(next(check.passed for check in paper_action_checks(fallback) if check.name == "paper_data_quality"))
+        proof = fallback.layer_details["provider_health"]["directional_news"]
+        self.assertEqual((proof["status"], proof["source"]), ("available", "marketaux"))
+        self.assertEqual(proof["providers"][1]["status"], "access_denied")
+
+        service.marketaux.check_news.return_value = NewsResult(0.0, "no_relevant_articles")
+        empty = asyncio.run(service._analyze_ticker(ticker="AAPL", item={**item, "latest_price": 102}, **common))
+        self.assertEqual(empty.freshness_flags["directional_news"], "successful_empty")
+        self.assertTrue(empty.news_checked)
 
     def _use_provider_max_bar_age(self, service: ScannerService, minutes: int) -> None:
         original_max_age = service.settings.provider_max_bar_age_minutes
@@ -127,7 +196,9 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         service._refresh_due_signal_outcomes = AsyncMock(return_value=0)
         service._refresh_due_prediction_snapshots = AsyncMock(return_value=0)
         service.daily_bar_service.get_daily_bars = AsyncMock(return_value=([], "cache"))
-        service.alpaca.get_latest_bars = AsyncMock(return_value={"AAPL": {}})
+        benchmark = {"latest_price": 101, "day_open": 100, "average_volume": 100,
+                     "bars": [{"t": datetime.now(timezone.utc)}] * 6}
+        service.alpaca.get_latest_bars = AsyncMock(return_value={ticker: benchmark for ticker in ("AAPL", "SPY", "QQQ")})
         service.fear_greed.get_index = AsyncMock(return_value=(50, "neutral"))
         service._compute_market_status = MagicMock(return_value=("neutral", 0.0, 0.0))
         service._analyze_ticker = AsyncMock(
@@ -217,6 +288,7 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         service._refresh_due_signal_outcomes = AsyncMock(return_value=0)
         service._refresh_due_prediction_snapshots = AsyncMock(return_value=0)
         service.alpaca.get_latest_bars = AsyncMock(return_value={ticker: {} for ticker in stocks})
+        service.alpaca.get_latest_stock_sip_bars = AsyncMock(return_value={})
         service.fear_greed.get_index = AsyncMock(return_value=(50, "neutral"))
         service._compute_market_status = MagicMock(return_value=("neutral", 0.0, 0.0))
         service._analyze_ticker = AsyncMock(return_value=None)
@@ -241,6 +313,7 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         service._refresh_due_prediction_snapshots = AsyncMock(return_value=0)
         service.daily_bar_service.get_daily_bars = AsyncMock(return_value=([], "cache"))
         service.alpaca.get_latest_bars = AsyncMock(return_value={"AAPL": {}})
+        service.alpaca.get_latest_stock_sip_bars = AsyncMock(return_value={})
         service.fear_greed.get_index = AsyncMock(return_value=(50, "neutral"))
         service._compute_market_status = MagicMock(return_value=("neutral", 0.0, 0.0))
         service._analyze_ticker = AsyncMock(return_value=None)
@@ -298,7 +371,6 @@ class ScannerServiceHardeningTests(unittest.TestCase):
     def test_alpaca_stale_cache_marks_provider_degraded_not_critical(self) -> None:
         service = ScannerService()
         observed_at = datetime.now(timezone.utc)
-        service.alpaca.consume_last_stale_flag = MagicMock(return_value=True)
 
         stale_observed = observed_at - timedelta(minutes=90)
         provider_status, warnings = service._provider_health(
@@ -355,11 +427,13 @@ class ScannerServiceHardeningTests(unittest.TestCase):
 
     def test_get_stock_bars_with_fallback_uses_polygon_when_alpaca_fails(self) -> None:
         service = ScannerService()
-        service.settings.polygon_api_key = "test-polygon-key"
+        service.settings = Settings(_env_file=None, polygon_api_key="test-polygon-key", polygon_intraday_fallback_enabled=True)
+        now = datetime.now(timezone.utc)
         polygon_bars = {
             "AAPL": {
                 "latest_price": 190.0,
-                "bars": [{"t": datetime.now(timezone.utc).isoformat(), "c": 190.0}],
+                "average_volume": 100,
+                "bars": [{"t": now - timedelta(minutes=5 * offset), "c": 190.0} for offset in range(5, -1, -1)],
             }
         }
         service.alpaca.get_latest_bars = AsyncMock(side_effect=RuntimeError("alpaca down"))
@@ -371,7 +445,7 @@ class ScannerServiceHardeningTests(unittest.TestCase):
         self.assertEqual(bars["AAPL"]["latest_price"], 190.0)
         service.polygon.get_latest_bars.assert_awaited_once()
 
-    def test_crypto_ws_override_makes_bars_fresh_when_alpaca_is_stale(self) -> None:
+    def test_crypto_ws_override_cannot_make_stale_ohlcv_fresh(self) -> None:
         service = ScannerService()
         self._use_provider_max_bar_age(service, 15)
         observed_at = datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc)
@@ -380,11 +454,6 @@ class ScannerServiceHardeningTests(unittest.TestCase):
             "coinbase_price_received_at": (observed_at - timedelta(minutes=2)).isoformat(),
         }
 
-        effective_age = service._effective_bar_age_minutes(
-            asset_type="crypto",
-            item=item,
-            observed_at=observed_at,
-        )
         flags = service._freshness_flags(
             item=item,
             observed_at=observed_at,
@@ -396,10 +465,9 @@ class ScannerServiceHardeningTests(unittest.TestCase):
             **self._provider_health_kwargs(asset_type="crypto"),
         )
 
-        self.assertEqual(effective_age, 2.0)
-        self.assertEqual(flags["market_bars"], "ws_override")
-        self.assertNotEqual(provider_status, "critical")
-        self.assertNotIn("market_bars_stale", warnings)
+        self.assertEqual(flags["market_bars"], "stale")
+        self.assertEqual(provider_status, "critical")
+        self.assertIn("market_bars_stale", warnings)
         self.assertNotIn("market_bars_missing", warnings)
 
     def test_crypto_ws_stale_still_triggers_stale_flag_when_both_sources_stale(self) -> None:
@@ -458,11 +526,6 @@ class ScannerServiceHardeningTests(unittest.TestCase):
             "coinbase_price_received_at": (observed_at - timedelta(minutes=2)).isoformat(),
         }
 
-        effective_age = service._effective_bar_age_minutes(
-            asset_type="stock",
-            item=item,
-            observed_at=observed_at,
-        )
         flags = service._freshness_flags(
             item=item,
             observed_at=observed_at,
@@ -474,7 +537,6 @@ class ScannerServiceHardeningTests(unittest.TestCase):
             **self._provider_health_kwargs(asset_type="stock"),
         )
 
-        self.assertEqual(effective_age, 90.0)
         self.assertEqual(flags["market_bars"], "stale")
         self.assertEqual(provider_status, "critical")
         self.assertIn("market_bars_stale", warnings)

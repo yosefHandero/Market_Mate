@@ -10,8 +10,10 @@ export const FRESH_BAR_MAX_MINUTES = 45;
 /** Scan-run freshness threshold — matches backend `health_max_stale_minutes`. */
 export const SCAN_FRESH_MAX_MINUTES = 30;
 
-/** Backend freshness flag values that indicate healthy market data. */
-export const HEALTHY_FRESHNESS_FLAG_VALUES = new Set(['ok', 'ws_override']);
+/** Backend freshness flag values that do not block paper action. */
+export const HEALTHY_FRESHNESS_FLAG_VALUES = new Set([
+  'ok', 'ws_override', 'fallback', 'successful_empty', 'not_requested', 'disabled',
+]);
 
 export function isHealthyFreshnessFlag(value: string): boolean {
   return HEALTHY_FRESHNESS_FLAG_VALUES.has(String(value).trim().toLowerCase());

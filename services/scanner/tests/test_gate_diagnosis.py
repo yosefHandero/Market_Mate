@@ -1,6 +1,5 @@
 """Gate explanations distinguish missing measurements from measured bad results."""
 from datetime import datetime, timezone
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -13,10 +12,14 @@ class GateDiagnosisTests(unittest.TestCase):
     def gate(self, returns):
         repo = ScanRepository()
         repo.settings = Settings(_env_file=None, trade_gate_horizon="1h")
-        rows = [SignalOutcomeORM(signal="BUY", entry_price=100, price_after_1h=100 + value) for value in returns]
-        bucket = repo._build_outcome_bucket(key="BUY", rows=rows)
-        summary = SimpleNamespace(by_signal=[bucket], by_signal_score_bucket=[])
-        with patch.object(repo, "get_signal_outcome_summary", return_value=summary):
+        rows = [
+            SignalOutcomeORM(signal="BUY", entry_price=100, price_after_1h=100 + value,
+                             generated_at=datetime(2026, 10, 25, 12), raw_score=55)
+            for value in returns
+        ]
+        with patch("app.services.repository.select_hourly_buy_evidence", return_value={
+            "Recent completed": rows, "Historical completed": [], "Historical replay": [],
+        }):
             return repo.evaluate_signal_gate(asset_type="stock", signal="BUY", score_band="60-69", horizon="1h", observed_at=datetime(2026, 10, 26, 14, tzinfo=timezone.utc))
 
     def test_missing_returns_are_unavailable_not_measured_zero(self):

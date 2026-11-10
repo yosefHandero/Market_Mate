@@ -6,7 +6,8 @@ import {
   getLatestScan,
   getReadyz,
 } from '@/lib/api';
-import { formatScanUpdated, isCoverageIncomplete, isScanStale } from '@/lib/decision-surface';
+import { describeUnscoredRequiredInputs, formatScanUpdated, isCoverageIncomplete, isScanStale } from '@/lib/decision-surface';
+import { withoutProviderDiagnostics } from '@/lib/scan-provider-data';
 
 export default async function DecisionPage() {
   const [decisionsResult, automationResult, healthResult, latestScanResult] = await Promise.all([
@@ -46,13 +47,15 @@ export default async function DecisionPage() {
       ) : null}
 
       <DecisionGrid
-        results={latestScan?.results ?? []}
-        topStocks={latestScan?.top_stocks}
-        topCrypto={latestScan?.top_crypto}
+        results={withoutProviderDiagnostics(latestScan?.results ?? [])}
+        topStocks={withoutProviderDiagnostics(latestScan?.top_stocks ?? [])}
+        topCrypto={withoutProviderDiagnostics(latestScan?.top_crypto ?? [])}
         decisions={decisionsResult.data ?? []}
         automation={automationResult.data}
         scanStale={isScanStale(healthResult.data, latestScan)}
         coverageIncomplete={isCoverageIncomplete(latestScan?.coverage)}
+        unscoredRequiredInputs={describeUnscoredRequiredInputs(latestScan?.coverage)}
+        hasSavedScan={latestScan != null}
       />
     </main>
   );

@@ -76,7 +76,9 @@ export function evaluatePaperActionGate({
   if (automation?.kill_switch_enabled) reasons.push('kill switch is on');
   if (automation?.breaker?.state === 'open') reasons.push('circuit breaker is open');
   if (providerCritical) reasons.push('provider is critical');
+  if (barAgeMinutes === null) reasons.push('bar age is unavailable');
   if (staleBars) reasons.push(`bars are stale (${Math.round(barAgeMinutes ?? 0)}m)`);
+  if (!Number.isFinite(result.price) || result.price <= 0) reasons.push('saved scan price is unavailable');
   if (hasBadFreshnessFlags(result.freshness_flags)) reasons.push('data-quality flags are blocking');
   if (tradeReadiness.hardStop) reasons.push('hard stop is active');
   if (result.decision_signal !== 'BUY') {

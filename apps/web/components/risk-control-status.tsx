@@ -2,7 +2,7 @@ import { MarketStatusBadge } from '@/components/market-status-badge';
 import type {
   AutomationStatusResponse,
   HealthResponse,
-  MarketStatus,
+  ScanMarketStatus,
   SystemReadinessResponse,
 } from '@/lib/types';
 
@@ -41,7 +41,7 @@ export function RiskControlStatus({
   health: HealthResponse | null;
   automation: AutomationStatusResponse | null;
   systemReadiness: SystemReadinessResponse | null;
-  marketStatus?: MarketStatus | null;
+  marketStatus?: ScanMarketStatus | null;
 }) {
   const liveTradingDisabled = automation?.dry_run_only !== false;
   const killSwitchOn = automation?.kill_switch_enabled === true;

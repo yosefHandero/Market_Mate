@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
@@ -16,10 +17,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 
 from app.clients.finnhub import FinnhubClient
-from app.clients.marketaux import MarketauxClient, NEWS_URL
+from app.clients.marketaux import MarketauxClient, NEWS_URL, marketaux_account
+from app.clients.news_result import NewsResult
 from app.marketaux_quota import main as quota_main
 from app.services.news_cache import NewsCacheService
 from app.services.provider_coordination import CoordinationBlocked, ProviderCoordination, content_key
+
+
+def marketaux_article(score: float | str) -> dict:
+    return {"data": [{"published_at": datetime.now(timezone.utc).isoformat(),
+                      "entities": [{"symbol": "AAPL", "sentiment_score": score}]}]}
+
+
+def marketaux_params() -> dict:
+    return {"api_token": "fake-token", "symbols": "AAPL", "language": "en", "limit": 10,
+            "published_after": (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()}
 
 
 class StoreTests(unittest.TestCase):
@@ -97,6 +109,20 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(sum(accepted), 3)
         self.assertEqual(self.store.status("account")["total_attempts"], 3)
 
+    def test_shared_pacing_defers_without_spending_an_attempt(self):
+        from app.services.provider_coordination import CoordinationPaced
+
+        self.claim(now=100)
+        self.store.reserve_attempt("account", "key", "owner", 3, min_interval_seconds=2.1, now=100)
+        other = ProviderCoordination(self.path)
+        other.claim("other", "new", 10, now=101)
+        with self.assertRaises(CoordinationPaced) as exc:
+            other.reserve_attempt("account", "other", "new", 3, min_interval_seconds=2.1, now=101)
+        self.assertAlmostEqual(exc.exception.retry_after_seconds, 1.1)
+        self.assertEqual(other.status("account")["total_attempts"], 1)
+        other.reserve_attempt("account", "other", "new", 3, min_interval_seconds=2.1, now=102.1)
+        self.assertEqual(other.status("account")["total_attempts"], 2)
+
     def test_separate_process_observes_persisted_unknown_reset(self):
         self.claim()
         self.store.record_block("account", "key", "owner", reason="usage_limit_reached", now=100)
@@ -156,6 +182,23 @@ else:
         self.assertTrue(status["audit"][0]["recorded_at"])
         self.assertIn("unknown", status["account_daily_allowance"])
 
+    def test_proof_quota_status_reports_current_local_budget_and_redacts_audit(self):
+        from app.clients.marketaux import marketaux_quota_status
+
+        settings = SimpleNamespace(cache_dir_path=self.path, marketaux_api_token="fake-token",
+                                   marketaux_daily_attempt_budget=9)
+        account = marketaux_account(settings.marketaux_api_token)
+        now = time.time()
+        self.store.set_attempt_ceiling(account, 4, "audit only")
+        self.store.claim("key", "owner", 60, now=now)
+        self.store.reserve_attempt(account, "key", "owner", 9, now=now)
+        expected = {"configured_daily_attempt_budget": 9, "utc_day_attempts": 1,
+                    "operational_attempts_remaining": 3, "block_state": None,
+                    "verified_reset_at": None, "rate_retry_at": None}
+        self.assertEqual(marketaux_quota_status(settings), expected)
+        with patch("app.clients.marketaux.time.time", return_value=now + 86400):
+            self.assertEqual(marketaux_quota_status(settings), {**expected, "utc_day_attempts": 0})
+
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -180,6 +223,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         client = MarketauxClient()
         self.clients.append(client)
         client._guard.pace_seconds = 0
+        client.min_attempt_interval_seconds = 0
         client._client.request = AsyncMock(side_effect=responses)
         return client
 
@@ -226,11 +270,26 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._client.request.await_count, 2)
         self.assertEqual(client.coordination.status(client.account)["total_attempts"], 2)
 
+    async def test_two_clients_wait_for_the_same_send_pace(self):
+        sends = []
+
+        async def send(*args, **kwargs):
+            sends.append(first.coordination.status(first.account)["last_attempt_at"])
+            return httpx.Response(200, json={"data": []})
+
+        first, second = self.client(send), self.client(send)
+        first.min_attempt_interval_seconds = second.min_attempt_interval_seconds = 0.05
+        results = await asyncio.gather(first.check_news("AAPL"), second.check_news("MSFT"))
+        self.assertEqual([result.status for result in results], ["no_relevant_articles"] * 2)
+        self.assertEqual(len(sends), 2)
+        self.assertGreaterEqual(sends[1] - sends[0], 0.0499)
+        self.assertEqual(second.coordination.status(second.account)["total_attempts"], 2)
+
     async def test_independent_clients_coalesce_and_reuse_genuine_neutral(self):
         first = self.client([])
         async def delayed(*args, **kwargs):
             await asyncio.sleep(0.05)
-            return httpx.Response(200, json={"data": [{"sentiment_score": 0.0}]})
+            return httpx.Response(200, json=marketaux_article(0.0))
         first._client.request.side_effect = delayed
         second = self.client([AssertionError("Equivalent request must coalesce")])
         self.assertEqual(await asyncio.gather(first.get_news_sentiment_score("AAPL"), second.get_news_sentiment_score("aapl")), [0.0, 0.0])
@@ -241,8 +300,8 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restarted._client.request.await_count, 0)
 
     async def test_wait_is_bounded_and_abandoned_request_recovers(self):
-        client = self.client([httpx.Response(200, json={"data": [{"sentiment_score": 0.4}]})])
-        params = {"api_token": "fake-token", "symbols": "AAPL", "language": "en", "limit": 10}
+        client = self.client([httpx.Response(200, json=marketaux_article(0.4))])
+        params = marketaux_params()
         key = content_key(["marketaux-news-v2", "GET", NEWS_URL, params])
         client.coordination.claim(key, "crashed", 0.1)
         client.wait_seconds = 0.02
@@ -261,15 +320,16 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second._client.request.await_count, 0)
 
     async def test_malformed_sentiment_is_not_cached_as_success(self):
-        client = self.client([httpx.Response(200, json={"data": [{"sentiment_score": "bad-number"}]})])
-        self.assertIsNone(await client.get_news_sentiment_score("AAPL"))
-        params = {"api_token": "fake-token", "symbols": "AAPL", "language": "en", "limit": 10}
+        client = self.client([httpx.Response(200, json=marketaux_article("bad-number"))])
+        result = await client.check_news("AAPL")
+        self.assertEqual((result.score, result.status, result.http_status), (None, "provider_error", 200))
+        params = marketaux_params()
         key = content_key(["marketaux-news-v2", "GET", NEWS_URL, params])
         self.assertIsNone(client.coordination.read_cache(key))
 
     async def test_request_parameter_change_does_not_reuse_cache(self):
-        client = self.client([httpx.Response(200, json={"data": [{"sentiment_score": 0.2}]})] * 2)
-        params = {"api_token": "fake-token", "symbols": "AAPL", "language": "en", "limit": 10}
+        client = self.client([httpx.Response(200, json=marketaux_article(0.2))] * 2)
+        params = marketaux_params()
         await client._shared_news(params)
         await client._shared_news({**params, "limit": 5})
         self.assertEqual(client._client.request.await_count, 2)
@@ -279,7 +339,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         client.ownership_seconds = 0.09
         async def delayed(*args, **kwargs):
             await asyncio.sleep(0.04)
-            return httpx.Response(200, json={"data": [{"sentiment_score": 0.2}]})
+            return httpx.Response(200, json=marketaux_article(0.2))
         client._client.request.side_effect = delayed
         with patch.object(client.coordination, "renew", side_effect=RuntimeError("fake store failure")), patch.object(
             client.coordination, "complete", wraps=client.coordination.complete
@@ -294,8 +354,110 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.clients.append(client)
         with patch.object(client, "_fetch_news_sentiment", AsyncMock(side_effect=RuntimeError("fake provider failure"))):
             self.assertIsNone(await client.get_news_sentiment_score("AAPL"))
-        with patch.object(client, "_fetch_news_sentiment", AsyncMock(return_value=0.0)):
+        with patch.object(client, "_fetch_news_sentiment", AsyncMock(return_value=NewsResult(0.0))):
             self.assertEqual(await client.get_news_sentiment_score("AAPL"), 0.0)
+
+    async def test_marketaux_uses_matching_entity_and_distinguishes_empty_and_uncovered(self):
+        article = {"published_at": datetime.now(timezone.utc).isoformat(), "entities": [
+            {"symbol": "UNIUSD", "sentiment_score": 0.6},
+            {"symbol": "ETHUSD", "sentiment_score": -0.8},
+        ]}
+        client = self.client([
+            httpx.Response(200, json={"data": [article]}),
+            httpx.Response(200, json={"data": []}),
+            httpx.Response(200, json={"data": [{"published_at": article["published_at"],
+                                                 "entities": [{"symbol": "AAPL"}]}]}),
+            httpx.Response(200, json={"data": [article]}),
+            httpx.Response(200, json={"data": [{}]}),
+            httpx.Response(200, json={"data": [{"entities": [{"symbol": "AMD", "sentiment_score": 0.5}]}]}),
+        ])
+        scored = await client.check_news("UNIUSD")
+        empty = await client.check_news("MSFT")
+        uncovered = await client.check_news("AAPL")
+        self.assertEqual((scored.score, scored.status), (0.6, "ok"))
+        self.assertEqual((empty.score, empty.status), (0.0, "no_relevant_articles"))
+        self.assertEqual((uncovered.score, uncovered.status), (None, "missing_sentiment"))
+        self.assertEqual(uncovered.latest_article_at, article["published_at"])
+        unrelated = await client.check_news("TSLA")
+        self.assertEqual((unrelated.score, unrelated.status), (None, "coverage_unavailable"))
+        self.assertEqual((await client.check_news("JNJ")).status, "provider_error")
+        undated = await client.check_news("AMD")
+        self.assertEqual((undated.score, undated.status), (None, "invalid_publication_time"))
+
+    async def test_marketaux_distinguishes_auth_quota_and_disabled_requests(self):
+        client = self.client([
+            httpx.Response(401, json={"error": {"code": "invalid_api_token"}}),
+            httpx.Response(402, json={"error": {"code": "usage_limit_reached"}}),
+        ])
+        self.assertEqual((await client.check_news("AAPL")).status, "authentication_failed")
+        self.assertEqual((await client.check_news("MSFT")).status, "quota_exhausted_reset_unknown")
+        client.coordination.recover(client.account, "fixture verification")
+        client.coordination.set_attempt_ceiling(client.account, 0, "fixture disabled")
+        self.assertEqual((await client.check_news("TSLA")).status, "operational_attempt_ceiling_reached")
+        self.assertEqual((await client.check_news("TSLA")).status, "operational_attempt_ceiling_reached")
+        self.assertEqual(client._client.request.await_count, 2)
+        self.settings.marketaux_api_token = ""
+        self.assertEqual((await client.check_news("AAPL")).status, "disabled_missing_credentials")
+        self.assertEqual(client._client.request.await_count, 2)
+
+    async def test_finnhub_distinguishes_empty_news_and_company_only(self):
+        client = FinnhubClient()
+        self.clients.append(client)
+        client._guard.pace_seconds = 0
+        client._client.request = AsyncMock(side_effect=[
+            httpx.Response(200, json={}),
+            httpx.Response(200, json=[]),
+            httpx.Response(200, json={"companyNewsScore": 0.75}),
+            httpx.Response(200, json=[]),
+        ])
+        empty = await client.check_news("MSFT")
+        self.assertEqual((empty.score, empty.status), (0.0, "no_relevant_articles"))
+        aggregate = await client.check_news("JNJ")
+        self.assertEqual((aggregate.score, aggregate.status), (0.35, "company_sentiment_only"))
+
+    async def test_finnhub_entitlement_denial_skips_articles_and_later_symbols(self):
+        client = FinnhubClient()
+        self.clients.append(client)
+        client._client.request = AsyncMock(return_value=httpx.Response(
+            403, json={"error": "You don't have access to this resource."}
+        ))
+        denied = await client.check_news("AAPL")
+        self.assertEqual(denied.status, "access_denied")
+        client._client.request.assert_awaited_once()
+        self.assertTrue(client._client.request.call_args.args[1].endswith("/news-sentiment"))
+        self.assertEqual((denied.endpoint, denied.http_status),
+                         ("https://finnhub.io/api/v1/news-sentiment", 403))
+        restarted = FinnhubClient()
+        self.clients.append(restarted)
+        restarted._client.request = AsyncMock(side_effect=AssertionError("Known denial must block sends"))
+        self.assertEqual(await restarted.check_news("MSFT"), denied)
+        restarted._client.request.assert_not_awaited()
+
+    async def test_finnhub_reads_documented_article_sentiment(self):
+        client = FinnhubClient()
+        self.clients.append(client)
+        client._guard.pace_seconds = 0
+        client._client.request = AsyncMock(side_effect=[
+            httpx.Response(200, json={"symbol": "AAPL", "companyNewsScore": 0.75,
+                                      "sentiment": {"bullishPercent": 0.8, "bearishPercent": 0.2}}),
+            httpx.Response(200, json=[]),
+        ])
+        self.assertEqual((await client.check_news("AAPL")).score, 0.47)
+
+    async def test_marketaux_reports_freshness_and_rejects_stale_sentiment(self):
+        now = datetime.now(timezone.utc)
+        stale = marketaux_article(0.8)
+        stale["data"][0]["published_at"] = (now - timedelta(days=8)).isoformat()
+        fresh = marketaux_article(0.4)
+        fresh["data"][0]["entities"][0]["symbol"] = "MSFT"
+        client = self.client([httpx.Response(200, json=stale), httpx.Response(200, json=fresh)])
+        result = await client.check_news("AAPL")
+        self.assertEqual((result.score, result.status), (None, "stale_news"))
+        self.assertEqual(result.latest_article_at, stale["data"][0]["published_at"])
+        self.assertEqual(result.lookback_start, (now.date() - timedelta(days=7)).isoformat())
+        self.assertEqual(client._client.request.call_args.kwargs["params"]["published_after"], result.lookback_start)
+        result = await client.check_news("MSFT")
+        self.assertEqual((result.score, result.status, result.http_status), (0.4, "ok", 200))
 
     async def test_scanner_keeps_finnhub_independent_and_neutral_honest(self):
         from app.services.scanner import ScannerService
@@ -303,17 +465,17 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         scanner.settings = self.settings
         scanner.news_cache = MagicMock()
         scanner.news_cache.get.return_value = (None, None)
-        scanner.marketaux = SimpleNamespace(get_news_sentiment_score=AsyncMock(return_value=None))
-        scanner.finnhub = SimpleNamespace(get_news_sentiment_score=AsyncMock(return_value=0.6))
+        scanner.marketaux = SimpleNamespace(check_news=AsyncMock(return_value=NewsResult(None, "provider_error")))
+        scanner.finnhub = SimpleNamespace(check_news=AsyncMock(return_value=NewsResult(0.6)))
         value = await scanner._get_directional_sentiment("AAPL")
         self.assertEqual(value[:3], (0.6, True, "finnhub"))
         scanner.news_cache.set.assert_not_called()
-        scanner.finnhub.get_news_sentiment_score.return_value = None
+        scanner.finnhub.check_news.return_value = NewsResult(None, "access_denied")
         value = await scanner._get_directional_sentiment("AAPL")
-        self.assertEqual(value[:3], (0.0, False, "unavailable"))
+        self.assertEqual(value[:3], (None, False, "unavailable"))
         scanner.news_cache.set.assert_not_called()
-        scanner.marketaux.get_news_sentiment_score.return_value = 0.0
-        scanner.finnhub.get_news_sentiment_score.return_value = 0.0
+        scanner.marketaux.check_news.return_value = NewsResult(0.0)
+        scanner.finnhub.check_news.return_value = NewsResult(0.0)
         value = await scanner._get_directional_sentiment("AAPL")
         self.assertEqual(value[:3], (0.0, True, "marketaux+finnhub"))
         self.assertNotIn("directional_news_unavailable", value[4])
@@ -325,11 +487,26 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         scanner.settings = self.settings
         scanner.news_cache = MagicMock()
         scanner.news_cache.get.return_value = (None, None)
-        scanner.marketaux = SimpleNamespace(get_news_sentiment_score=AsyncMock(return_value=0.8))
-        scanner.finnhub = SimpleNamespace(get_news_sentiment_score=AsyncMock(return_value=-0.4))
+        scanner.marketaux = SimpleNamespace(check_news=AsyncMock(return_value=NewsResult(0.8)))
+        scanner.finnhub = SimpleNamespace(check_news=AsyncMock(return_value=NewsResult(-0.4)))
         self.assertEqual((await scanner._get_directional_sentiment("AAPL"))[0], 0.2)
-        scanner.finnhub.get_news_sentiment_score.return_value = 0.0
+        scanner.finnhub.check_news.return_value = NewsResult(0.0)
         self.assertEqual((await scanner._get_directional_sentiment("AAPL"))[0], 0.8)
+
+    async def test_crypto_needs_marketaux_and_never_checks_finnhub_company_endpoints(self):
+        from app.services.scanner import ScannerService
+        scanner = ScannerService.__new__(ScannerService)
+        scanner.marketaux = SimpleNamespace(check_news=AsyncMock(return_value=NewsResult(0.4)))
+        scanner.finnhub = SimpleNamespace(check_news=AsyncMock(return_value=NewsResult(None, "access_denied")))
+        value = await scanner._get_directional_sentiment("UNI/USD", "crypto")
+        self.assertEqual(value[:3], (0.4, True, "marketaux"))
+        self.assertEqual(value[4], [])
+        scanner.marketaux.check_news.assert_awaited_once_with("UNIUSD")
+        scanner.finnhub.check_news.assert_not_awaited()
+        scanner.marketaux.check_news.return_value = NewsResult(None, "operational_attempt_ceiling_reached")
+        value = await scanner._get_directional_sentiment("UNI/USD", "crypto")
+        self.assertEqual(value[:3], (None, False, "unavailable"))
+        self.assertEqual(value[4], ["marketaux_operational_attempt_ceiling_reached", "directional_news_unavailable"])
 
 
 if __name__ == "__main__":

@@ -48,6 +48,21 @@ export function isCoverageIncomplete(
   return (coverage ?? []).some((row) => row.status === 'partial' || row.status === 'unavailable');
 }
 
+export function describeUnscoredRequiredInputs(coverage: ScanAssetCoverage[] | null | undefined): string {
+  const missing = (coverage ?? []).flatMap((asset) => asset.missing_symbols);
+  const messages: string[] = [];
+  if (missing.some((symbol) => symbol.required_input === 'benchmark')) {
+    messages.push('Some symbols were skipped because a relative-strength benchmark was unavailable.');
+  }
+  if (missing.some((symbol) => symbol.required_input === 'directional_news' || symbol.directional_news)) {
+    messages.push('Some symbols were skipped because required directional news was unavailable.');
+  }
+  if (missing.some((symbol) => symbol.required_input === 'volume_reference')) {
+    messages.push('Some symbols were skipped because reference volume was unavailable.');
+  }
+  return messages.join(' ');
+}
+
 export type DecisionWarning = {
   message: string;
   tone: 'safety' | 'data';
@@ -60,6 +75,9 @@ export function buildDecisionWarning(input: {
   barsStale?: boolean;
   coverageIncomplete: boolean;
   marketDataDegraded: boolean;
+  requiredDataUnavailable?: boolean;
+  unscoredRequiredInputs?: string;
+  compatibleFallback?: boolean;
   heldBackCount: number;
 }): DecisionWarning | null {
   const safety: string[] = [];
@@ -67,21 +85,31 @@ export function buildDecisionWarning(input: {
   if (input.breakerOpen) safety.push('The circuit breaker is open.');
 
   const stale = input.scanStale || input.barsStale === true;
-  const degraded = input.coverageIncomplete || input.marketDataDegraded;
-  if (!safety.length && !stale && !degraded && input.heldBackCount <= 0) return null;
+  const coverageUnknown = input.coverageIncomplete && !input.unscoredRequiredInputs;
+  const degraded = coverageUnknown || input.marketDataDegraded;
+  if (!safety.length && !stale && !degraded && !input.requiredDataUnavailable &&
+      !input.unscoredRequiredInputs && !input.compatibleFallback && input.heldBackCount <= 0) return null;
 
   const parts: string[] = [];
   if (safety.length) {
     parts.push(`${safety.join(' ')} Paper actions are blocked.`);
   }
-  const heldBack = input.heldBackCount > 0 ? ' Blocked setups stay off this list.' : '';
-  if (stale) {
-    parts.push(`Stale or incomplete data is affecting these results.${heldBack}`);
+  if (input.scanStale) {
+    parts.push('The latest scan is stale.');
+  } else if (stale) {
+    parts.push('Stale or incomplete data is affecting these results.');
+  } else if (input.requiredDataUnavailable) {
+    parts.push('Required data is unavailable for some candidates.');
+  } else if (coverageUnknown) {
+    parts.push('Required data was unavailable for some symbols.');
   } else if (degraded) {
-    parts.push(`Degraded or incomplete data is affecting these results.${heldBack}`);
-  } else if (input.heldBackCount > 0) {
+    parts.push('Degraded or incomplete data is affecting these results.');
+  } else if (input.compatibleFallback && !input.unscoredRequiredInputs) {
+    parts.push('Required data was available through a compatible fallback.');
+  } else if (input.heldBackCount > 0 && !input.unscoredRequiredInputs) {
     parts.push('Blocked setups stay off this list.');
   }
+  if (input.unscoredRequiredInputs) parts.push(input.unscoredRequiredInputs);
 
   return {
     message: parts.join(' '),

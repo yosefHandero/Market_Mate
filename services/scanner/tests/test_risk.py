@@ -125,6 +125,39 @@ class _FakeRepo:
 
 
 class RiskServiceTests(unittest.TestCase):
+    def test_rejected_order_reports_locked_evidence_checks_and_keeps_saved_reason(self) -> None:
+        repo = _FakeRepo()
+        repo.latest_context.gate_passed = False
+        repo.latest_context.gate_reason = "Saved sample count was below minimum."
+        locked_gate = repo.evaluate_signal_gate(
+            asset_type="stock", signal="BUY", score_band="60-69", horizon="1h"
+        )
+        locked_gate.passed = False
+        locked_gate.reason = "Locked average return is below minimum."
+        locked_gate.signal_avg_return = -0.01
+        locked_gate.checks.append(GateCheck(name="avg_return", passed=False, detail="-0.01% vs min 0.15%"))
+        repo.evaluate_signal_gate = lambda **kwargs: locked_gate
+        service = RiskService(scan_repository=repo)
+        service.settings = service.settings.model_copy(update={"trade_gate_enabled": True, "trade_gate_horizon": "1h"})
+
+        eligibility = service.evaluate_trade(ticker="AAPL", side="buy", qty=1, latest_price=190.0)
+
+        self.assertFalse(eligibility.allowed)
+        self.assertEqual(eligibility.stored_gate_reason, repo.latest_context.gate_reason)
+        with self.subTest("current explanation"):
+            self.assertEqual(eligibility.reason, locked_gate.reason)
+        with self.subTest("serialized checks"):
+            checks = {check.name: check.passed for check in eligibility.gate_checks}
+            self.assertEqual(checks, {
+                "required_signal": True,
+                "latest_scan_freshness": True,
+                "signal_freshness": True,
+                "signal_enabled": True,
+                "sample_size": True,
+                "avg_return": False,
+                "signal_gate_consistency": True,
+            })
+
     def test_signal_level_fallback_allows_when_band_is_still_maturing(self) -> None:
         service = RiskService()
         service.repo = _FakeRepo()

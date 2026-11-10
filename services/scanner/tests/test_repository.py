@@ -278,23 +278,23 @@ class RepositoryCalibrationTests(unittest.TestCase):
             -1.0,
         )
 
-    def test_evaluate_signal_gate_uses_recent_window_summary(self) -> None:
+    def test_sell_gate_uses_recent_window_summary(self) -> None:
         summary = SignalOutcomeSummary(
             total_signals=25,
             pending_15m_count=0,
             pending_1h_count=0,
             pending_1d_count=0,
             overall=self._bucket("overall", count=25, win_rate=60.0, avg_return=0.2),
-            by_signal=[self._bucket("BUY", count=25, win_rate=66.0, avg_return=0.3)],
+            by_signal=[self._bucket("SELL", count=25, win_rate=66.0, avg_return=0.3)],
             by_confidence_bucket=[],
             by_signal_confidence_bucket=[],
-            by_signal_score_bucket=[self._bucket("BUY:60-69", count=8, win_rate=70.0, avg_return=0.35)],
+            by_signal_score_bucket=[self._bucket("SELL:60-69", count=8, win_rate=70.0, avg_return=0.35)],
         )
 
         with patch.object(self.repo, "get_signal_outcome_summary", return_value=summary) as summary_mock:
             evaluation = self.repo.evaluate_signal_gate(
                 asset_type="stock",
-                signal="BUY",
+                signal="SELL",
                 score_band="60-69",
                 horizon="1h",
                 observed_at=datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
@@ -313,19 +313,14 @@ class RepositoryCalibrationTests(unittest.TestCase):
     def test_crypto_buy_gate_requires_higher_sample_bar(self) -> None:
         # A 25-outcome BUY bucket clears the stock gate but must fail for crypto BUY,
         # which requires the stricter crypto sample bar (default 30). Stricter only.
-        summary = SignalOutcomeSummary(
-            total_signals=25,
-            pending_15m_count=0,
-            pending_1h_count=0,
-            pending_1d_count=0,
-            overall=self._bucket("overall", count=25, win_rate=66.0, avg_return=0.3),
-            by_signal=[self._bucket("BUY", count=25, win_rate=66.0, avg_return=0.3)],
-            by_confidence_bucket=[],
-            by_signal_confidence_bucket=[],
-            by_signal_score_bucket=[self._bucket("BUY:60-69", count=25, win_rate=70.0, avg_return=0.35)],
-        )
-
-        with patch.object(self.repo, "get_signal_outcome_summary", return_value=summary):
+        recent_rows = [
+            SignalOutcomeORM(signal="BUY", entry_price=100, price_after_1h=100.3,
+                             generated_at=datetime(2026, 3, 19, 12), raw_score=65)
+            for _ in range(25)
+        ]
+        with patch("app.services.repository.select_hourly_buy_evidence", return_value={
+            "Recent completed": recent_rows, "Historical completed": [], "Historical replay": [],
+        }):
             stock_eval = self.repo.evaluate_signal_gate(
                 asset_type="stock",
                 signal="BUY",

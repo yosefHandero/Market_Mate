@@ -262,6 +262,7 @@ class Settings(BaseSettings):
     finnhub_api_key: str = ""
     polygon_api_key: str = ""
     polygon_base_url: str = "https://api.polygon.io"
+    polygon_intraday_fallback_enabled: bool = True
     coingecko_base_url: str = "https://api.coingecko.com/api/v3"
     coingecko_api_key: str = ""
     coinbase_ws_enabled: bool = True

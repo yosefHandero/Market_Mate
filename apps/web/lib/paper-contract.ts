@@ -9,6 +9,17 @@ export function forecastAnchor(ticker: string): string {
   return `forecast-${ticker.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
 }
 
+export function formatUnitPrice(price: number | null | undefined): string {
+  if (price == null || !Number.isFinite(price) || price <= 0) return '--';
+  return price.toLocaleString(undefined, {
+    style: 'currency',
+    currency: 'USD',
+    ...(price < 0.01
+      ? { minimumSignificantDigits: 1, maximumSignificantDigits: 6 }
+      : { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+  });
+}
+
 export function formatPaperTimestamp(value: string | null | undefined): string {
   if (!value) return '--';
   // SQLite stores UTC without an offset; explicit provider offsets stay intact.

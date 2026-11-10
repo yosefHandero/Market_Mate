@@ -10,7 +10,7 @@ import {
   provenanceLabel,
 } from '@/lib/decision-presentation';
 import { formatPaperSizing, recommendedActionLine } from '@/lib/paper-order';
-import { forecastAnchor, formatHoldingDuration, formatPaperTimestamp } from '@/lib/paper-contract';
+import { forecastAnchor, formatHoldingDuration, formatPaperTimestamp, formatUnitPrice } from '@/lib/paper-contract';
 import { SIGNAL_DECISION_SUPPORT_DISCLAIMER } from '@/lib/signal-copy';
 import { usePaperOrder } from '@/lib/use-paper-order';
 import type { AutomationStatusResponse, DecisionRow, ScanResult } from '@/lib/types';
@@ -93,7 +93,7 @@ export function DecisionCard({
       <div className="candidate-row">
         <div className="candidate-summary">
           <strong className="candidate-symbol">{result.ticker}</strong>
-          <span data-testid="current-price">{formatCurrency(result.price)}</span>
+          <span data-testid="current-price">{formatUnitPrice(result.price)}</span>
           <span className="candidate-field">
             <span className="muted">Confidence </span>
             <span data-testid="confidence-score">{confidence}/100</span>
@@ -256,7 +256,7 @@ export function DecisionCard({
             </div>
             {receipt.ok ? (
               <>
-                <div><span className="muted">Actual simulated fill:</span> {formatCurrency(receipt.fill_price)} at {formatPaperTimestamp(receipt.filled_at)}</div>
+                <div><span className="muted">Actual simulated fill:</span> {formatUnitPrice(receipt.fill_price)} at {formatPaperTimestamp(receipt.filled_at)}</div>
                 <div><span className="muted">Saved exit deadline:</span> {formatPaperTimestamp(receipt.exit_due_at)}</div>
               </>
             ) : null}

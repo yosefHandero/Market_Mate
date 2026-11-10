@@ -23,8 +23,8 @@ from sqlalchemy.orm import sessionmaker
 import app.services.automation_repository as automation_repository_module
 import app.services.execution as execution_module
 import app.services.repository as repository_module
-import app.services.scanner as scanner_module
 from app.config import get_settings
+from app.brain.policies.hybrid import HYBRID_POLICY_ID, HYBRID_POLICY_VERSION
 from app.core.paper_action import paper_action_checks
 from app.core.selection import apply_top_pick_selection, select_top_picks
 from app.core.signals import compute_signal_and_explanation
@@ -87,10 +87,10 @@ class PaperContractAcceptanceTests(unittest.TestCase):
         self.execution.risk.settings = self.settings
         self.execution.alpaca.get_latest_price = AsyncMock(return_value=100.0)
         self.execution.alpaca.get_latest_crypto_price = AsyncMock(return_value=100.0)
-        self.scanner.alpaca.get_latest_price = AsyncMock(return_value=104.0)
-        self.scanner.alpaca.get_latest_crypto_price = AsyncMock(return_value=104.0)
         self.scan_at = datetime.now(timezone.utc) - timedelta(seconds=60)
         self.fill_at = self.scan_at + timedelta(seconds=30)
+        self.scanner.alpaca.get_latest_stock_quote = AsyncMock(return_value=(104.0, self.fill_at + timedelta(hours=1)))
+        self.scanner.alpaca.get_latest_crypto_quote = AsyncMock(return_value=(104.0, self.fill_at + timedelta(hours=1)))
 
     def _store_hybrid_buy(self, *, ticker="AAPL", asset_type="stock", evidence=True, provider_status="ok") -> ScanResult:
         signal = compute_signal_and_explanation(
@@ -107,22 +107,30 @@ class PaperContractAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(signal.decision_signal, "BUY")
         if evidence:
-            # Thirty independent earlier price-bearing rows; no threshold,
-            # calibration formula, learned input or production gate is mocked.
+            # Prior outcomes carry the production policy identity used by the live gate.
             band = self.repo._score_band(signal.score)
             with self.SessionLocal.begin() as session:
                 for index in range(30):
                     future_price = 100.4 if index < 24 else 99.9
+                    run_id = f"evidence-{asset_type}-{index}"
+                    generated_at = self.scan_at - timedelta(hours=2, minutes=index)
                     session.add(SignalOutcomeORM(
-                        run_id=f"evidence-{asset_type}-{index}", ticker=ticker,
+                        run_id=run_id, ticker=ticker,
                         asset_type=asset_type, signal="BUY", confidence=signal.score,
                         raw_score=signal.score, score_band=band, calibrated_confidence=signal.score,
                         calibration_source="raw", entry_price=100.0,
-                        generated_at=self.scan_at - timedelta(hours=2, minutes=index),
+                        strategy_variant=self.settings.scanner_strategy_variant or "layered-v4",
+                        scoring_version=signal.scoring_version, generated_at=generated_at,
                         price_after_1h=future_price,
                         return_after_1h=self.repo._signal_return(signal="BUY", entry_price=100.0, future_price=future_price),
                         status_1h="resolved", evaluated_at_1h=self.scan_at-timedelta(hours=1),
                         sample_source="live_paper_forward", gate_passed=True,
+                    ))
+                    session.add(PredictionSnapshotORM(
+                        run_id=run_id, ticker=ticker, asset_type=asset_type, signal="BUY", entry_price=100.0,
+                        range_low=99.0, range_high=101.0, horizon="1w", generated_at=generated_at,
+                        sample_source="live_paper_forward", decision_role="production",
+                        policy_id=HYBRID_POLICY_ID, policy_version=HYBRID_POLICY_VERSION,
                     ))
         confidence, source, passed, reason, checks, blend = self.scanner._gate_signal(
             asset_type=asset_type, signal=signal, observed_at=self.scan_at,
@@ -197,10 +205,7 @@ class PaperContractAcceptanceTests(unittest.TestCase):
         return preview, request, place
 
     def _close_at(self, observed_at: datetime) -> int:
-        # The maintenance path timestamps its actual quote retrieval, separately
-        # from due selection. Freeze that clock as well as the eligibility time.
-        with patch.object(scanner_module, "datetime", _clock_at(observed_at)):
-            return asyncio.run(self.scanner.close_open_positions_past_horizon(observed_at=observed_at))
+        return asyncio.run(self.scanner.close_open_positions_past_horizon(observed_at=observed_at))
 
     def test_real_buy_preview_fill_frozen_deadline_late_close_and_gross_ledger(self):
         row = self._store_hybrid_buy()
@@ -223,10 +228,9 @@ class PaperContractAcceptanceTests(unittest.TestCase):
         self.assertEqual(position.policy_id, preview.paper_contract.policy_id)
         # Crossing an advisory stop before the saved deadline does not trigger a
         # protective order or a fabricated protective result.
-        self.scanner.alpaca.get_latest_price.return_value = 98.0
         self.assertEqual(self._close_at(self.fill_at+timedelta(minutes=30)), 0)
-        self.scanner.alpaca.get_latest_price.assert_not_awaited()
-        self.scanner.alpaca.get_latest_price.return_value = 104.0
+        self.scanner.alpaca.get_latest_stock_quote.assert_not_awaited()
+        self.scanner.alpaca.get_latest_stock_quote.return_value = (104.0, due_at + timedelta(minutes=10))
         self.settings.trade_gate_horizon = "1d"
         self.assertEqual(self.repo.list_paper_positions_due_for_horizon_close(observed_at=due_at-timedelta(seconds=1)), [])
         self.assertEqual(self._close_at(due_at+timedelta(minutes=10)), 1)
@@ -295,8 +299,8 @@ class PaperContractAcceptanceTests(unittest.TestCase):
         observed_at = self.fill_at+timedelta(hours=1, minutes=5)
         for quote in (None, 0.0, -1.0, float("nan"), float("inf"), RuntimeError("mock unavailable")):
             with self.subTest(quote=quote):
-                self.scanner.alpaca.get_latest_price.side_effect = quote if isinstance(quote, Exception) else None
-                self.scanner.alpaca.get_latest_price.return_value = quote
+                self.scanner.alpaca.get_latest_stock_quote.side_effect = quote if isinstance(quote, Exception) else None
+                self.scanner.alpaca.get_latest_stock_quote.return_value = (quote, observed_at)
                 self.assertEqual(self._close_at(observed_at), 0)
                 position = self.repo.list_paper_positions(observed_at=observed_at)[0]
                 self.assertEqual(position.status, "open")

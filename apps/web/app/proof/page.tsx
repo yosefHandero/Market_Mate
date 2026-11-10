@@ -13,6 +13,7 @@ import { PredictionAccuracyPanel } from '@/components/prediction-accuracy-panel'
 import { ProofLedgerSection } from '@/components/proof-ledger-section';
 import { ProofSummaryPanel } from '@/components/proof-summary-panel';
 import { RiskControlStatus } from '@/components/risk-control-status';
+import { ScanInputDiagnostics } from '@/components/scan-input-diagnostics';
 import { WalkForwardProofPanel } from '@/components/walk-forward-proof-panel';
 import {
   getAutomationStatus,
@@ -24,6 +25,7 @@ import {
   getReadyz,
   getSystemReadiness,
 } from '@/lib/api';
+import { sanitizeCoverageProviderDiagnostics, sanitizeProviderDiagnostics, withoutProviderDiagnostics } from '@/lib/scan-provider-data';
 
 function buildLatestPriceMap(
   results: { ticker: string; asset_type: string; price: number }[],
@@ -70,7 +72,15 @@ export default async function ProofPage() {
   const workerRunning =
     healthResult.data?.worker_alive ?? healthResult.data?.scheduler_running ?? false;
 
-  const latestPrices = buildLatestPriceMap(latestScanResult.data?.results ?? []);
+  const savedScan = latestScanResult.data;
+  const results = withoutProviderDiagnostics(savedScan?.results ?? []);
+  const latestScan = savedScan ? {
+    ...savedScan, results,
+    coverage: sanitizeCoverageProviderDiagnostics(savedScan.coverage),
+    top_stocks: withoutProviderDiagnostics(savedScan.top_stocks ?? []),
+    top_crypto: withoutProviderDiagnostics(savedScan.top_crypto ?? []),
+  } : null;
+  const latestPrices = buildLatestPriceMap(results);
   const paperLedgerError = [paperLedgerResult.error, paperLedgerSummaryResult.error]
     .filter(Boolean)
     .join(' ');
@@ -98,11 +108,16 @@ export default async function ProofPage() {
         <DashboardStatusBanner
           health={healthResult.data}
           automation={automationResult.data}
-          latestScan={latestScanResult.data}
+          latestScan={latestScan}
           systemReadiness={systemReadinessResult.data}
           compactDiagnostics
         />
-        <BuyGateDiagnostics results={latestScanResult.data?.results ?? []} />
+        <ScanInputDiagnostics
+          results={(savedScan?.results ?? []).map(sanitizeProviderDiagnostics)}
+          coverage={latestScan?.coverage}
+          marketauxQuota={proofSummaryResult.data?.marketaux_quota}
+        />
+        <BuyGateDiagnostics results={results} />
       </section>
 
       <ProofSummaryPanel summary={proofSummaryResult.data} />
@@ -127,7 +142,7 @@ export default async function ProofPage() {
         health={healthResult.data}
         automation={automationResult.data}
         systemReadiness={systemReadinessResult.data}
-        marketStatus={latestScanResult.data?.market_status ?? null}
+        marketStatus={latestScan?.market_status ?? null}
       />
 
       <OperatorActions
@@ -142,9 +157,9 @@ export default async function ProofPage() {
 
       <ConfidencePerformancePanel performance={proofSummaryResult.data?.confidence_performance} />
 
-      <ConfidenceProvenancePanel results={latestScanResult.data?.results ?? []} />
+      <ConfidenceProvenancePanel results={results} />
 
-      <ForecastContextPanel results={latestScanResult.data?.results ?? []} />
+      <ForecastContextPanel results={results} />
 
       <ExitWindowAccuracyPanel metrics={proofSummaryResult.data?.exit_window_accuracy} />
 

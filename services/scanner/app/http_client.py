@@ -178,11 +178,11 @@ async def request_json(
     last_error: Exception | None = None
     max_attempts = settings.provider_retry_attempts + 1
     for attempt in range(1, max_attempts + 2):
+        if before_attempt is not None:
+            pending = before_attempt()
+            if asyncio.iscoroutine(pending):
+                await pending
         try:
-            if before_attempt is not None:
-                pending = before_attempt()
-                if asyncio.iscoroutine(pending):
-                    await pending
             response = await client.request(method, url, **kwargs)
             if on_response is not None:
                 pending = on_response(response)
@@ -213,6 +213,13 @@ async def request_json(
                     },
                 )
             if not exc.retryable or attempt > settings.provider_retry_attempts:
+                if exc.status_code == 429 and on_backoff is not None:
+                    deferred = on_backoff(
+                        exc.retry_after_seconds or settings.provider_retry_backoff_seconds,
+                        rate_limited=True,
+                    )
+                    if asyncio.iscoroutine(deferred):
+                        await deferred
                 raise
             delay_seconds = _apply_retry_jitter(
                 min(

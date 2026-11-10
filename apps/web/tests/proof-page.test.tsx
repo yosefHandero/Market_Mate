@@ -106,6 +106,14 @@ vi.mock('@/lib/api', () => ({
       scan_fresh: true,
       mark_prices_source: 'latest_scan',
       note: 'Unrealized P/L uses latest scan prices. Horizon closes use live market prices.',
+      marketaux_quota: {
+        configured_daily_attempt_budget: 12,
+        utc_day_attempts: 4,
+        operational_attempts_remaining: 8,
+        block_state: 'reset_known',
+        verified_reset_at: '2026-05-19T00:00:00Z',
+        rate_retry_at: null,
+      },
     },
     error: null,
   })),
@@ -121,6 +129,91 @@ vi.mock('@/components/proof-ledger-section', () => ({
 }));
 
 describe('ProofPage', () => {
+  it('renders safe saved provider diagnostics for HOLD rows as well as candidates', async () => {
+    const scan = getDashboardFixture().latestScan;
+    const row = {
+      ...scan.results[0], ticker: 'CHECK', decision_signal: 'HOLD' as const,
+      bar_as_of: '2026-05-18T14:58:00Z', bar_age_minutes: 2,
+      price_source: 'polygon' as const, fallback_used: true,
+      freshness_flags: { market_bars: 'fallback', directional_news: 'successful_empty', options_flow: 'disabled' },
+      layer_details: { provider_health: {
+        benchmark: {
+          status: 'stale', symbols: [{
+            symbol: 'SPY', provider: 'alpaca_iex', status: 'stale', as_of: '2026-05-18T13:00:00Z', age_minutes: 120,
+          }],
+        },
+        directional_news: {
+          status: 'successful_empty' as const, source: 'marketaux', providers: [
+            { provider: 'finnhub', endpoint: 'https://finnhub.io/api/v1/news-sentiment?token=PRIVATE_VALUE', status: 'access_denied', http_status: 403 },
+            { provider: 'marketaux', endpoint: '/v1/news/all', status: 'successful_empty' },
+          ],
+        },
+        market_bars: {
+          provider: 'polygon', endpoint: '/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{from}/{to}',
+          status: 'fresh', as_of: '2026-05-18T14:58:00Z', max_age_minutes: 45,
+          primary_status: 'rate_limited', primary_http_status: 429, fallback_status: 'available',
+        },
+      } },
+    };
+    const skipped = {
+      ...row, ticker: 'SKIP', layer_details: { provider_health: {
+        directional_news: { status: 'not_requested' as const, source: 'skipped', providers: [] },
+      } },
+    };
+    const missingSentiment = {
+      ...row, ticker: 'NO-SCORE', layer_details: { provider_health: {
+        directional_news: { status: 'unavailable' as const, source: '', providers: [
+          { provider: 'marketaux', endpoint: '/v1/news/all', status: 'missing_sentiment', http_status: 200 },
+        ] },
+      } },
+    };
+    vi.mocked(getLatestScan).mockResolvedValueOnce({
+      data: {
+        ...scan, results: [row, skipped, missingSentiment],
+        coverage: [{
+          asset_type: 'stock', expected_symbols: ['CHECK', 'SKIP', 'NO-SCORE', 'OMITTED'],
+          returned_symbols: ['CHECK', 'SKIP', 'NO-SCORE'], status: 'partial',
+          missing_symbols: [{
+            ticker: 'OMITTED', reason: 'analysis_skipped', required_input: 'directional_news',
+            detail: 'Required directional news unavailable.', directional_news: {
+              status: 'unavailable', source: 'unavailable', providers: [{
+                provider: 'marketaux', endpoint: '/v1/news/all?api_token=PRIVATE_VALUE',
+                status: 'invalid_publication_time', http_status: 200,
+              }],
+            },
+          }],
+        }],
+      },
+      error: null,
+    });
+    render(await ProofPage());
+
+    const diagnostics = screen.getByLabelText('Required data diagnostics');
+    expect(diagnostics).toHaveTextContent('CHECK');
+    expect(diagnostics).toHaveTextContent(/Finnhub \/api\/v1\/news-sentiment.*Access denied.*HTTP 403/i);
+    expect(diagnostics).toHaveTextContent(/Marketaux \/v1\/news\/all.*Successful empty/i);
+    expect(diagnostics).toHaveTextContent(/Marketaux \/v1\/news\/all.*Matching articles lack usable sentiment.*HTTP 200/i);
+    expect(diagnostics).toHaveTextContent(/OMITTED · Required directional news unavailable.*Marketaux.*Matching articles lack a valid publication time/i);
+    expect(diagnostics).toHaveTextContent(/Relative-strength benchmark.*Stale.*SPY.*Alpaca IEX.*Age at scan 120m/i);
+    expect(diagnostics).toHaveTextContent(/Polygon \/v2\/aggs\/ticker/);
+    expect(diagnostics).toHaveTextContent(/Primary.*Rate limited.*HTTP 429/i);
+    expect(diagnostics).toHaveTextContent(/Fallback.*Available/i);
+    expect(diagnostics).toHaveTextContent('2026-05-18T14:58:00Z');
+    expect(diagnostics).toHaveTextContent(/Options flow.*Intentionally disabled/i);
+    expect(diagnostics).toHaveTextContent(/Directional news.*Not requested/i);
+    expect(document.body).not.toHaveTextContent('PRIVATE_VALUE');
+  });
+
+  it('separates live shared quota from provider attempts recorded in a saved scan', async () => {
+    render(await ProofPage());
+
+    const diagnostics = screen.getByLabelText('Required data diagnostics');
+    expect(diagnostics).toHaveTextContent('Marketaux shared quota now');
+    expect(diagnostics).toHaveTextContent('4 of 12 local UTC-day attempts');
+    expect(diagnostics).toHaveTextContent('8 remaining under the persisted ceiling');
+    expect(diagnostics).toHaveTextContent('Verified account reset 2026-05-19T00:00:00Z');
+  });
+
   it('explains every saved BUY evidence failure without treating detection as paper permission', async () => {
     const scan = getDashboardFixture().latestScan;
     const link = {

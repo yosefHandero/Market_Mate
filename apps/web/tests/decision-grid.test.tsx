@@ -5,6 +5,7 @@ import { render, screen, within } from '@testing-library/react';
 import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { DecisionGrid } from '@/components/decision-grid';
+import { describeUnscoredRequiredInputs } from '@/lib/decision-surface';
 import { getDashboardFixture } from '@/tests/fixtures/dashboard-fixture';
 import type { ScanResult } from '@/lib/types';
 
@@ -93,10 +94,11 @@ describe('DecisionGrid', () => {
     );
   });
 
-  it('splits blocked top BUY setups into a read-only section when valid candidates remain', () => {
+  it('keeps the affected candidate reason visible when other BUY setups qualify', () => {
     const valid = {
       ticker: 'NVDA',
       asset_type: 'stock',
+      price: 100,
       decision_signal: 'BUY',
       is_buy_candidate: true,
       provider_status: 'ok',
@@ -134,13 +136,15 @@ describe('DecisionGrid', () => {
     ).toBeInTheDocument();
     expect(screen.queryByTestId('card-ROKU')).not.toBeInTheDocument();
     expect(screen.queryByTestId('stock-readonly-grid')).not.toBeInTheDocument();
-    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/blocked setups stay off this list/i);
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/required data is unavailable/i);
+    expect(screen.getByTestId('held-back-ROKU')).toHaveTextContent(/required price data was stale/i);
   });
 
   it('does not expose shadow rows on the Decision surface', () => {
     const production = {
       ticker: 'NVDA',
       asset_type: 'stock',
+      price: 100,
       decision_signal: 'BUY',
       is_buy_candidate: true,
       provider_status: 'ok',
@@ -219,6 +223,7 @@ describe('DecisionGrid', () => {
     const stockCandidate = {
       ticker: 'MSFT',
       asset_type: 'stock',
+      price: 100,
       decision_signal: 'BUY',
       is_buy_candidate: true,
       provider_status: 'ok',
@@ -392,8 +397,52 @@ describe('DecisionGrid', () => {
 
     expect(screen.queryByTestId('card-LINK/USD')).not.toBeInTheDocument();
     expect(screen.getByTestId('decision-empty-state')).toHaveTextContent(/no qualifying buy candidates/i);
-    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/degraded or incomplete data/i);
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/required data is unavailable/i);
+    expect(screen.getByTestId('held-back-LINK/USD')).toHaveTextContent(/directional news was unavailable/i);
     expect(screen.getByTestId('decision-data-warning')).not.toHaveTextContent(/stale/i);
+  });
+
+  it('keeps a compatible fallback actionable and names only the affected candidate', () => {
+    const fixture = getDashboardFixture();
+    const selected = fixture.latestScan.top_stocks![0];
+    const recovered: ScanResult = {
+      ...selected,
+      freshness_flags: { market_bars: 'ok', directional_news: 'fallback', options_flow: 'disabled' },
+      provider_warnings: ['finnhub_access_denied'],
+    };
+    const blocked: ScanResult = {
+      ...recovered,
+      ticker: 'NEWSLESS',
+      freshness_flags: { market_bars: 'ok', directional_news: 'missing' },
+      provider_warnings: ['finnhub_access_denied'],
+    };
+
+    render(<DecisionGrid results={[recovered, blocked]} topStocks={[recovered, blocked]} decisions={[]} />);
+
+    expect(screen.getByTestId(`card-${recovered.ticker}`)).toBeInTheDocument();
+    expect(screen.queryByTestId('card-NEWSLESS')).not.toBeInTheDocument();
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/required data is unavailable for some candidates/i);
+    expect(screen.getByTestId('held-back-NEWSLESS')).toHaveTextContent(/directional news was unavailable/i);
+    expect(screen.queryByText(/finnhub|marketaux|access denied/i)).not.toBeInTheDocument();
+  });
+
+  it('describes skipped required inputs without exposing provider details on Decision', () => {
+    const unscoredRequiredInputs = describeUnscoredRequiredInputs([{
+      asset_type: 'crypto', status: 'unavailable', expected_symbols: ['LINK/USD', 'POL/USD'], returned_symbols: [],
+      missing_symbols: [{
+        ticker: 'LINK/USD', reason: 'analysis_skipped', required_input: 'directional_news',
+        detail: 'Marketaux daily quota reached.',
+      }, {
+        ticker: 'POL/USD', reason: 'analysis_skipped', required_input: 'volume_reference',
+        detail: 'Alpaca had no usable volume history.',
+      }],
+    }]);
+
+    render(<DecisionGrid results={[]} decisions={[]} coverageIncomplete unscoredRequiredInputs={unscoredRequiredInputs} hasSavedScan />);
+
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/required directional news was unavailable/i);
+    expect(screen.getByTestId('decision-data-warning')).toHaveTextContent(/reference volume was unavailable/i);
+    expect(screen.queryByText(/marketaux|daily quota|alpaca/i)).not.toBeInTheDocument();
   });
 
   it('shows at most three candidates per asset and keeps the supplied rank order', () => {
@@ -402,6 +451,7 @@ describe('DecisionGrid', () => {
         ({
           ticker: `S${rank}`,
           asset_type: 'stock',
+          price: 100,
           decision_signal: 'BUY',
           is_buy_candidate: true,
           provider_status: 'ok',

@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from app.config import Settings
 from app.schemas import ScanResult
 
-# Freshness flag values that indicate healthy market data (not blocking).
-HEALTHY_FRESHNESS_FLAG_VALUES = frozenset({"ok", "ws_override"})
+# A usable fallback and inputs that were intentionally skipped are nonblocking.
+HEALTHY_FRESHNESS_FLAG_VALUES = frozenset({
+    "ok", "ws_override", "fallback", "successful_empty", "not_requested", "disabled",
+})
 
 
 def is_healthy_freshness_flag(value: object) -> bool:

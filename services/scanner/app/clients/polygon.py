@@ -79,7 +79,6 @@ class PolygonClient:
         ticker = self._polygon_ticker(symbol)
         from_ms = int(start.timestamp() * 1000)
         to_ms = int(end.timestamp() * 1000)
-        await self._guard.throttle()
         payload = await request_json(
             self._client,
             method="GET",
@@ -91,14 +90,14 @@ class PolygonClient:
                 "adjusted": "true",
                 "sort": "asc",
                 "limit": limit,
-                "apiKey": self.settings.polygon_api_key,
             },
+            headers={"Authorization": f"Bearer {self.settings.polygon_api_key}"},
             provider="polygon",
+            before_attempt=self._guard.throttle,
             on_backoff=self._guard.register_backoff,
         )
-        if payload.get("status") not in {None, "OK", "ok"} and not payload.get("results"):
-            message = payload.get("error") or payload.get("message") or "unexpected Polygon response"
-            raise RuntimeError(f"Polygon returned no bars for {symbol}: {message}")
+        if str(payload.get("status") or "OK").upper() not in {"OK", "DELAYED"} and not payload.get("results"):
+            raise RuntimeError(f"Polygon rejected the bars request for {symbol}.")
         return self._rows_to_alpaca_bars(list(payload.get("results") or []))
 
     async def get_latest_bars(
@@ -114,7 +113,9 @@ class PolygonClient:
 
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=3)
-        limit = 1000
+        # This cap counts base minutes. Cover the whole three-day window
+        # (4,320 minutes) without silently truncating the newest aggregates.
+        limit = 5000
 
         async def fetch_one(symbol: str) -> tuple[str, list[dict[str, Any]]]:
             rows = await self._fetch_symbol_bars(

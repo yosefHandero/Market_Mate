@@ -212,14 +212,11 @@ async def get_trade_eligibility(
 ) -> TradeEligibilityResponse:
     symbol = ticker.upper()
     try:
-        if "/" in symbol:
-            latest_price = await execution_service.alpaca.get_latest_crypto_price(symbol)
-        else:
-            latest_price = await execution_service.alpaca.get_latest_price(symbol)
-    except Exception as exc:
+        latest_price = await execution_service.get_paper_quote(symbol)
+    except AppError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Unable to fetch latest price for {symbol}: {exc}",
+            detail=f"Unable to fetch latest price for {symbol}. {exc.message}",
         ) from exc
     eligibility = risk_service.evaluate_trade(
         ticker=symbol,

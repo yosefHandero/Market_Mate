@@ -32,6 +32,7 @@ from app.core.signals import map_score_to_decision_signal
 from app.core.strategy_contract import build_strategy_evaluation_metadata, determine_recommended_action
 from app.db import SessionLocal, engine
 from app.services.scan_lease import ScanLeaseLost, assert_current_scan_lease
+from app.services.hourly_buy_evidence import MAX_AGE as HOURLY_BUY_EVIDENCE_MAX_AGE, select_hourly_buy_evidence
 from app.models.journal import JournalEntryORM
 from app.models.scan import (
     AutomationIntentORM,
@@ -1081,16 +1082,56 @@ class ScanRepository:
         observed_at: datetime | None = None,
     ) -> EvidenceGateEvaluation:
         window = self._trust_window_bounds(observed_at=observed_at, horizon=horizon)
-        summary = self.get_signal_outcome_summary(
-            asset_type=asset_type,
-            generated_at_start=window.start,
-            generated_at_end=window.end,
-        )
-        signal_bucket = next((bucket for bucket in summary.by_signal if bucket.key == signal), None)
-        score_band_bucket = next(
-            (bucket for bucket in summary.by_signal_score_bucket if bucket.key == f"{signal}:{score_band}"),
-            None,
-        )
+        min_count = self.settings.trade_gate_min_evaluated_count
+        if asset_type == "crypto" and signal == "BUY":
+            min_count = max(min_count, self.settings.trade_gate_crypto_buy_min_evaluated_count)
+        hourly_buy = horizon == "1h" and signal == "BUY"
+        sources_check = None
+        evidence_basis = self._evidence_basis_label(window=window)
+        evidence_start = window.start
+        if hourly_buy:
+            live_provenance_available = self._has_policy_columns()
+            with SessionLocal() as session:
+                sources = select_hourly_buy_evidence(
+                    session, settings=self.settings, asset_type=asset_type, recent_start=window.start,
+                    as_of=window.end, minimum=min_count, live_provenance_available=live_provenance_available,
+                    holdout_source=self._live_forward_sample_source,
+                )
+            rows = [row for group in sources.values() for row in group]
+            signal_bucket = self._build_outcome_bucket(key=signal, rows=rows)
+            score_band_bucket = self._build_outcome_bucket(
+                key=f"{signal}:{score_band}",
+                rows=[row for row in rows if self._score_band(self._raw_score_for(row)) == score_band],
+            )
+            source_details = []
+            for label, group in sources.items():
+                span = ""
+                if group:
+                    span = f" ({group[-1].generated_at.isoformat()}Z to {group[0].generated_at.isoformat()}Z)"
+                source_details.append(f"{label} {len(group)}{span}")
+            historical = bool(sources["Historical completed"] or sources["Historical replay"])
+            if historical:
+                evidence_basis = "hourly_buy_mixed_historical" if sources["Recent completed"] else "hourly_buy_historical_only"
+            else:
+                evidence_basis = "hourly_buy_recent_completed" if rows else "hourly_buy_insufficient"
+            evidence_start = window.end - HOURLY_BUY_EVIDENCE_MAX_AGE
+            sources_check = GateCheck(
+                name="evidence_sources", passed=True,
+                detail=(f"{' | '.join(source_details)}. {asset_type} BUY, 1h, as of {window.end.isoformat()}Z. "
+                        f"Recent {min(window.days, HOURLY_BUY_EVIDENCE_MAX_AGE.days)} days, "
+                        f"maximum age {HOURLY_BUY_EVIDENCE_MAX_AGE.days} days. Compatible campaigns pooled for paper. "
+                        "Historical evidence does not count toward live-forward or promotion requirements."),
+            )
+        else:
+            summary = self.get_signal_outcome_summary(
+                asset_type=asset_type,
+                generated_at_start=window.start,
+                generated_at_end=window.end,
+            )
+            signal_bucket = next((bucket for bucket in summary.by_signal if bucket.key == signal), None)
+            score_band_bucket = next(
+                (bucket for bucket in summary.by_signal_score_bucket if bucket.key == f"{signal}:{score_band}"), None,
+            )
         signal_count, signal_win_rate, signal_avg_return = self._bucket_metrics(
             signal_bucket,
             horizon=horizon,
@@ -1099,11 +1140,6 @@ class ScanRepository:
             score_band_bucket,
             horizon=horizon,
         )
-        min_count = self.settings.trade_gate_min_evaluated_count
-        # Crypto BUY is underpowered and weak after friction/out-of-sample; require a
-        # higher sample bar before it can clear the gate. Stricter only.
-        if asset_type == "crypto" and signal == "BUY":
-            min_count = max(min_count, self.settings.trade_gate_crypto_buy_min_evaluated_count)
         min_win_rate = self.settings.trade_gate_min_win_rate
         min_avg_return = self.settings.trade_gate_min_avg_return
         checks = [
@@ -1167,13 +1203,16 @@ class ScanRepository:
         else:
             first_failed = next(check for check in checks if not check.passed)
             reason = f"Blocked by {first_failed.name}: {first_failed.detail}."
-        reason = f"{reason} {self._window_reason_suffix(window=window, horizon=horizon)}"
+        if sources_check is not None:
+            checks.append(sources_check)
+        else:
+            reason = f"{reason} {self._window_reason_suffix(window=window, horizon=horizon)}"
         return EvidenceGateEvaluation(
             passed=passed,
             reason=reason,
             horizon=horizon,
-            evidence_basis=self._evidence_basis_label(window=window),
-            trust_window_start=window.start,
+            evidence_basis=evidence_basis,
+            trust_window_start=evidence_start,
             trust_window_end=window.end,
             signal_count=signal_count,
             signal_win_rate=signal_win_rate,
@@ -3575,7 +3614,7 @@ class ScanRepository:
                     row.evaluated_at_15m = evaluation.evaluated_at
                     row.status_15m = evaluation.status
                     if evaluation.price is not None:
-                        row.price_after_15m = round(evaluation.price, 4)
+                        row.price_after_15m = evaluation.price
                         row.return_after_15m = self._signal_return(
                             signal=row.signal,
                             entry_price=row.entry_price,
@@ -3586,7 +3625,7 @@ class ScanRepository:
                     row.evaluated_at_1h = evaluation.evaluated_at
                     row.status_1h = evaluation.status
                     if evaluation.price is not None:
-                        row.price_after_1h = round(evaluation.price, 4)
+                        row.price_after_1h = evaluation.price
                         row.return_after_1h = self._signal_return(
                             signal=row.signal,
                             entry_price=row.entry_price,
@@ -3597,7 +3636,7 @@ class ScanRepository:
                     row.evaluated_at_1d = evaluation.evaluated_at
                     row.status_1d = evaluation.status
                     if evaluation.price is not None:
-                        row.price_after_1d = round(evaluation.price, 4)
+                        row.price_after_1d = evaluation.price
                         row.return_after_1d = self._signal_return(
                             signal=row.signal,
                             entry_price=row.entry_price,
@@ -3608,7 +3647,7 @@ class ScanRepository:
                     row.evaluated_at_1w = evaluation.evaluated_at
                     row.status_1w = evaluation.status
                     if evaluation.price is not None:
-                        row.price_after_1w = round(evaluation.price, 4)
+                        row.price_after_1w = evaluation.price
                         row.return_after_1w = self._signal_return(
                             signal=row.signal,
                             entry_price=row.entry_price,

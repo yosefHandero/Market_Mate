@@ -1196,6 +1196,58 @@ class ExecutionServiceTests(unittest.TestCase):
             finally:
                 engine.dispose()
 
+    def test_preview_keeps_required_data_reason_when_risk_gate_is_also_blocked(self) -> None:
+        service = ExecutionService()
+        row = _paper_buy_row("LINK/USD", freshness_flags={"market_bars": "ok", "directional_news": "missing"})
+        service._scan_repository.get_latest_run = lambda: SimpleNamespace(results=[row])
+        evidence_block = self._eligible_trade(ticker="LINK/USD", price=14.25).model_copy(update={
+            "allowed": False, "reason": "1h evidence sample too small", "signal_run_id": None,
+        })
+        service.risk.evaluate_trade = lambda **_: evidence_block.model_copy(deep=True)
+        with patch.object(service, "_enforce_operational_readiness"), patch.object(service, "_enforce_kill_switch"), patch.object(
+            service, "get_paper_quote", AsyncMock(return_value=14.25),
+        ), patch.object(service, "_write_audit", return_value=1):
+            preview = asyncio.run(service.preview(OrderPreviewRequest(ticker="LINK/USD", side="buy", qty=1)))
+
+        self.assertEqual(preview.gate_result, "blocked")
+        self.assertIn("1h evidence sample too small", preview.reject_reasons)
+        self.assertTrue(any("directional_news=missing" in reason for reason in preview.reject_reasons))
+
+    def test_preview_preserves_a_sub_cent_quote_and_blocks_a_zero_saved_price(self) -> None:
+        ticker = "BONK/USD"
+        quote = 0.00000974
+        service = ExecutionService()
+        row = _paper_buy_row(ticker).model_copy(update={"price": 0.0})
+        service._scan_repository.get_latest_run = lambda: SimpleNamespace(results=[row])
+        service.risk.evaluate_trade = lambda **_: self._eligible_trade(ticker=ticker, price=quote)
+        with patch.object(service, "_enforce_operational_readiness"), patch.object(service, "_enforce_kill_switch"), patch.object(
+            service, "get_paper_quote", AsyncMock(return_value=quote),
+        ), patch.object(service, "_write_audit", return_value=1):
+            preview = asyncio.run(service.preview(OrderPreviewRequest(ticker=ticker, side="buy", qty=1_000_000)))
+
+        self.assertEqual(preview.latest_price, quote)
+        self.assertEqual(preview.entry_price, quote)
+        self.assertEqual(preview.gate_result, "blocked")
+        self.assertTrue(any("Saved scan price is unavailable" in reason for reason in preview.reject_reasons))
+
+    def test_preview_uses_saved_coverage_reason_for_unscored_ticker(self) -> None:
+        service = ExecutionService()
+        detail = "Relative-strength benchmark BTC/USD unavailable"
+        missing = SimpleNamespace(ticker="LINK/USD", reason="analysis_skipped", detail=detail)
+        service._scan_repository.get_latest_run = lambda: SimpleNamespace(
+            results=[], coverage=[SimpleNamespace(missing_symbols=[missing])],
+        )
+        service.risk.evaluate_trade = lambda **_: self._eligible_trade(
+            ticker="LINK/USD", price=14.25,
+        ).model_copy(update={"signal_run_id": None})
+        with patch.object(service, "_enforce_operational_readiness"), patch.object(service, "_enforce_kill_switch"), patch.object(
+            service, "get_paper_quote", AsyncMock(return_value=14.25),
+        ), patch.object(service, "_write_audit", return_value=1):
+            preview = asyncio.run(service.preview(OrderPreviewRequest(ticker="LINK/USD", side="buy", qty=1)))
+
+        self.assertEqual(preview.gate_result, "blocked")
+        self.assertIn(detail, preview.reject_reasons[0])
+
     def test_blocked_link_preview_cannot_open_a_paper_position(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "scanner.db"
@@ -1217,7 +1269,9 @@ class ExecutionServiceTests(unittest.TestCase):
                 service.settings.require_readyz_for_execution = False
                 service.alpaca.get_latest_crypto_price = AsyncMock(return_value=14.25)
                 service.alpaca._request_json = AsyncMock()
-                eligible = _paper_buy_row("LINK/USD")
+                eligible = _paper_buy_row(
+                    "LINK/USD", freshness_flags={"market_bars": "ok", "directional_news": "fallback"},
+                )
                 blocked = _paper_buy_row(
                     "LINK/USD",
                     gate_passed=False,

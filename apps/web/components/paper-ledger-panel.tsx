@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { reconcilePaperLedger } from '@/lib/api';
-import { formatHoldingDuration, formatPaperTimestamp } from '@/lib/paper-contract';
+import { formatHoldingDuration, formatPaperTimestamp, formatUnitPrice } from '@/lib/paper-contract';
 import type { PaperLedgerSummary, PaperPositionSummary } from '@/lib/types';
 
 function safeNumber(value: number | null | undefined): number | null {
@@ -131,8 +131,8 @@ function PositionTable({
                     </td>
                     <td>{position.side}</td>
                     <td>{formatQuantity(position.quantity)}</td>
-                    <td>{formatCurrency(position.simulated_fill_price)}</td>
-                    <td>{position.status === 'closed' ? formatCurrency(position.close_price) : 'pending'}</td>
+                    <td>{formatUnitPrice(position.simulated_fill_price)}</td>
+                    <td>{position.status === 'closed' ? formatUnitPrice(position.close_price) : 'pending'}</td>
                     <td>{formatCurrency(position.notional_usd)}</td>
                     <td className={pnl == null ? 'muted' : pnl >= 0 ? 'positive' : 'negative'}>
                       {pnl == null ? 'unavailable' : formatCurrency(pnl)}

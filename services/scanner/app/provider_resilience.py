@@ -91,7 +91,7 @@ class AsyncProviderGuard:
         loop = asyncio.get_running_loop()
         async with self._pace_lock:
             self._next_allowed_at = max(self._next_allowed_at, loop.time() + delay)
-            if delay > MAX_RETRY_BACKOFF_SECONDS:
+            if delay > MAX_RETRY_BACKOFF_SECONDS or self._consecutive_rate_limits >= RATE_LIMIT_COOLDOWN_THRESHOLD:
                 self._deferred_until = max(self._deferred_until, loop.time() + delay)
 
     async def cached_call(

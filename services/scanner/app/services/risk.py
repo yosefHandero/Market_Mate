@@ -127,7 +127,6 @@ class RiskService:
         required_signal = self._required_signal_for_side(side)
         notional_estimate = round(latest_price * qty, 2)
         horizon = self.settings.trade_gate_horizon
-        gate_checks: list[GateCheck] = []
         now = datetime.now(timezone.utc)
 
         if not self.settings.trade_gate_enabled:
@@ -308,9 +307,9 @@ class RiskService:
             score_band_evaluated_count=evidence_gate.score_band_count,
             score_band_win_rate=evidence_gate.score_band_win_rate,
             score_band_avg_return=evidence_gate.score_band_avg_return,
-            gate_checks=gate_checks,
         )
 
+        gate_checks = eligibility.gate_checks
         gate_checks.append(
             GateCheck(
                 name="required_signal",
@@ -396,7 +395,7 @@ class RiskService:
             )
             return eligibility
         if not latest_context.gate_passed:
-            eligibility.reason = latest_context.gate_reason
+            eligibility.reason = evidence_gate.reason
             return eligibility
 
         portfolio_checks, portfolio_summary = self._portfolio_checks(

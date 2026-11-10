@@ -1,10 +1,13 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
+import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from app.auth import require_read_access
+from app.clients.marketaux import marketaux_quota_status
 from app.config import get_settings
 from app.db import check_database_connection, get_schema_status
 from app.dependencies import (
@@ -54,6 +57,7 @@ from app.services.scheduler import SchedulerService
 from app.services.scanner import ScannerService
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def require_schema_ready() -> None:
@@ -552,6 +556,11 @@ async def get_proof_summary(
     walk_forward_repository: WalkForwardRepository = Depends(get_walk_forward_repository),
 ) -> ProofSummaryResponse:
     settings = get_settings()
+    try:
+        marketaux_quota = marketaux_quota_status(settings)
+    except (OSError, sqlite3.Error):
+        logger.warning("Local Marketaux quota status unavailable")
+        marketaux_quota = None
     latest = scan_repository.get_latest_run()
     mark_prices = {row.ticker: float(row.price) for row in (latest.results if latest else [])}
     ledger_data = scan_repository.get_paper_ledger_summary(mark_prices=mark_prices or None)
@@ -609,6 +618,7 @@ async def get_proof_summary(
             EvidenceTrackDescriptor(**track) for track in evidence_track_manifest()
         ],
         last_scan_at=last_scan_at,
+        marketaux_quota=marketaux_quota,
         scan_fresh=scan_fresh,
         mark_prices_source="latest_scan",
         note=(

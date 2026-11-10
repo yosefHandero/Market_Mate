@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -82,7 +83,8 @@ class CoinbaseMarketDataServiceTests(unittest.TestCase):
 
             updated = service.apply_crypto_price_overrides(
                 {
-                    "BTC/USD": {"latest_price": 67000.0, "session_open": 66000.0},
+                    "BTC/USD": {"latest_price": 67000.0, "session_open": 66000.0,
+                                "bars": [{"t": datetime.now(timezone.utc) - timedelta(minutes=1)}]},
                     "SOL/USD": {"latest_price": 150.0, "session_open": 148.0},
                 }
             )
@@ -90,6 +92,24 @@ class CoinbaseMarketDataServiceTests(unittest.TestCase):
             self.assertEqual(updated["BTC/USD"]["latest_price"], 68000.0)
             self.assertEqual(updated["SOL/USD"]["latest_price"], 150.0)
             self.assertEqual(updated["BTC/USD"]["coinbase_product_id"], "BTC-USD")
+
+    def test_reader_reloads_worker_snapshots_and_preserves_newer_bar_price(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = CoinbaseMarketDataService()
+            reader = CoinbaseMarketDataService()
+            writer.settings = writer.settings.model_copy(update={"cache_dir": tmpdir})
+            reader.settings = writer.settings
+
+            def publish(price: str, sequence: int) -> None:
+                writer.handle_message({"channel": "ticker", "sequence_num": sequence,
+                                       "events": [{"tickers": [{"product_id": "BTC-USD", "price": price}]}]})
+
+            publish("68000", 1)
+            self.assertEqual(reader.get_latest_price("BTC/USD"), 68000)
+            publish("68100", 2)
+            self.assertEqual(reader.get_latest_price("BTC/USD"), 68100)
+            bar = {"latest_price": 68200, "bars": [{"t": datetime.now(timezone.utc)}]}
+            self.assertEqual(reader.apply_crypto_price_overrides({"BTC/USD": bar})["BTC/USD"], bar)
 
     def test_handle_ticker_message_ignores_older_sequence_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

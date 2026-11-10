@@ -15,7 +15,14 @@ from app.services.runtime_identity import build_runtime_identity
 class RuntimeIdentityTests(unittest.TestCase):
     def test_imported_policy_and_saved_identity_are_reported_separately(self):
         with tempfile.TemporaryDirectory() as directory:
-            settings = Settings(_env_file=None, database_url=f"sqlite:///{Path(directory) / 'test.db'}", cache_dir=directory)
+            settings = Settings(
+                _env_file=None,
+                database_url=f"sqlite:///{Path(directory) / 'test.db'}",
+                cache_dir=directory,
+                finnhub_api_key="private-finnhub-marker",
+                marketaux_api_token="private-marketaux-marker",
+                marketaux_daily_attempt_budget=60,
+            )
             policy = SimpleNamespace(policy_id="hybrid_legacy", policy_version="hybrid-new", fingerprint=lambda: "new")
             runtime = Mock()
             runtime.learned_inputs_service.load_active_campaign_pin.return_value = SimpleNamespace(fingerprint="pin")
@@ -29,7 +36,10 @@ class RuntimeIdentityTests(unittest.TestCase):
             self.assertFalse(identity["identity_matches_saved_campaign"])
             self.assertEqual(identity["learned_artifacts_fingerprint"], "pin")
             self.assertEqual(identity["database"], settings.database_path)
-            self.assertNotIn("api_token", json.dumps(identity))
+            self.assertTrue(identity["finnhub_configured"])
+            self.assertTrue(identity["marketaux_configured"])
+            self.assertEqual(identity["marketaux_daily_attempt_budget"], 60)
+            self.assertNotIn("private-", json.dumps(identity))
 
     def test_missing_pin_does_not_load_latest_or_claim_matching_identity(self):
         settings = Settings(_env_file=None, database_url="sqlite:///:memory:")

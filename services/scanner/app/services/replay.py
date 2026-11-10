@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-
+import math
 from uuid import uuid4
 
 from app.clients.alpaca import AlpacaClient
@@ -28,6 +28,7 @@ from app.brain.weekly_backtest import walk_forward_pattern_samples
 from app.brain.weekly_patterns import detect_weekly_pattern, project_weekly_range
 from app.brain.weekly_bar_utils import bars_as_of, close_price, sorted_bars
 from app.services.daily_bar_service import DailyBarService
+from app.services.hourly_buy_evidence import EXIT_TOLERANCE, HORIZON, replay_identity, replay_thresholds
 from app.services.repository import ScanRepository
 from app.services.scanner import ScannerService
 
@@ -66,11 +67,14 @@ class ReplayService:
         payload = {"bars": {symbol: rows[: index + 1]}}
         return self.alpaca._build_bars_by_symbol(payload).get(symbol)
 
-    def _build_item_at_or_before(self, symbol: str, rows: list[dict], *, observed_at: datetime) -> dict | None:
-        usable_rows = [
-            row for row in rows
-            if self.alpaca._parse_bar_timestamp(row.get("t")) <= observed_at
-        ]
+    def _build_item_at_or_before(
+        self, symbol: str, rows: list[dict], *, observed_at: datetime, since: datetime | None = None,
+    ) -> dict | None:
+        usable_rows = []
+        for row in rows:
+            timestamp = self.alpaca._parse_bar_timestamp(row.get("t"))
+            if timestamp <= observed_at and (since is None or timestamp >= since):
+                usable_rows.append(row)
         if not usable_rows:
             return None
         return self._build_item(symbol, usable_rows, len(usable_rows) - 1)
@@ -87,6 +91,21 @@ class ReplayService:
             if timestamp >= target:
                 return float(row.get("c", 0) or 0) or None
         return None
+
+    def _hourly_exit(
+        self, rows: list[dict], *, observed_at: datetime, end: datetime,
+    ) -> tuple[float | None, datetime | None]:
+        target = observed_at + HORIZON
+        for row in rows:
+            timestamp = self.alpaca._parse_bar_timestamp(row.get("t"))
+            if timestamp < target:
+                continue
+            available_at = timestamp + timedelta(minutes=5)
+            price = float(row.get("c", 0) or 0)
+            if available_at <= min(end, target + EXIT_TOLERANCE) and math.isfinite(price) and price > 0:
+                return price, available_at
+            break
+        return None, None
 
     async def _replay_weekly(self, request: ReplayRequest) -> ReplayResponse:
         strategy_variant = request.strategy_variant or self.settings.scanner_strategy_variant or "layered-v4"
@@ -216,8 +235,10 @@ class ReplayService:
     async def replay(self, request: ReplayRequest) -> ReplayResponse:
         if request.replay_mode == "weekly":
             return await self._replay_weekly(request)
+        hourly = request.horizon == "1h"
+        history_start = request.start - timedelta(days=3) if hourly else request.start
         strategy_variant = request.strategy_variant or self.settings.scanner_strategy_variant or "layered-v4"
-        symbols = request.symbols
+        symbols = list(dict.fromkeys(request.symbols))
         stock_symbols = [symbol for symbol in symbols if self._asset_type_for_symbol(symbol) == "stock"]
         crypto_symbols = [symbol for symbol in symbols if self._asset_type_for_symbol(symbol) == "crypto"]
 
@@ -226,7 +247,7 @@ class ReplayService:
             for benchmark in ("SPY", "QQQ"):
                 benchmark_rows[benchmark] = await self.alpaca.get_historical_stock_bars(
                     benchmark,
-                    start=request.start,
+                    start=history_start,
                     end=request.end,
                     timeframe="5Min",
                 )
@@ -234,7 +255,7 @@ class ReplayService:
             benchmark_symbol = "BTC/USD"
             benchmark_rows[benchmark_symbol] = await self.alpaca.get_historical_crypto_bars(
                 benchmark_symbol,
-                start=request.start,
+                start=history_start,
                 end=request.end,
                 timeframe="5Min",
             )
@@ -243,14 +264,14 @@ class ReplayService:
         for symbol in stock_symbols:
             symbol_rows[symbol] = await self.alpaca.get_historical_stock_bars(
                 symbol,
-                start=request.start,
+                start=history_start,
                 end=request.end,
                 timeframe="5Min",
             )
         for symbol in crypto_symbols:
             symbol_rows[symbol] = await self.alpaca.get_historical_crypto_bars(
                 symbol,
-                start=request.start,
+                start=history_start,
                 end=request.end,
                 timeframe="5Min",
             )
@@ -265,23 +286,45 @@ class ReplayService:
             for index in self._sample_timestamps(
                 rows,
                 interval_minutes=request.interval_minutes,
-                warmup_bars=request.warmup_bars,
+                warmup_bars=max(20, request.warmup_bars) if hourly else request.warmup_bars,
             ):
-                observed_at = self.alpaca._parse_bar_timestamp(rows[index].get("t"))
-                item = self._build_item(symbol, rows, index)
+                bar_at = self.alpaca._parse_bar_timestamp(rows[index].get("t"))
+                observed_at = bar_at + timedelta(minutes=5) if hourly else bar_at
+                since = observed_at - timedelta(days=3) if hourly else None
+                if hourly and not request.start <= observed_at <= request.end:
+                    continue
+                item = (
+                    self._build_item_at_or_before(symbol, rows, observed_at=bar_at, since=since)
+                    if hourly else self._build_item(symbol, rows, index)
+                )
                 if not item:
                     continue
                 benchmark_item = self._build_item_at_or_before(
                     benchmark_symbol,
                     benchmark_rows.get(benchmark_symbol, []),
-                    observed_at=observed_at,
+                    observed_at=bar_at,
+                    since=since,
                 )
                 secondary_item = self._build_item_at_or_before(
                     secondary_benchmark,
                     benchmark_rows.get(secondary_benchmark, []),
-                    observed_at=observed_at,
+                    observed_at=bar_at,
+                    since=since,
                 )
-                if asset_type == "stock":
+                if hourly and any(
+                    not benchmark
+                    or self.scanner._market_bars_freshness_flag(asset_type=asset_type, item=benchmark, observed_at=observed_at) != "ok"
+                    or benchmark["day_open"] <= 0 or benchmark["latest_price"] <= 0
+                    for benchmark in (benchmark_item, secondary_item)
+                ):
+                    continue
+                if hourly and asset_type == "stock":
+                    market_status, spy_change, qqq_change = self.scanner._compute_market_status({
+                        "SPY": benchmark_item, "QQQ": secondary_item,
+                    })
+                    benchmark_change_pct = (spy_change + qqq_change) / 2
+                    benchmark_label = "SPY/QQQ"
+                elif asset_type == "stock":
                     spy_change = (
                         ((((benchmark_item or {}).get("latest_price", 0) or 0) - (((benchmark_item or {}).get("day_open", 0) or 0)))
                         / max((((benchmark_item or {}).get("day_open", 0) or 1)), 1))
@@ -304,7 +347,7 @@ class ReplayService:
 
                 price = float(item["latest_price"])
                 day_open = float(item.get("session_open") or price or 1)
-                price_change_pct = ((price - day_open) / max(day_open, 1)) * 100
+                price_change_pct = ((price - day_open) / (day_open if hourly else max(day_open, 1))) * 100
                 relative_volume = float(item.get("latest_volume", 0) or 0) / max(float(item.get("average_volume", 1) or 1), 1)
                 data_quality = self.scanner._data_quality(item, relative_volume)
                 breakout_flag = price > float(item.get("rolling_high") or price) and price_change_pct > 0
@@ -325,6 +368,11 @@ class ReplayService:
                     fear_greed_value=None,
                     coingecko_context=None,
                 )
+                scoring_inputs = {}
+                if hourly:
+                    trend_above_sma, trend_strength_pct = self.scanner._compute_trend_signal(item, price)
+                    scoring_inputs = replay_thresholds(self.settings, asset_type)
+                    scoring_inputs.update(trend_above_sma=trend_above_sma, trend_strength_pct=trend_strength_pct)
                 signal = compute_signal_and_explanation(
                     ticker=symbol,
                     price=price,
@@ -345,11 +393,12 @@ class ReplayService:
                     volatility_regime=volatility_regime,
                     data_quality=data_quality,
                     context_bias=context_bias,
+                    **scoring_inputs,
                 )
                 calibrated_confidence = signal.score
                 calibration_source = "raw"
                 gate_passed = False
-                if signal.decision_signal in {"BUY", "SELL"}:
+                if not hourly and signal.decision_signal in {"BUY", "SELL"}:
                     calibrated_confidence, score_band, calibration_source = self.repo.calibrate_signal(
                         asset_type=asset_type,
                         signal=signal.decision_signal,
@@ -373,7 +422,11 @@ class ReplayService:
                     provider_status=provider_status,
                     provider_warnings=[],
                 )
-                future_price = self._future_price(rows, observed_at=observed_at, horizon=PRIMARY_HOLDING_HORIZON)
+                future_price_at = None
+                if hourly:
+                    future_price, future_price_at = self._hourly_exit(rows, observed_at=observed_at, end=request.end)
+                else:
+                    future_price = self._future_price(rows, observed_at=observed_at, horizon=PRIMARY_HOLDING_HORIZON)
                 raw_return = None
                 adjusted_return = None
                 if signal.decision_signal in {"BUY", "SELL"} and future_price is not None:
@@ -401,10 +454,12 @@ class ReplayService:
                         strategy_version=STRATEGY_VERSION,
                         market_status=market_status,
                         provider_status=provider_status,
-                        entry_price=round(price, 4),
-                        future_price=round(future_price, 4) if future_price is not None else None,
+                        entry_price=price if hourly else round(price, 4),
+                        future_price=(future_price if hourly or future_price is None else round(future_price, 4)),
+                        future_price_at=future_price_at,
                         raw_return_pct=raw_return,
                         friction_adjusted_return_pct=adjusted_return,
+                        horizon=request.horizon,
                     )
                 )
 
@@ -433,7 +488,8 @@ class ReplayService:
             friction=self._friction(),
             assumptions=[
                 ENTRY_ASSUMPTION,
-                EXIT_ASSUMPTION,
+                ("One-hour replay uses the first completed five-minute close at or after the target, within three days."
+                 if hourly else EXIT_ASSUMPTION),
                 "Replay uses only bar history up to each replay timestamp and does not look ahead during signal generation.",
                 "Secondary providers are intentionally omitted unless a later replay phase adds historical provider reconstruction.",
             ],
@@ -454,9 +510,14 @@ class ReplayService:
     async def replay_and_persist(self, request: ReplayRequest) -> ReplayResponse:
         response = await self.replay(request)
         replay_id = str(uuid4())
+        request_payload = request.model_dump(mode="json")
+        if request.horizon == "1h" and request.persist_outcomes and request.sample_source == "backfilled_replay":
+            identity = replay_identity(self.settings)
+            if response.strategy_variant == identity["strategy_variant"]:
+                request_payload["hourly_buy_evidence"] = identity
         self.repo.persist_strategy_replay_run(
             replay_id=replay_id,
-            request_payload=request.model_dump(mode="json"),
+            request_payload=request_payload,
             response_payload=response.model_dump(mode="json"),
             symbol_count=len(request.symbols),
             snapshot_count=response.summary.total_snapshots,

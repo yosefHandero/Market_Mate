@@ -1,12 +1,24 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+import math
 from typing import Any
+from zoneinfo import ZoneInfo
 import httpx
 
 from app.config import get_settings
 from app.http_client import request_json
 from app.provider_resilience import AsyncProviderGuard
+
+
+def stock_iex_session_is_open(observed_at: datetime) -> bool:
+    """Return whether the time is within normal IEX weekday hours."""
+    local = observed_at.astimezone(ZoneInfo("America/New_York"))
+    return local.weekday() < 5 and time(8) <= local.time() < time(17)
+
+
+class MarketQuoteUnavailable(RuntimeError):
+    pass
 
 
 class AlpacaClient:
@@ -19,15 +31,14 @@ class AlpacaClient:
         }
         self._async_client = httpx.AsyncClient(timeout=self.timeout)
         self._guard = AsyncProviderGuard("alpaca", pace_seconds=0.1)
-        self._last_alpaca_served_stale = False
 
     async def _request_json(self, method: str, url: str, **kwargs: Any) -> Any:
-        await self._guard.throttle()
         return await request_json(
             self._async_client,
             method=method,
             url=url,
             provider="alpaca",
+            before_attempt=self._guard.throttle,
             on_backoff=self._guard.register_backoff,
             headers={**self.headers, **kwargs.pop("headers", {})},
             **kwargs,
@@ -36,10 +47,8 @@ class AlpacaClient:
     def _latest_cache_key(self, namespace: str, symbols: list[str], timeframe: str) -> tuple[str, tuple[str, ...], str]:
         return namespace, tuple(sorted(symbol.upper() for symbol in symbols if symbol)), timeframe
 
-    def consume_last_stale_flag(self) -> bool:
-        served_stale = self._last_alpaca_served_stale
-        self._last_alpaca_served_stale = False
-        return served_stale
+    def latest_bars_served_stale(self, namespace: str, symbols: list[str], timeframe: str = "5Min") -> bool:
+        return self._guard.last_served_stale_for(self._latest_cache_key(namespace, symbols, timeframe))
 
     def _require_credentials(self) -> None:
         if not self.settings.alpaca_api_key or not self.settings.alpaca_api_secret:
@@ -120,7 +129,7 @@ class AlpacaClient:
             bars_by_symbol[symbol] = {
                 "latest_price": float(latest.get("c", 0)),
                 "latest_volume": session_cumulative_volume,
-                "average_volume": reference_cumulative_volume or 1,
+                "average_volume": reference_cumulative_volume,
                 "day_open": session_open,
                 "session_open": session_open,
                 "session_high": session_high,
@@ -170,6 +179,7 @@ class AlpacaClient:
         end: datetime,
         timeframe: str,
         limit: int,
+        feed: str = "iex",
     ) -> dict[str, Any]:
         return await self._fetch_bars_paginated(
             url=f"{self.settings.alpaca_market_data_url}/v2/stocks/bars",
@@ -183,7 +193,7 @@ class AlpacaClient:
                 # Mixing raw and split-adjusted bars across a split corrupts
                 # walk-forward outcomes, so both providers must agree.
                 "adjustment": "split",
-                "feed": "iex",
+                "feed": feed,
                 "sort": "asc",
             },
         )
@@ -210,19 +220,25 @@ class AlpacaClient:
         )
 
     async def get_latest_bars(self, symbols: list[str], timeframe: str = "5Min") -> dict[str, dict[str, Any]]:
+        return await self._get_cached_stock_bars(symbols, timeframe, feed="iex")
+
+    async def get_latest_stock_sip_bars(self, symbols: list[str], timeframe: str = "5Min") -> dict[str, dict[str, Any]]:
+        return await self._get_cached_stock_bars(symbols, timeframe, feed="sip")
+
+    async def _get_cached_stock_bars(
+        self, symbols: list[str], timeframe: str, *, feed: str,
+    ) -> dict[str, dict[str, Any]]:
         self._require_credentials()
         if not symbols:
             return {}
-        key = self._latest_cache_key("stocks", symbols, timeframe)
-        bars = await self._guard.cached_call(
+        namespace = "stocks" if feed == "iex" else "stocks_sip"
+        key = self._latest_cache_key(namespace, symbols, timeframe)
+        return await self._guard.cached_call(
             key=key,
             ttl_seconds=self.settings.alpaca_latest_data_cache_seconds,
             stale_ttl_seconds=max(self.settings.alpaca_latest_data_cache_seconds * 6, 15),
-            fetcher=lambda: self._get_latest_bars_uncached(symbols=symbols, timeframe=timeframe),
+            fetcher=lambda: self._get_latest_bars_uncached(symbols=symbols, timeframe=timeframe, feed=feed),
         )
-        if self._guard.last_served_stale_for(key):
-            self._last_alpaca_served_stale = True
-        return bars
 
     async def get_latest_crypto_bars(
         self,
@@ -233,37 +249,38 @@ class AlpacaClient:
         if not symbols:
             return {}
         key = self._latest_cache_key("crypto", symbols, timeframe)
-        bars = await self._guard.cached_call(
+        return await self._guard.cached_call(
             key=key,
             ttl_seconds=self.settings.alpaca_latest_data_cache_seconds,
             stale_ttl_seconds=max(self.settings.alpaca_latest_data_cache_seconds * 6, 15),
             fetcher=lambda: self._get_latest_crypto_bars_uncached(symbols=symbols, timeframe=timeframe),
         )
-        if self._guard.last_served_stale_for(key):
-            self._last_alpaca_served_stale = True
-        return bars
 
     async def _get_latest_bars_uncached(
         self,
         *,
         symbols: list[str],
         timeframe: str,
+        feed: str = "iex",
     ) -> dict[str, dict[str, Any]]:
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=3)
+        now = datetime.now(timezone.utc)
+        # Historical SIP access permits a window ending at least 15 minutes ago.
+        end = now - timedelta(minutes=16) if feed == "sip" else now
+        start = now - timedelta(days=3)
         payload = await self._fetch_stock_bars(
             symbols=symbols,
             start=start,
             end=end,
             timeframe=timeframe,
             limit=10000,
+            feed=feed,
         )
         # A long weekend/holiday can leave the ordinary three-calendar-day
         # window empty. Retry only missing symbols once with older real bars;
         # keep returned timestamps intact so the existing freshness gates apply.
         bars = dict(payload.get("bars") or {})
         missing = [symbol for symbol in symbols if not bars.get(symbol)]
-        if missing:
+        if missing and feed == "iex":
             older = await self._fetch_stock_bars(
                 symbols=missing,
                 start=end - timedelta(days=7),
@@ -295,18 +312,52 @@ class AlpacaClient:
         return self._build_bars_by_symbol(payload)
 
     async def get_latest_price(self, symbol: str) -> float:
+        price, _ = await self.get_latest_stock_quote(symbol)
+        return price
+
+    async def get_latest_stock_quote(self, symbol: str) -> tuple[float, datetime]:
+        symbol = symbol.upper()
         bars = await self.get_latest_bars([symbol], timeframe="1Min")
+        now = datetime.now(timezone.utc)
         item = bars.get(symbol)
-        if not item:
-            raise RuntimeError(f"No price data returned for {symbol}")
-        return float(item["latest_price"])
+        quote = self.fresh_bar_quote(item, now)
+        if quote is not None:
+            return quote
+        if stock_iex_session_is_open(now) and not self.latest_bars_served_stale("stocks", [symbol], "1Min"):
+            sip_bars = await self.get_latest_stock_sip_bars([symbol], timeframe="1Min")
+            item = sip_bars.get(symbol) or item
+            quote = self.fresh_bar_quote(item, datetime.now(timezone.utc))
+            if quote is not None:
+                return quote
+        raise MarketQuoteUnavailable("Stock quote is missing or stale.")
 
     async def get_latest_crypto_price(self, symbol: str) -> float:
+        price, _ = await self.get_latest_crypto_quote(symbol)
+        return price
+
+    async def get_latest_crypto_quote(self, symbol: str) -> tuple[float, datetime]:
+        symbol = symbol.upper()
         bars = await self.get_latest_crypto_bars([symbol], timeframe="1Min")
-        item = bars.get(symbol)
-        if not item:
-            raise RuntimeError(f"No crypto price data returned for {symbol}")
-        return float(item["latest_price"])
+        quote = self.fresh_bar_quote(bars.get(symbol), datetime.now(timezone.utc))
+        if quote is None:
+            raise MarketQuoteUnavailable("Crypto quote is missing or stale.")
+        return quote
+
+    def fresh_bar_quote(self, item: dict[str, Any] | None, observed_at: datetime) -> tuple[float, datetime] | None:
+        rows = item.get("bars") if item else None
+        if not rows:
+            return None
+        try:
+            latest = self._parse_bar_timestamp(rows[-1].get("t"))
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=timezone.utc)
+            age = (observed_at - latest).total_seconds() / 60
+            price = float(item["latest_price"])
+        except (KeyError, TypeError, ValueError, OverflowError, OSError, RuntimeError):
+            return None
+        if 0 <= age <= self.settings.provider_max_bar_age_minutes and math.isfinite(price) and price > 0:
+            return price, latest
+        return None
 
     async def get_price_near_timestamp(
         self,

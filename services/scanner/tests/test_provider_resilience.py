@@ -31,6 +31,24 @@ from app.schemas import OptionsFlowSnapshot
 
 
 class HttpClientResilienceTests(unittest.TestCase):
+    def test_final_429_still_registers_backoff(self) -> None:
+        client = MagicMock()
+        client.request = AsyncMock(return_value=httpx.Response(429, headers={"retry-after": "2"}))
+        backoff = AsyncMock()
+
+        async def run():
+            with patch("app.http_client.get_settings", return_value=SimpleNamespace(
+                provider_retry_attempts=0, provider_retry_backoff_seconds=0.5,
+            )):
+                with self.assertRaises(ProviderRequestError):
+                    await request_json(client, method="GET", url="https://example.com/data", on_backoff=backoff)
+
+        asyncio.run(run())
+        client.request.assert_awaited_once()
+        backoff.assert_awaited_once()
+        self.assertGreaterEqual(backoff.await_args.args[0], 2)
+        self.assertEqual(backoff.await_args.kwargs, {"rate_limited": True})
+
     def test_apply_retry_jitter_increases_delay(self) -> None:
         base = 1.0
         jittered = [_apply_retry_jitter(base) for _ in range(20)]

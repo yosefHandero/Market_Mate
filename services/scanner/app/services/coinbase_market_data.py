@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,7 @@ class CoinbaseMarketDataService:
         )
         self._stop_event = asyncio.Event()
         self._snapshots: dict[str, dict[str, Any]] = {}
+        self._snapshot_revision: tuple[int, int] | None = None
         self._channel_handlers = {
             "ticker": self._handle_ticker_message,
         }
@@ -46,6 +48,7 @@ class CoinbaseMarketDataService:
 
     def reset_for_testing(self) -> None:
         self._snapshots = {}
+        self._snapshot_revision = None
         self._stop_event = asyncio.Event()
 
     def list_snapshots(self) -> list[dict[str, Any]]:
@@ -67,9 +70,9 @@ class CoinbaseMarketDataService:
         if received_at is None:
             return None
         age = datetime.now(timezone.utc) - received_at
-        if age > timedelta(seconds=max(self.settings.coinbase_ws_snapshot_stale_seconds, 1)):
+        if not timedelta(0) <= age <= timedelta(seconds=max(self.settings.coinbase_ws_snapshot_stale_seconds, 1)):
             return None
-        return snapshot
+        return snapshot if self._parse_price(snapshot.get("price")) is not None else None
 
     def apply_crypto_price_overrides(self, crypto_bars: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if not crypto_bars:
@@ -78,7 +81,12 @@ class CoinbaseMarketDataService:
         updated = dict(crypto_bars)
         for symbol, item in crypto_bars.items():
             snapshot = self.get_snapshot_for_symbol(symbol)
-            if snapshot is None:
+            bars = item.get("bars") or []
+            bar_time = self._parse_timestamp(bars[-1].get("t")) if bars else None
+            if snapshot is None or bar_time is None:
+                continue
+            received_at = self._parse_timestamp(snapshot["received_at"])
+            if received_at is None or received_at < bar_time:
                 continue
 
             refreshed = dict(item)
@@ -197,11 +205,13 @@ class CoinbaseMarketDataService:
             self._persist_snapshots()
 
     def _load_snapshots(self) -> dict[str, dict[str, Any]]:
-        if self._snapshots:
-            return self._snapshots
-
         try:
-            raw = json.loads(self.snapshot_file_path.read_text(encoding="utf-8"))
+            path = self.snapshot_file_path
+            stat = path.stat()
+            revision = (stat.st_mtime_ns, stat.st_ino)
+            if self._snapshot_revision == revision:
+                return self._snapshots
+            raw = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return self._snapshots
         except Exception as exc:
@@ -212,12 +222,14 @@ class CoinbaseMarketDataService:
             )
             return self._snapshots
 
-        snapshots: dict[str, dict[str, Any]] = {}
         for item in raw.get("prices", []):
             product_id = str(item.get("product_id") or "").upper()
-            if product_id:
-                snapshots[product_id] = item
-        self._snapshots = snapshots
+            received_at = self._parse_timestamp(item.get("received_at"))
+            current = self._snapshots.get(product_id, {})
+            current_at = self._parse_timestamp(current.get("received_at"))
+            if product_id and received_at is not None and (current_at is None or received_at > current_at):
+                self._snapshots[product_id] = item
+        self._snapshot_revision = revision
         return self._snapshots
 
     def _persist_snapshots(self) -> None:
@@ -310,7 +322,7 @@ class CoinbaseMarketDataService:
             price = float(value)
         except (TypeError, ValueError):
             return None
-        return price if price > 0 else None
+        return price if math.isfinite(price) and price > 0 else None
 
     def product_id_for_symbol(self, symbol: str) -> str:
         return symbol.strip().upper().replace("/", "-")

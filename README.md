@@ -23,16 +23,27 @@ flowchart TD
     scanner --> persistence
 ```
 
-## Primary Local Workflows
+## Primary Local Workflow (Windows)
 
-From the repository root, the default npm scripts now target the scanner web app in `apps/web`:
+After installing the existing backend/frontend dependencies and configuring the local `.env` files, start the complete paper-only app from the repository root:
 
-- `npm run dev`
-- `npm run build`
-- `npm run start`
-- `npm run lint`
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/windows/Start-MarketMate.ps1
+```
 
-Do not run `next dev` from the repository root for this product; root `package.json` delegates to `apps/web`.
+Open `http://127.0.0.1:3000` (API: `http://127.0.0.1:8005`). Keep the terminal open. The command starts the API, web app, and one worker; recurring scans and due-outcome processing run while the session is open. It does not change laptop power settings or install scheduled tasks.
+
+Stop with **Ctrl+C** in that terminal, or from a second terminal:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/windows/Stop-MarketMate.ps1
+```
+
+The launcher rejects a duplicate session or occupied app ports. A Windows job owns its process tree, including Python/Next.js launcher children; shutdown signals those owned services, and closing the supervisor also removes their descendants. Independent processes are never swept or killed. Logs are in `services/scanner/var/logs/manual-*.log`.
+
+For a bounded operator check, add `-NoAutoScan`: the worker still handles due outcomes, but scans are triggered manually from the app or `POST /scan/run`. This is a session-only choice; no `.env` file is rewritten. Scans/outcomes need provider data and can remain partial or unresolved when valid data is unavailable.
+
+Developer-only frontend commands (`npm run dev`, `build`, `start`, `lint`) continue to target `apps/web`; they do not start the backend/worker.
 
 ## Scanner Web App
 
@@ -54,59 +65,10 @@ Do not put scanner tokens in `NEXT_PUBLIC_*` variables. Only `NEXT_PUBLIC_SCANNE
 is exposed to the browser; `SCANNER_READ_API_TOKEN` and `SCANNER_ADMIN_API_TOKEN` are
 server-side web settings.
 
-## Start Backend And Worker (Local)
+## Individual Backend Services (Development)
 
-Run these in **two separate terminals**. The API listens on `http://localhost:8005`.
+Use the complete manual command above for ordinary operation. For backend development, `python -m uvicorn app.main:app --reload --port 8005` and `python -m app.worker` remain available from `services/scanner` in separate terminals; stop each with Ctrl+C. Do not mix these standalone processes with the managed manual session. The worker retains its singleton guard.
 
-**Terminal 1 - backend API** (from repo root):
-
-```bash
-cd "services/scanner"
-python -m uvicorn app.main:app --reload --port 8005
-```
-
-If your prompt already ends in `.../services/scanner`, skip the `cd` and run only the `python` line.
-
-**Terminal 2 - scheduler worker** (from repo root; auto-scans when the app scheduler is enabled):
-
-```bash
-cd "services/scanner"
-python -m app.worker
-```
-
-From the repo root you can also start the worker with:
-
-```bash
-./scripts/start-worker.sh
-```
-
-On Windows PowerShell:
-
-```powershell
-powershell -File scripts/start-worker.ps1
-```
-
-Quick checks:
-
-```bash
-curl http://localhost:8005/readyz
-curl http://localhost:8005/health
-```
-
-If you see `WinError 10013` or "address already in use", port 8005 is taken - usually a backend already running. Check and reuse it:
-
-```bash
-curl http://127.0.0.1:8005/health
-```
-
-On Windows, find what holds the port:
-
-```bash
-netstat -ano | findstr 8005
-tasklist //FI "PID eq <pid-from-netstat>"
-```
-
-Stop the old process before starting a new one, or leave the existing server running if `/health` returns `"ok": true`.
 
 ## Local Smoke Test
 
@@ -220,31 +182,16 @@ The active web product is intentionally limited to Decision and Proof. Use the c
 
 ## Operations runbook (local personal host)
 
-### Wake-and-scan schedule (Windows)
-
-Register Task Scheduler jobs once (elevated PowerShell from repo root):
-
-```powershell
-powershell -File scripts/windows/Register-ScannerTasks.ps1
-```
-
-Windows:
-
-| Task | Local window |
-|------|----------------|
-| `MarketMate-Weekday-Market` | Mon–Fri ~08:12 → 16:30 |
-| `MarketMate-Daily-Overnight` | Daily ~03:13 → 03:45 |
-| `MarketMate-Weekend-Crypto` | Sat–Sun ~15:58 → 16:30 |
-| `MarketMate-Daily-Backup` | Daily DB backup |
-
-Health / wake checks:
+### Manual health checks and independent backups
 
 ```powershell
 powershell -File scripts/windows/Test-ScannerHealth.ps1
 powershell -File scripts/windows/Backup-ScannerDb.ps1
 ```
 
-Missed expected windows are recorded in `scan_windows` and surfaced on `/system/readiness` and the Proof page live-forward panel. After downtime, the worker resolves due prediction snapshots and signal outcomes on the next wake (within expiry windows).
+Health checks report API/worker state and stale or missing scans without requiring laptop wake timers or expected wake windows. After downtime, outcome processing resumes while the app is running, using available historical bars and preserving unresolved records when a valid result cannot be established.
+
+The former MarketMate wake/scan Task Scheduler workflow is retired. `Retire-WakeTasks.ps1` is a one-time, elevated removal tool for the seven known MarketMate wake/scan tasks only; it exports task definitions before deletion to `services/scanner/var/retired-scheduled-tasks/`. Independent backups and unrelated Windows tasks are preserved. The standalone backup script and backup XML template remain available, but app startup does not install or alter backup tasks.
 
 ### Evidence campaigns
 
@@ -252,7 +199,7 @@ Each scan attaches predictions to an active evidence campaign (`GET /proof/campa
 
 ### Application completion vs real-money readiness
 
-Finishing the app only means collection can run unattended. A small manual real-money pilot is a **later** decision based on untouched live-forward samples under one frozen campaign. See `docs/completion-report.md` for the graduation criteria. The app stays paper-only; any future orders would be placed manually at the broker.
+Finishing the app means the manual startup, scan/persistence, outcome processing, honest data-status presentation, and stop workflow work within provider limits. A small manual real-money pilot is a **later** decision based on untouched live-forward samples under one frozen campaign. See `docs/completion-report.md` for the graduation criteria. The app stays paper-only; any future orders would be placed manually at the broker.
 
 ### Operating Documents
 

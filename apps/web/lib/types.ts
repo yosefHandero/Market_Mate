@@ -1,4 +1,5 @@
 export type MarketStatus = 'bullish' | 'neutral' | 'bearish';
+export type ScanMarketStatus = MarketStatus | 'unavailable';
 export type AssetType = 'stock' | 'crypto';
 export type DecisionSignal = 'BUY' | 'SELL' | 'HOLD';
 export type RecommendedAction = 'ignore' | 'review' | 'preview' | 'dry_run' | 'blocked';
@@ -65,6 +66,49 @@ export interface GateCheck {
   detail: string;
 }
 
+export interface ProviderAttemptDiagnostic {
+  provider: string;
+  endpoint?: string | null;
+  status: string;
+  http_status?: number | null;
+  lookback_start?: string | null;
+  latest_article_at?: string | null;
+}
+
+export interface ScanProviderDiagnostics {
+  benchmark?: {
+    status: string;
+    symbols: (ProviderAttemptDiagnostic & {
+      symbol: string;
+      as_of?: string | null;
+      age_minutes?: number | null;
+      primary_status?: string | null;
+      primary_http_status?: number | null;
+      fallback_status?: string | null;
+      fallback_http_status?: number | null;
+      polygon_status?: string | null;
+      polygon_http_status?: number | null;
+    })[];
+  };
+  directional_news?: {
+    status: 'available' | 'unavailable' | 'successful_empty' | 'not_requested';
+    source: string;
+    providers: ProviderAttemptDiagnostic[];
+  };
+  market_bars?: ProviderAttemptDiagnostic & {
+    as_of?: string | null;
+    max_age_minutes?: number | null;
+    coinbase_price_as_of?: string | null;
+    primary_status?: string | null;
+    primary_http_status?: number | null;
+    fallback_status?: string | null;
+    fallback_http_status?: number | null;
+    fallback_provider?: string | null;
+    polygon_status?: string | null;
+    polygon_http_status?: number | null;
+  };
+}
+
 export interface ScanResult {
   ticker: string;
   asset_type: AssetType;
@@ -126,7 +170,7 @@ export interface ScanResult {
   fear_greed_label: string | null;
   provider_status: string;
   provider_warnings: string[];
-  price_source?: 'alpaca' | 'coinbase_ws' | 'polygon' | 'stale_cache';
+  price_source?: 'alpaca' | 'alpaca_sip' | 'coinbase_ws' | 'polygon' | 'stale_cache';
   fallback_used?: boolean;
   bar_age_minutes: number | null;
   bar_as_of?: string | null;
@@ -138,6 +182,7 @@ export interface ScanResult {
   selection_rank?: number | null;
   is_top_pick?: boolean;
   layer_details?: {
+    provider_health?: ScanProviderDiagnostics;
     confidence?: {
       blend?: {
         horizon?: string | null;
@@ -155,18 +200,26 @@ export interface ScanResult {
   created_at: string;
 }
 
+export interface ScanMissingSymbol {
+  ticker: string;
+  reason: string;
+  detail: string;
+  required_input?: 'benchmark' | 'directional_news' | 'volume_reference' | null;
+  directional_news?: ScanProviderDiagnostics['directional_news'] | null;
+}
+
 export interface ScanAssetCoverage {
   asset_type: AssetType;
   expected_symbols: string[];
   returned_symbols: string[];
-  missing_symbols: { ticker: string; reason: string; detail: string }[];
+  missing_symbols: ScanMissingSymbol[];
   status: 'complete' | 'partial' | 'unavailable' | 'not_requested';
 }
 
 export interface ScanRun {
   run_id: string;
   created_at: string;
-  market_status: MarketStatus;
+  market_status: ScanMarketStatus;
   scan_count: number;
   watchlist_size: number;
   scan_age_minutes?: number | null;
@@ -883,6 +936,15 @@ export interface PolicyPromotionReport {
   requested_champion_policy_id: string;
 }
 
+export interface MarketauxQuotaSummary {
+  configured_daily_attempt_budget: number | null;
+  utc_day_attempts: number;
+  operational_attempts_remaining: number | null;
+  block_state: 'reset_known' | 'reset_unknown' | null;
+  verified_reset_at: string | null;
+  rate_retry_at: string | null;
+}
+
 export interface ProofSummary {
   generated_at: string;
   ledger: PaperLedgerSummary;
@@ -895,6 +957,7 @@ export interface ProofSummary {
   live_forward?: LiveForwardProgress | null;
   evidence_contract?: EvidenceTrackDescriptor[];
   last_scan_at: string | null;
+  marketaux_quota?: MarketauxQuotaSummary | null;
   scan_fresh: boolean | null;
   mark_prices_source: string;
   note: string | null;

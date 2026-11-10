@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 
+from app.clients.news_result import NEWS_LOOKBACK_DAYS
 from app.config import get_settings
 from app.services.provider_coordination import ProviderCoordination, content_key
 
@@ -15,8 +16,8 @@ class NewsCacheService:
     def _key(self, ticker: str) -> str:
         # Legacy JSON can contain failures encoded as neutral; leave it intact
         # and exclude it from the new success-only cache.
-        return content_key(["combined-news-v2", ticker.upper(), self.settings.marketaux_api_token,
-                            self.settings.finnhub_api_key, "en", 10, 7])
+        return content_key(["combined-news-v4", ticker.upper(), self.settings.marketaux_api_token,
+                            self.settings.finnhub_api_key, "en", 10, NEWS_LOOKBACK_DAYS])
 
     def get(self, ticker: str) -> tuple[float | None, str | None]:
         item = self.coordination.read_cache(self._key(ticker))

@@ -20,6 +20,12 @@ class CoordinationBlocked(RuntimeError):
     pass
 
 
+class CoordinationPaced(CoordinationBlocked):
+    def __init__(self, retry_after_seconds: float) -> None:
+        super().__init__("shared_request_pacing")
+        self.retry_after_seconds = retry_after_seconds
+
+
 def content_key(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
@@ -105,10 +111,10 @@ class ProviderCoordination:
                 (time.time() + 5 if failed else 0, key, owner, time.time()))
 
     def reserve_attempt(self, account: str, key: str, owner: str, daily_budget: int | None,
-                        *, now: float | None = None) -> None:
-        now = time.time() if now is None else now
-        day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
+                        *, min_interval_seconds: float = 0.0, now: float | None = None) -> None:
         with self._transaction() as conn:
+            now = time.time() if now is None else now
+            day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
             if not self._owns(conn, key, owner, now):
                 raise CoordinationBlocked("request_ownership_lost")
             state = self._quota(conn, account)
@@ -123,6 +129,10 @@ class ProviderCoordination:
             day_count = state["day_attempts"] if state["day"] == day else 0
             if daily_budget is not None and day_count >= daily_budget:
                 raise CoordinationBlocked("configured_daily_attempt_budget_reached")
+            if min_interval_seconds and state["last_attempt_at"] is not None:
+                delay = state["last_attempt_at"] + min_interval_seconds - now
+                if delay > 0:
+                    raise CoordinationPaced(delay)
             conn.execute("""UPDATE quota SET total_attempts=total_attempts+1, day=?, day_attempts=?,
                 last_attempt_at=?, block_state=NULL, reset_at=NULL, block_reason=NULL WHERE account=?""",
                 (day, day_count + 1, now, account))
